@@ -65,8 +65,21 @@ local CONFIG = {
     -- anti-afk: prevent the 20-minute idle kick
     antiAfk          = (g.AutoBountyAntiAFK ~= false),
     antiAfkInterval  = 8,                               -- seconds between keep-alive nudges
+    maxNoProgressRuns = 3,                              -- give up on a bounty after N runs that add 0 progress
 }
-CONFIG.enabled = AB.enabled == true                    -- resume running after a teleport
+CONFIG.enabled = false                                 -- set from the saved session below
+
+-- ============================================================
+-- Cross-teleport memory.
+-- _G is WIPED on teleport (new place = new Luau VM), so the bounty board can't
+-- be tracked while in Story mode. We persist the running state AND the active
+-- bounty target (world / enemy / required / progress / run count) to DISK so it
+-- survives the lobby <-> battle teleports and we reconcile progress on return.
+-- ============================================================
+local Session = { running = false, bounty = nil }
+-- forward declarations (these are referenced by step() but defined later)
+local saveSession
+local setEnabled, mainLoop, rememberBounty, forgetBounty
 
 -- ============================================================
 -- Cleanup system
@@ -196,6 +209,13 @@ local function readBounties()
 
             local worldL = f:FindFirstChild("World")
             entry.world = worldL and worldL.Text or nil
+
+            -- enemy name lives in the Description: "-> <font...>Scout Ninja</font> is seeking..."
+            local descL = f:FindFirstChild("Description")
+            if descL then
+                entry.enemy = descL.Text:match(">([^<]+)</font>")
+                if entry.enemy then entry.enemy = entry.enemy:match("^%s*(.-)%s*$") end
+            end
 
             local progL = f:FindFirstChild("Progress")
             if progL then entry.progress, entry.required = parseProgress(progL.Text) end
@@ -328,8 +348,9 @@ local function step()
 
     local list = readBounties()
     if #list == 0 then
-        setStatus("No bounties on the board.")
-        return "done"
+        -- board not populated yet (just joined / still loading) - wait, don't stop
+        setStatus("Waiting for bounty board to load...")
+        return
     end
 
     -- 1) handle the active bounty first (one active at a time)
@@ -340,12 +361,39 @@ local function step()
             setStatus(("Claiming completed bounty (%s)"):format(active.world or "?"))
             if bClaim(active.id) then
                 notify("Bounty", "Claimed reward from " .. (active.world or "bounty"), "success")
+                forgetBounty()
             end
             return
         end
         if active.trait then
-            setStatus(("Active trait bounty: %s  %d/%d - launching map")
-                :format(active.world or "?", active.progress, active.required))
+            -- remember this target on disk so it survives the Story-mode teleport,
+            -- and reconcile eliminations: did the last run actually add progress?
+            local prev = Session.bounty
+            if prev and prev.id == active.id and prev.lastLaunchProgress ~= nil then
+                if active.progress <= prev.lastLaunchProgress then
+                    prev.noProgress = (prev.noProgress or 0) + 1
+                else
+                    prev.noProgress = 0
+                end
+            end
+            rememberBounty(active)
+            if (Session.bounty.noProgress or 0) >= CONFIG.maxNoProgressRuns then
+                setStatus(("No progress after %d runs on %s - stopping (check Act/loadout)")
+                    :format(CONFIG.maxNoProgressRuns, active.world or "?"))
+                notify("Auto Bounty",
+                    "Runs aren't eliminating " .. (active.enemy or "the target") ..
+                    " - stopped. Try a different Act.", "error")
+                setEnabled(false)
+                return "done"
+            end
+
+            setStatus(("Farming %s: eliminate %s  %d/%d  (run #%d) - launching")
+                :format(active.world or "?", active.enemy or "target",
+                    active.progress, active.required, (Session.bounty.runs or 0) + 1))
+            Session.bounty.runs = (Session.bounty.runs or 0) + 1
+            Session.bounty.lastLaunchProgress = active.progress
+            saveSession()
+
             local ok, err = startMap(active.world)
             if ok then
                 waitForRun(active.id, active.progress)
@@ -365,6 +413,9 @@ local function step()
         end
         return
     end
+
+    -- no active bounty -> drop any stale memory of one
+    if Session.bounty then forgetBounty() end
 
     -- 2) no active bounty -> clear out a non-trait bounty (one per step)
     if CONFIG.declineNonTrait then
@@ -402,7 +453,7 @@ local function step()
 end
 
 local _looping = false
-local function mainLoop()
+function mainLoop()
     if _looping then return end
     _looping = true
     setStatus("Auto Bounty started.")
@@ -414,8 +465,7 @@ local function mainLoop()
             if CONFIG.stopWhenDone then
                 setStatus("No trait-reroll bounties left - stopped.")
                 notify("Auto Bounty", "No trait bounties left. Done.", "success")
-                CONFIG.enabled = false
-                AB.enabled = false
+                setEnabled(false)
                 break
             end
         end
@@ -425,10 +475,32 @@ local function mainLoop()
     setStatus("Stopped.")
 end
 
-local function setEnabled(on)
+function setEnabled(on)
     CONFIG.enabled = on and true or false
     AB.enabled = CONFIG.enabled
+    Session.running = CONFIG.enabled
+    if saveSession then saveSession() end
     if CONFIG.enabled then addThread(mainLoop) end
+end
+
+-- remember/forget the bounty we are currently farming (persists across teleport)
+function rememberBounty(b)
+    if not b then return end
+    local s = Session.bounty
+    if not s or s.id ~= b.id then
+        -- new target
+        s = { id = b.id, runs = 0, noProgress = 0, lastLaunchProgress = nil }
+    end
+    s.world    = b.world
+    s.enemy    = b.enemy
+    s.required = b.required
+    s.progress = b.progress
+    Session.bounty = s
+    if saveSession then saveSession() end
+end
+function forgetBounty()
+    Session.bounty = nil
+    if saveSession then saveSession() end
 end
 
 -- ============================================================
@@ -479,6 +551,35 @@ local function loadSettings()
     if type(data.scriptUrl) == "string" and data.scriptUrl ~= "" then CONFIG.scriptUrl = data.scriptUrl end
 end
 loadSettings()
+
+-- ----- session memory (survives teleports) -----
+local SESSION_FILE = "AutoBounty_session.json"
+local _sessionSaveQueued = false
+saveSession = function()
+    if not canFile() then return end
+    if _sessionSaveQueued then return end
+    _sessionSaveQueued = true
+    addThread(function()
+        task.wait(0.3)
+        _sessionSaveQueued = false
+        pcall(function() writefile(SESSION_FILE, HttpService:JSONEncode(Session)) end)
+    end)
+end
+local function loadSession()
+    if not canFile() or not isfile(SESSION_FILE) then return end
+    local ok, raw = pcall(readfile, SESSION_FILE)
+    if not ok or not raw then return end
+    local ok2, data = pcall(function() return HttpService:JSONDecode(raw) end)
+    if ok2 and type(data) == "table" then
+        Session.running = data.running == true
+        if type(data.bounty) == "table" and data.bounty.id then
+            Session.bounty = data.bounty
+        end
+    end
+end
+loadSession()
+-- resume the running state captured before the last teleport
+CONFIG.enabled = Session.running == true
 
 -- ============================================================
 -- Teleport persistence (re-exec after returning to lobby)
@@ -632,6 +733,8 @@ local function buildUI()
     statusLabels.active  = St:Label("Active bounty: -")
     statusLabels.trait   = St:Label("Trait bounties available: -")
     statusLabels.board   = St:Label("Board: -")
+    St:Section("Remembered (survives Story teleport)")
+    statusLabels.memory  = St:Label("Target: none")
 
     -- ----- Misc tab -----
     local Misc = Win:Tab("⚙️", "Misc")
@@ -678,6 +781,18 @@ addThread(function()
         if next(statusLabels) then
             local lobby = inLobby()
             pcall(function() statusLabels.place.Set("Place: " .. (lobby and "Lobby" or "Battle/Loading")) end)
+            -- remembered target works in Story mode too (read from disk-backed Session)
+            pcall(function()
+                local sb = Session.bounty
+                if sb then
+                    statusLabels.memory.Set(("Target: %s | %s | %s/%s | runs %d")
+                        :format(sb.world or "?", sb.enemy or "?",
+                            tostring(sb.progress or 0), tostring(sb.required or 0),
+                            sb.runs or 0))
+                else
+                    statusLabels.memory.Set("Target: none")
+                end
+            end)
             if lobby then
                 local list = readBounties()
                 local active, traitCount = nil, 0
