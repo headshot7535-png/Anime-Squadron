@@ -20,6 +20,7 @@
       built-in AFK script). Toggle it in the Misc tab.
 --------------------------------------------------------------------------]]
 
+local VERSION = "1.4.0"   -- bump this each upload so you can confirm the live build
 local NEXUSLIB_URL = "https://raw.githubusercontent.com/headshot7535-png/Nexuslib/main/Nexuslib"
 
 -- ============================================================
@@ -66,6 +67,8 @@ local CONFIG = {
     antiAfk          = (g.AutoBountyAntiAFK ~= false),
     antiAfkInterval  = 8,                               -- seconds between keep-alive nudges
     maxActs          = tonumber(g.AutoBountyMaxActs) or 7, -- acts to cycle through when finding the enemy
+    liveKills        = (g.AutoBountyLiveKills ~= false), -- count bounty-enemy kills live while in Story mode
+    leaveWhenDone    = (g.AutoBountyLeaveWhenDone == true), -- leave the stage early once the target count is met (experimental)
 }
 CONFIG.enabled = false                                 -- set from the saved session below
 
@@ -560,6 +563,8 @@ local function saveSettings()
             scriptUrl        = CONFIG.scriptUrl,
             autoExecute      = CONFIG.autoExecute,
             antiAfk          = CONFIG.antiAfk,
+            liveKills        = CONFIG.liveKills,
+            leaveWhenDone    = CONFIG.leaveWhenDone,
         }
         pcall(function() writefile(SETTINGS_FILE, HttpService:JSONEncode(data)) end)
     end)
@@ -580,6 +585,8 @@ local function loadSettings()
     -- default these to true when missing from an older settings file
     if data.autoExecute ~= nil then CONFIG.autoExecute = data.autoExecute == true end
     if data.antiAfk ~= nil then CONFIG.antiAfk = data.antiAfk == true end
+    if data.liveKills ~= nil then CONFIG.liveKills = data.liveKills == true end
+    if data.leaveWhenDone ~= nil then CONFIG.leaveWhenDone = data.leaveWhenDone == true end
     if type(data.scriptUrl) == "string" and data.scriptUrl ~= "" then CONFIG.scriptUrl = data.scriptUrl end
 end
 loadSettings()
@@ -711,6 +718,62 @@ end
 startAntiAFK()
 
 -- ============================================================
+-- Live in-stage elimination tracker (Story/battle place)
+-- The bounty board doesn't exist in Story mode, so we count the bounty enemy's
+-- deaths directly: any Model named like the enemy with a Humanoid that Dies = 1
+-- kill. This is a live readout; the server still credits the real bounty count
+-- (reconciled in the lobby). Solo room => every kill is yours.
+-- ============================================================
+local function startKillTracker()
+    addThread(function()
+        local tracking = false
+        local conns = {}
+        local function stop()
+            for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+            conns = {}
+            tracking = false
+        end
+        while alive() do
+            local battle = not inLobby()
+            local enemy = Session.bounty and Session.bounty.enemy
+            if CONFIG.liveKills and battle and enemy and CONFIG.enabled then
+                if not tracking then
+                    tracking = true
+                    Session.runKills = 0
+                    local hook = function(m)
+                        if not (m and m:IsA("Model")) then return end
+                        if m.Name ~= enemy then return end
+                        if m:GetAttribute("_abk") then return end
+                        local hum = m:FindFirstChildOfClass("Humanoid")
+                        if not hum then return end
+                        m:SetAttribute("_abk", true)
+                        local c
+                        c = hum.Died:Connect(function()
+                            Session.runKills = (Session.runKills or 0) + 1
+                        end)
+                        conns[#conns + 1] = c
+                    end
+                    for _, d in ipairs(workspace:GetDescendants()) do pcall(hook, d) end
+                    conns[#conns + 1] = workspace.DescendantAdded:Connect(function(d) pcall(hook, d) end)
+                end
+                -- optional: bail out of the stage as soon as the target is met
+                if CONFIG.leaveWhenDone and Session.bounty and Session.bounty.required then
+                    local total = (Session.bounty.progress or 0) + (Session.runKills or 0)
+                    if total >= Session.bounty.required then
+                        setStatus("Target reached in-stage - leaving to claim...")
+                        pcall(function() fireR("Play", "leave") end)
+                    end
+                end
+            elseif tracking and (inLobby() or not enemy) then
+                stop()
+            end
+            task.wait(1)
+        end
+    end)
+end
+startKillTracker()
+
+-- ============================================================
 -- UI
 -- ============================================================
 local Lib
@@ -722,7 +785,7 @@ end
 local statusLabels = {}
 local function buildUI()
     if not Lib then return end
-    Win = Lib:Window({ title = "Auto Bounty" })
+    Win = Lib:Window({ title = "Auto Bounty  v" .. VERSION })
 
     -- ----- Main tab -----
     local Main = Win:Tab("⚔️", "Bounty")
@@ -765,6 +828,7 @@ local function buildUI()
 
     -- ----- Status tab -----
     local St = Win:Tab("📊", "Status")
+    St:Label("Version: v" .. VERSION)
     St:Section("Live")
     statusLabels.place   = St:Label("Place: -")
     statusLabels.tickets = St:Label("Tickets: -")
@@ -773,6 +837,7 @@ local function buildUI()
     statusLabels.board   = St:Label("Board: -")
     St:Section("Remembered (survives Story teleport)")
     statusLabels.memory  = St:Label("Target: none")
+    statusLabels.kills   = St:Label("Live kills this run: -")
 
     -- ----- Misc tab -----
     local Misc = Win:Tab("⚙️", "Misc")
@@ -790,6 +855,15 @@ local function buildUI()
     Misc:Label((getQueueFn() ~= nil)
         and "Re-exec: supported by this executor ✓"
         or  "Re-exec: NOT supported (queue_on_teleport missing) ✗")
+
+    Misc:Toggle("Live kill counter (in Story)",
+        "Count the bounty enemy's kills during the stage", CONFIG.liveKills, function(on)
+            CONFIG.liveKills = on; saveSettings()
+        end)
+    Misc:Toggle("Leave stage when target met",
+        "Experimental: exit early once enough kills (server must bank live)", CONFIG.leaveWhenDone, function(on)
+            CONFIG.leaveWhenDone = on; saveSettings()
+        end)
 
     Misc:Section("Actions")
     Misc:Button("💾", "Save Settings", "Write settings to file", nil, function()
@@ -833,6 +907,16 @@ addThread(function()
                             sb.runs or 0))
                 else
                     statusLabels.memory.Set("Target: none")
+                end
+            end)
+            pcall(function()
+                local sb = Session.bounty
+                if (not lobby) and sb then
+                    local need = sb.required and ((sb.required - (sb.progress or 0))) or "?"
+                    statusLabels.kills.Set(("Live kills this run: %d  (need ~%s more)")
+                        :format(Session.runKills or 0, tostring(need)))
+                else
+                    statusLabels.kills.Set("Live kills this run: -")
                 end
             end)
             if lobby then
@@ -879,4 +963,6 @@ if CONFIG.enabled then
     end)
 end
 
-setStatus("Loaded. Toggle 'Enable Auto Bounty' to start.")
+setStatus(("v%s loaded. Toggle 'Enable Auto Bounty' to start."):format(VERSION))
+notify("Auto Bounty", "Loaded v" .. VERSION, "success")
+print("[Auto Bounty] loaded v" .. VERSION)
