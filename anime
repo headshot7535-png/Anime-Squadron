@@ -20,7 +20,7 @@
       built-in AFK script). Toggle it in the Misc tab.
 --------------------------------------------------------------------------]]
 
-local VERSION = "1.4.0"   -- bump this each upload so you can confirm the live build
+local VERSION = "1.5.0"   -- bump this each upload so you can confirm the live build
 local NEXUSLIB_URL = "https://raw.githubusercontent.com/headshot7535-png/Nexuslib/main/Nexuslib"
 
 -- ============================================================
@@ -733,6 +733,10 @@ local function startKillTracker()
             conns = {}
             tracking = false
         end
+        local function norm(s) return tostring(s):lower():gsub("%s+", "") end
+        -- in this game enemies are Models cloned into workspace.Characters, tagged
+        -- with attribute type=="Enemies" (allies are "Allies"); a kill Destroys the
+        -- model -> fires ChildRemoved. We count those, filtered to the bounty enemy.
         while alive() do
             local battle = not inLobby()
             local enemy = Session.bounty and Session.bounty.enemy
@@ -740,21 +744,56 @@ local function startKillTracker()
                 if not tracking then
                     tracking = true
                     Session.runKills = 0
-                    local hook = function(m)
-                        if not (m and m:IsA("Model")) then return end
-                        if m.Name ~= enemy then return end
-                        if m:GetAttribute("_abk") then return end
-                        local hum = m:FindFirstChildOfClass("Humanoid")
-                        if not hum then return end
-                        m:SetAttribute("_abk", true)
-                        local c
-                        c = hum.Died:Connect(function()
-                            Session.runKills = (Session.runKills or 0) + 1
-                        end)
-                        conns[#conns + 1] = c
+                    local target = norm(enemy)
+                    local chars = workspace:FindFirstChild("Characters")
+                    local function isTargetEnemy(m)
+                        if not (m and m:IsA("Model")) then return false end
+                        local ok, t = pcall(function() return m:GetAttribute("type") end)
+                        if not ok or t ~= "Enemies" then return false end
+                        return norm(m.Name) == target
                     end
-                    for _, d in ipairs(workspace:GetDescendants()) do pcall(hook, d) end
-                    conns[#conns + 1] = workspace.DescendantAdded:Connect(function(d) pcall(hook, d) end)
+                    local function bind(container)
+                        if not container then return end
+                        conns[#conns + 1] = container.ChildRemoved:Connect(function(m)
+                            if isTargetEnemy(m) then
+                                Session.runKills = (Session.runKills or 0) + 1
+                            end
+                        end)
+                    end
+                    bind(chars)
+                    -- if Characters folder isn't there yet, wait for it then bind
+                    if not chars then
+                        conns[#conns + 1] = workspace.ChildAdded:Connect(function(c)
+                            if c.Name == "Characters" then bind(c) end
+                        end)
+                    end
+
+                    -- diagnostic: after a few seconds, if we found no enemy of the
+                    -- target name, print what enemies ARE present so we can verify
+                    task.delay(6, function()
+                        if not alive() or inLobby() then return end
+                        local c = workspace:FindFirstChild("Characters")
+                        if not c then
+                            warn("[Auto Bounty] workspace.Characters not found in battle.")
+                            return
+                        end
+                        local seen, names, found = {}, {}, false
+                        for _, m in ipairs(c:GetChildren()) do
+                            local ok, t = pcall(function() return m:GetAttribute("type") end)
+                            if ok and t == "Enemies" and m:IsA("Model") then
+                                if norm(m.Name) == target then found = true end
+                                if not seen[m.Name] then
+                                    seen[m.Name] = true
+                                    names[#names + 1] = m.Name
+                                end
+                            end
+                        end
+                        if not found then
+                            warn("[Auto Bounty] No enemy named '" .. tostring(enemy) ..
+                                "'. Enemies currently present: " ..
+                                (#names > 0 and table.concat(names, ", ") or "(none yet)"))
+                        end
+                    end)
                 end
                 -- optional: bail out of the stage as soon as the target is met
                 if CONFIG.leaveWhenDone and Session.bounty and Session.bounty.required then
