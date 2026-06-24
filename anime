@@ -9,12 +9,15 @@
       returns to the lobby, claims the reward and accepts the next trait bounty
     - Repeats until there are no trait-reroll bounties left
 
-    NOTE ON TELEPORTS:
-      Starting a stage teleports you to a battle place. For the loop to resume
-      after you return to the lobby, host this file at a raw URL and set:
-          getgenv().AutoBountyScriptURL = "https://your-raw-url"
-      before loadstring-ing it (or load it FROM that url). Without it the
-      lobby-side automation still works every time you run the script.
+    AUTO EXECUTE:
+      Starting a stage teleports you to a battle place. Auto Execute uses
+      queue_on_teleport to re-run this script (from SCRIPT_URL) after every
+      teleport so the loop resumes automatically. Toggle it in Misc, or
+      override the url with getgenv().AutoBountyScriptURL = "...".
+
+    ANTI-AFK:
+      Blocks the 20-minute idle kick (Idled hook + input nudge + disables any
+      built-in AFK script). Toggle it in the Misc tab.
 --------------------------------------------------------------------------]]
 
 local NEXUSLIB_URL = "https://raw.githubusercontent.com/headshot7535-png/Nexuslib/main/Nexuslib"
@@ -41,6 +44,9 @@ local LP                = Players.LocalPlayer
 -- ============================================================
 -- Config (with getgenv overrides)
 -- ============================================================
+-- Raw URL this script is hosted at (used for auto-execute / queue_on_teleport)
+local SCRIPT_URL = "https://raw.githubusercontent.com/headshot7535-png/Anime-Squadron/refs/heads/main/anime"
+
 local g = getgenv and getgenv() or {}
 local CONFIG = {
     traitReward      = "Trait Shards",                 -- reward keyword that marks a "trait reroll" bounty
@@ -53,7 +59,12 @@ local CONFIG = {
     loopDelay        = 1.0,
     actionCooldown   = 0.45,                            -- min gap between remote calls (rate-limit safety)
     farmTimeout      = 600,                             -- max seconds to wait for a same-place run to progress
-    scriptUrl        = g.AutoBountyScriptURL or "",    -- for queue_on_teleport persistence
+    -- auto-execute: re-run this script automatically after each teleport (lobby <-> battle)
+    autoExecute      = (g.AutoBountyAutoExecute ~= false),
+    scriptUrl        = g.AutoBountyScriptURL or SCRIPT_URL, -- for queue_on_teleport persistence
+    -- anti-afk: prevent the 20-minute idle kick
+    antiAfk          = (g.AutoBountyAntiAFK ~= false),
+    antiAfkInterval  = 8,                               -- seconds between keep-alive nudges
 }
 CONFIG.enabled = AB.enabled == true                    -- resume running after a teleport
 
@@ -443,6 +454,8 @@ local function saveSettings()
             useRefreshTicket = CONFIG.useRefreshTicket,
             stopWhenDone     = CONFIG.stopWhenDone,
             scriptUrl        = CONFIG.scriptUrl,
+            autoExecute      = CONFIG.autoExecute,
+            antiAfk          = CONFIG.antiAfk,
         }
         pcall(function() writefile(SETTINGS_FILE, HttpService:JSONEncode(data)) end)
     end)
@@ -460,6 +473,9 @@ local function loadSettings()
     CONFIG.declineNonTrait  = data.declineNonTrait == true
     CONFIG.useRefreshTicket = data.useRefreshTicket == true
     CONFIG.stopWhenDone     = data.stopWhenDone == true
+    -- default these to true when missing from an older settings file
+    if data.autoExecute ~= nil then CONFIG.autoExecute = data.autoExecute == true end
+    if data.antiAfk ~= nil then CONFIG.antiAfk = data.antiAfk == true end
     if type(data.scriptUrl) == "string" and data.scriptUrl ~= "" then CONFIG.scriptUrl = data.scriptUrl end
 end
 loadSettings()
@@ -468,6 +484,7 @@ loadSettings()
 -- Teleport persistence (re-exec after returning to lobby)
 -- ============================================================
 local function armReexec()
+    if not CONFIG.autoExecute then return end
     local url = CONFIG.scriptUrl
     if type(url) ~= "string" or url == "" then return end
     local q = (syn and syn.queue_on_teleport)
@@ -488,6 +505,71 @@ addConn(LP.OnTeleport:Connect(function(state)
     end
 end))
 armReexec()
+
+-- ============================================================
+-- Anti-AFK (prevents the 20-minute idle kick)
+-- ============================================================
+local function startAntiAFK()
+    local VirtualUser = game:GetService("VirtualUser")
+    local VIM = nil
+    pcall(function() VIM = game:GetService("VirtualInputManager") end)
+
+    -- 1) definitive backstop: reset idle the instant Roblox fires Idled
+    addConn(LP.Idled:Connect(function()
+        if not CONFIG.antiAfk then return end
+        pcall(function()
+            VirtualUser:CaptureController()
+            VirtualUser:Button2Down(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
+            task.wait(0.2)
+            VirtualUser:Button2Up(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
+        end)
+    end))
+
+    -- disable any built-in AFK / idle LocalScript (and watch for re-injection)
+    local function disableAfkScripts(root)
+        if not root then return end
+        for _, d in ipairs(root:GetDescendants()) do
+            if d:IsA("LocalScript") then
+                local n = d.Name:lower()
+                if n:find("afk") or n:find("idle") then
+                    pcall(function() d.Disabled = true end)
+                end
+            end
+        end
+    end
+    local ps = LP:FindFirstChild("PlayerScripts")
+    if ps then
+        addConn(ps.ChildAdded:Connect(function(c)
+            if CONFIG.antiAfk and c:IsA("LocalScript") then
+                local n = c.Name:lower()
+                if n:find("afk") or n:find("idle") then
+                    pcall(function() c.Disabled = true end)
+                end
+            end
+        end))
+    end
+
+    -- 2) proactive keep-alive: send a harmless input (VirtualInputManager
+    --    preferred per its broader detection coverage) + re-disable afk scripts
+    addThread(function()
+        while alive() do
+            if CONFIG.antiAfk then
+                disableAfkScripts(LP:FindFirstChild("PlayerScripts"))
+                disableAfkScripts(LP:FindFirstChildOfClass("PlayerGui"))
+                if VIM then
+                    pcall(function()
+                        local cam = workspace.CurrentCamera
+                        local vp = cam and cam.ViewportSize or Vector2.new(200, 200)
+                        local x, y = math.floor(vp.X * 0.5), math.floor(vp.Y * 0.5)
+                        VIM:SendMouseMoveEvent(x, y, game)
+                    end)
+                end
+            end
+            task.wait(CONFIG.antiAfkInterval)
+        end
+    end)
+end
+startAntiAFK()
 
 -- ============================================================
 -- UI
@@ -553,6 +635,18 @@ local function buildUI()
 
     -- ----- Misc tab -----
     local Misc = Win:Tab("⚙️", "Misc")
+
+    Misc:Section("Session")
+    Misc:Toggle("Anti-AFK",
+        "Block the 20-min idle kick", CONFIG.antiAfk, function(on)
+            CONFIG.antiAfk = on; saveSettings()
+        end)
+    Misc:Toggle("Auto Execute (on teleport)",
+        "Re-run this script after each teleport", CONFIG.autoExecute, function(on)
+            CONFIG.autoExecute = on; saveSettings()
+            if on then armReexec() end
+        end)
+
     Misc:Section("Actions")
     Misc:Button("💾", "Save Settings", "Write settings to file", nil, function()
         saveSettings(); notify("Settings", "Saved.", "success")
