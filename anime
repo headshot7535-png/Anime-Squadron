@@ -1,0 +1,631 @@
+--[[
+    Auto Bounty
+    --------------------------------------------------------------------------
+    - Accepts ONLY bounties whose rewards include "Trait Shards" (trait rerolls)
+    - Declines bounties that do NOT give trait shards
+    - Runs ONE bounty active at a time
+    - Detects the bounty's world, launches that Story map (configurable Act /
+      Difficulty), waits for the run to clear (your units auto-fight), then
+      returns to the lobby, claims the reward and accepts the next trait bounty
+    - Repeats until there are no trait-reroll bounties left
+
+    NOTE ON TELEPORTS:
+      Starting a stage teleports you to a battle place. For the loop to resume
+      after you return to the lobby, host this file at a raw URL and set:
+          getgenv().AutoBountyScriptURL = "https://your-raw-url"
+      before loadstring-ing it (or load it FROM that url). Without it the
+      lobby-side automation still works every time you run the script.
+--------------------------------------------------------------------------]]
+
+local NEXUSLIB_URL = "https://raw.githubusercontent.com/headshot7535-png/Nexuslib/main/Nexuslib"
+
+-- ============================================================
+-- Anti-stacking generation token
+-- ============================================================
+_G.AutoBountyGen = (_G.AutoBountyGen or 0) + 1
+local GEN = _G.AutoBountyGen
+local function alive() return _G.AutoBountyGen == GEN end
+
+-- persistent state (survives re-execution / teleport)
+_G.AB = _G.AB or {}
+local AB = _G.AB
+
+-- ============================================================
+-- Services
+-- ============================================================
+local Players           = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local HttpService       = game:GetService("HttpService")
+local LP                = Players.LocalPlayer
+
+-- ============================================================
+-- Config (with getgenv overrides)
+-- ============================================================
+local g = getgenv and getgenv() or {}
+local CONFIG = {
+    traitReward      = "Trait Shards",                 -- reward keyword that marks a "trait reroll" bounty
+    act              = tonumber(g.AutoBountyAct) or 1,  -- Story act to farm
+    difficulty       = g.AutoBountyDifficulty or "Normal", -- "Normal" | "Hard"
+    soloOnly         = (g.AutoBountySolo ~= false),     -- create a friends-only (solo) room
+    declineNonTrait  = (g.AutoBountyDeclineNonTrait ~= false),
+    useRefreshTicket = (g.AutoBountyUseTicket == true), -- spend bounty tickets to roll new bounties when none left
+    stopWhenDone     = (g.AutoBountyStopWhenDone ~= false),
+    loopDelay        = 1.0,
+    actionCooldown   = 0.45,                            -- min gap between remote calls (rate-limit safety)
+    farmTimeout      = 600,                             -- max seconds to wait for a same-place run to progress
+    scriptUrl        = g.AutoBountyScriptURL or "",    -- for queue_on_teleport persistence
+}
+CONFIG.enabled = AB.enabled == true                    -- resume running after a teleport
+
+-- ============================================================
+-- Cleanup system
+-- ============================================================
+local _conns, _threads = {}, {}
+local function addConn(c) table.insert(_conns, c); return c end
+local function addThread(fn)
+    local t = task.spawn(fn)
+    table.insert(_threads, t)
+    return t
+end
+local function cleanupAll()
+    for _, c in ipairs(_conns) do pcall(function() c:Disconnect() end) end
+    for _, t in ipairs(_threads) do pcall(function() task.cancel(t) end) end
+    _conns, _threads = {}, {}
+end
+-- kill the previous instance's connections/threads/GUI
+if AB.cleanup then pcall(AB.cleanup) end
+
+-- ============================================================
+-- Wait for PlayerGui
+-- ============================================================
+do
+    local ok = false
+    for _ = 1, 60 do
+        if LP and LP:FindFirstChildOfClass("PlayerGui") then ok = true break end
+        task.wait(0.3)
+    end
+    if not ok then return end
+end
+
+-- ============================================================
+-- Remote caching + safe calling
+-- ============================================================
+local _remotes = {}
+local function getRemote(folder, name)
+    local key = folder .. "/" .. name
+    local cached = _remotes[key]
+    if cached and cached.Parent then return cached end
+    local f = ReplicatedStorage:FindFirstChild("Remotes")
+    f = f and f:FindFirstChild(folder)
+    local r = f and f:FindFirstChild(name)
+    if r then _remotes[key] = r end
+    return r
+end
+
+local _lastCall = 0
+local function throttle()
+    local dt = tick() - _lastCall
+    if dt < CONFIG.actionCooldown then task.wait(CONFIG.actionCooldown - dt) end
+    _lastCall = tick()
+end
+
+-- InvokeServer wrapper that preserves multi-returns: ok, serverSuccess, a, b
+local function invokeR(folder, name, ...)
+    local r = getRemote(folder, name)
+    if not r then return false, "remote_missing" end
+    throttle()
+    local res = table.pack(pcall(function(...) return r:InvokeServer(...) end, ...))
+    if not res[1] then return false, res[2] end
+    return true, res[2], res[3], res[4]
+end
+local function fireR(folder, name, ...)
+    local r = getRemote(folder, name)
+    if not r then return false end
+    throttle()
+    return pcall(function(...) r:FireServer(...) end, ...)
+end
+
+-- ============================================================
+-- GUI helpers / place detection
+-- ============================================================
+local function getMenus()
+    local pg = LP:FindFirstChildOfClass("PlayerGui")
+    return pg and pg:FindFirstChild("Menus")
+end
+local function getBountyGui()
+    local m = getMenus()
+    return m and m:FindFirstChild("Bounty")
+end
+-- We're "in the lobby" if the Bounty menu exists (battle place won't have it)
+local function inLobby()
+    return getBountyGui() ~= nil
+end
+
+-- the game's own bounty client module (calls remotes AND refreshes the GUI)
+local _bModule
+local function ensureModule()
+    if _bModule then return _bModule end
+    local ok, m = pcall(function()
+        return require(LP.PlayerScripts.Client.Bounties)
+    end)
+    if ok and type(m) == "table" then _bModule = m end
+    return _bModule
+end
+-- best-effort refresh of the game's own bounty GUI after a direct remote call
+local function refreshGUI(bounties, tickets)
+    if not bounties then return end
+    local m = ensureModule()
+    if m and m.setup then pcall(m.setup, bounties, tickets) end
+end
+
+-- ============================================================
+-- Bounty reading (parse the live GUI)
+-- ============================================================
+local function parseProgress(text)
+    if type(text) ~= "string" then return 0, 0 end
+    local p, r = text:match(">%s*(%d+)%s*</font>%s*/%s*(%d+)")
+    if not p then
+        local clean = text:gsub("<[^>]->", "")
+        p, r = clean:match("(%d+)%s*/%s*(%d+)")
+    end
+    return tonumber(p) or 0, tonumber(r) or 0
+end
+
+-- returns a list: { {id, world, progress, required, active, complete, trait}, ... }
+local function readBounties()
+    local out = {}
+    local gui = getBountyGui()
+    if not gui then return out end
+    local sf = gui:FindFirstChild("ScrollingFrame")
+    if not sf then return out end
+    for _, f in ipairs(sf:GetChildren()) do
+        local id = tonumber(f.Name)
+        if id and f:IsA("GuiObject") then
+            local entry = { id = id, progress = 0, required = 0, active = false, trait = false }
+
+            local worldL = f:FindFirstChild("World")
+            entry.world = worldL and worldL.Text or nil
+
+            local progL = f:FindFirstChild("Progress")
+            if progL then entry.progress, entry.required = parseProgress(progL.Text) end
+
+            local isAct = f:FindFirstChild("Is_Active")
+            if isAct and isAct.Visible then entry.active = true end
+            local accept = f:FindFirstChild("Accept")
+            local acceptLbl = accept and accept:FindFirstChild("TextLabel")
+            if acceptLbl then
+                local t = acceptLbl.Text
+                if t == "Pending" or t == "Claim" then entry.active = true end
+            end
+
+            local rew = f:FindFirstChild("Rewards")
+            if rew then
+                for _, r in ipairs(rew:GetChildren()) do
+                    if r:IsA("GuiObject") and r.Name == CONFIG.traitReward then
+                        entry.trait = true
+                    end
+                end
+            end
+
+            entry.complete = (entry.required > 0) and (entry.progress >= entry.required)
+            out[#out + 1] = entry
+        end
+    end
+    return out
+end
+
+local function getTickets()
+    local gui = getBountyGui()
+    local tl = gui and gui:FindFirstChild("Tickets Left")
+    local amt = tl and tl:FindFirstChild("Amount")
+    if amt then
+        local n = tostring(amt.Text):gsub("%D", "")
+        return tonumber(n) or 0
+    end
+    return 0
+end
+
+-- ============================================================
+-- Bounty actions (direct remotes + GUI refresh)
+-- ============================================================
+-- Prefer the game's module fn (it InvokeServers + rebuilds the GUI in one go),
+-- fall back to a direct remote call + manual GUI refresh.
+local function doAction(method, remoteName, id)
+    local m = ensureModule()
+    if m and m[method] then
+        throttle()
+        local ok = pcall(m[method], id)
+        if ok then return true end
+    end
+    local ok, suc, bounties, tickets = invokeR("Bounties", remoteName, id)
+    if ok and suc then refreshGUI(bounties, tickets); return true end
+    return false, suc
+end
+local function bAccept(id)    return doAction("accept",      "accept",      id) end
+local function bDecline(id)   return doAction("decline",     "decline",     id) end
+local function bClaim(id)     return doAction("claim",       "claim",       id) end
+local function bUseTicket()   return doAction("use_ticket",  "use_ticket",  nil) end
+
+-- ============================================================
+-- Matchmaking (start the bounty's world)
+-- ============================================================
+local function startMap(world)
+    local current = {
+        world        = world,
+        act          = CONFIG.act,
+        mode         = "Story",
+        difficulty   = CONFIG.difficulty,
+        only_friends = CONFIG.soloOnly and true or false,
+    }
+    local okC, sucC, room = invokeR("Play", "create_room", current)
+    if not (okC and sucC) then
+        return false, tostring(room or "create_room failed")
+    end
+    task.wait(0.3)
+    local okS, sucS = invokeR("Play", "start")
+    if okS and sucS then return true end
+    -- couldn't start; clean up the room so we don't get stuck
+    pcall(function() fireR("Play", "leave") end)
+    return false, "start failed"
+end
+
+-- ============================================================
+-- UI handle (set later) + status helper
+-- ============================================================
+local Win
+local function setStatus(msg)
+    if Win then pcall(function() Win:Status(msg) end) end
+end
+local function notify(title, msg, typ)
+    if Win then pcall(function() Win:Notify(title, msg, 4, typ or "info") end) end
+end
+
+-- ============================================================
+-- Core loop logic
+-- ============================================================
+-- after launching a stage, block here until we leave the lobby (teleport) or,
+-- if it's a same-place arena, until the bounty progress changes.
+local function waitForRun(bountyId, startProg)
+    local t0 = tick()
+    while alive() and CONFIG.enabled and inLobby() and (tick() - t0) < 12 do
+        task.wait(0.5)
+    end
+    if not inLobby() then
+        setStatus("In battle - auto-fighting, waiting to return...")
+        while alive() and not inLobby() do task.wait(1) end
+        task.wait(2) -- let lobby GUI repopulate
+        setStatus("Returned to lobby.")
+        return
+    end
+    -- same-place fallback: wait for progress to move
+    setStatus("Farming - waiting for bounty progress...")
+    local t1 = tick()
+    while alive() and CONFIG.enabled and inLobby() and (tick() - t1) < CONFIG.farmTimeout do
+        for _, b in ipairs(readBounties()) do
+            if b.id == bountyId and (b.progress ~= startProg or b.complete) then return end
+        end
+        task.wait(2)
+    end
+end
+
+-- one decision step; returns "done" when there is nothing left to do
+local function step()
+    if not inLobby() then
+        setStatus("Not in lobby (battle/loading) - waiting...")
+        return
+    end
+
+    local list = readBounties()
+    if #list == 0 then
+        setStatus("No bounties on the board.")
+        return "done"
+    end
+
+    -- 1) handle the active bounty first (one active at a time)
+    local active
+    for _, b in ipairs(list) do if b.active then active = b break end end
+    if active then
+        if active.complete then
+            setStatus(("Claiming completed bounty (%s)"):format(active.world or "?"))
+            if bClaim(active.id) then
+                notify("Bounty", "Claimed reward from " .. (active.world or "bounty"), "success")
+            end
+            return
+        end
+        if active.trait then
+            setStatus(("Active trait bounty: %s  %d/%d - launching map")
+                :format(active.world or "?", active.progress, active.required))
+            local ok, err = startMap(active.world)
+            if ok then
+                waitForRun(active.id, active.progress)
+            else
+                setStatus("Launch failed: " .. tostring(err))
+                task.wait(2)
+            end
+            return
+        end
+        -- active bounty does NOT reward trait shards
+        if CONFIG.declineNonTrait then
+            setStatus("Active bounty has no trait reward - declining it")
+            bDecline(active.id)
+        else
+            setStatus("Active bounty has no trait reward (decline disabled) - idle")
+            task.wait(2)
+        end
+        return
+    end
+
+    -- 2) no active bounty -> clear out a non-trait bounty (one per step)
+    if CONFIG.declineNonTrait then
+        for _, b in ipairs(list) do
+            if (not b.trait) and (not b.active) then
+                setStatus(("Declining non-trait bounty (%s)"):format(b.world or "?"))
+                bDecline(b.id)
+                return
+            end
+        end
+    end
+
+    -- 3) accept a trait-reroll bounty
+    for _, b in ipairs(list) do
+        if b.trait and (not b.active) then
+            setStatus(("Accepting trait bounty (%s)"):format(b.world or "?"))
+            if bAccept(b.id) then
+                notify("Bounty", "Accepted: " .. (b.world or "bounty"), "info")
+            end
+            return
+        end
+    end
+
+    -- 4) nothing acceptable left
+    local anyTrait = false
+    for _, b in ipairs(list) do if b.trait then anyTrait = true break end end
+    if not anyTrait then
+        if CONFIG.useRefreshTicket and getTickets() > 0 then
+            setStatus("No trait bounties - using a ticket to roll a new one")
+            bUseTicket()
+            return
+        end
+        return "done"
+    end
+end
+
+local _looping = false
+local function mainLoop()
+    if _looping then return end
+    _looping = true
+    setStatus("Auto Bounty started.")
+    while alive() and CONFIG.enabled do
+        local ok, res = pcall(step)
+        if not ok then
+            setStatus("Error: " .. tostring(res))
+        elseif res == "done" then
+            if CONFIG.stopWhenDone then
+                setStatus("No trait-reroll bounties left - stopped.")
+                notify("Auto Bounty", "No trait bounties left. Done.", "success")
+                CONFIG.enabled = false
+                AB.enabled = false
+                break
+            end
+        end
+        task.wait(CONFIG.loopDelay)
+    end
+    _looping = false
+    setStatus("Stopped.")
+end
+
+local function setEnabled(on)
+    CONFIG.enabled = on and true or false
+    AB.enabled = CONFIG.enabled
+    if CONFIG.enabled then addThread(mainLoop) end
+end
+
+-- ============================================================
+-- Settings persistence (JSON, debounced)
+-- ============================================================
+local SETTINGS_FILE = "AutoBounty_settings.json"
+local function canFile()
+    return (writefile and readfile and isfile) and true or false
+end
+local _saveQueued = false
+local function saveSettings()
+    if not canFile() then return end
+    if _saveQueued then return end
+    _saveQueued = true
+    addThread(function()
+        task.wait(0.6)
+        _saveQueued = false
+        local data = {
+            act              = CONFIG.act,
+            difficulty       = CONFIG.difficulty,
+            soloOnly         = CONFIG.soloOnly,
+            declineNonTrait  = CONFIG.declineNonTrait,
+            useRefreshTicket = CONFIG.useRefreshTicket,
+            stopWhenDone     = CONFIG.stopWhenDone,
+            scriptUrl        = CONFIG.scriptUrl,
+        }
+        pcall(function() writefile(SETTINGS_FILE, HttpService:JSONEncode(data)) end)
+    end)
+end
+local function loadSettings()
+    if not canFile() then return end
+    if not isfile(SETTINGS_FILE) then return end
+    local ok, raw = pcall(readfile, SETTINGS_FILE)
+    if not ok or not raw then return end
+    local ok2, data = pcall(function() return HttpService:JSONDecode(raw) end)
+    if not ok2 or type(data) ~= "table" then return end
+    CONFIG.act              = math.clamp(tonumber(data.act) or CONFIG.act, 1, 7)
+    if data.difficulty == "Normal" or data.difficulty == "Hard" then CONFIG.difficulty = data.difficulty end
+    CONFIG.soloOnly         = data.soloOnly == true
+    CONFIG.declineNonTrait  = data.declineNonTrait == true
+    CONFIG.useRefreshTicket = data.useRefreshTicket == true
+    CONFIG.stopWhenDone     = data.stopWhenDone == true
+    if type(data.scriptUrl) == "string" and data.scriptUrl ~= "" then CONFIG.scriptUrl = data.scriptUrl end
+end
+loadSettings()
+
+-- ============================================================
+-- Teleport persistence (re-exec after returning to lobby)
+-- ============================================================
+local function armReexec()
+    local url = CONFIG.scriptUrl
+    if type(url) ~= "string" or url == "" then return end
+    local q = (syn and syn.queue_on_teleport)
+        or queue_on_teleport
+        or (fluxus and fluxus.queue_on_teleport)
+    if not q then return end
+    -- guard against double-queue
+    local now = tick()
+    if AB._lastQueue and (now - AB._lastQueue) < 3 then return end
+    AB._lastQueue = now
+    pcall(q, ([[loadstring(game:HttpGet("%s"))()]]):format(url))
+end
+addConn(LP.OnTeleport:Connect(function(state)
+    if state == Enum.TeleportState.Started
+        or state == Enum.TeleportState.RequestedByServer
+        or state == Enum.TeleportState.InProgress then
+        armReexec()
+    end
+end))
+armReexec()
+
+-- ============================================================
+-- UI
+-- ============================================================
+local Lib
+do
+    local ok, lib = pcall(function() return loadstring(game:HttpGet(NEXUSLIB_URL))() end)
+    if ok then Lib = lib end
+end
+
+local statusLabels = {}
+local function buildUI()
+    if not Lib then return end
+    Win = Lib:Window({ title = "Auto Bounty" })
+
+    -- ----- Main tab -----
+    local Main = Win:Tab("⚔️", "Bounty")
+    Main:Section("Automation")
+
+    Main:Toggle("Enable Auto Bounty",
+        "Accept trait bounties, farm, claim, repeat", CONFIG.enabled, function(on)
+            setEnabled(on)
+        end)
+
+    Main:Toggle("Decline non-trait bounties",
+        "Clear bounties that don't reward Trait Shards", CONFIG.declineNonTrait, function(on)
+            CONFIG.declineNonTrait = on; saveSettings()
+        end)
+
+    Main:Toggle("Solo room (friends only)",
+        "Run the stage alone", CONFIG.soloOnly, function(on)
+            CONFIG.soloOnly = on; saveSettings()
+        end)
+
+    Main:Toggle("Use tickets when none left",
+        "Spend bounty tickets to roll new bounties", CONFIG.useRefreshTicket, function(on)
+            CONFIG.useRefreshTicket = on; saveSettings()
+        end)
+
+    Main:Toggle("Auto-stop when finished",
+        "Stop once no trait bounties remain", CONFIG.stopWhenDone, function(on)
+            CONFIG.stopWhenDone = on; saveSettings()
+        end)
+
+    Main:Section("Stage")
+    Main:Slider("Story Act", "Act to farm the bounty enemy",
+        { min = 1, max = 7, default = CONFIG.act }, function(v)
+            CONFIG.act = math.floor(v); saveSettings()
+        end)
+    Main:Dropdown("Difficulty", "Story difficulty", { "Normal", "Hard" },
+        (CONFIG.difficulty == "Hard") and 2 or 1, function(opt)
+            CONFIG.difficulty = opt; saveSettings()
+        end)
+
+    -- ----- Status tab -----
+    local St = Win:Tab("📊", "Status")
+    St:Section("Live")
+    statusLabels.place   = St:Label("Place: -")
+    statusLabels.tickets = St:Label("Tickets: -")
+    statusLabels.active  = St:Label("Active bounty: -")
+    statusLabels.trait   = St:Label("Trait bounties available: -")
+    statusLabels.board   = St:Label("Board: -")
+
+    -- ----- Misc tab -----
+    local Misc = Win:Tab("⚙️", "Misc")
+    Misc:Section("Actions")
+    Misc:Button("💾", "Save Settings", "Write settings to file", nil, function()
+        saveSettings(); notify("Settings", "Saved.", "success")
+    end)
+    Misc:Button("🛑", "Stop All Loops", "Emergency stop", nil, function()
+        setEnabled(false)
+    end)
+    Misc:Button("🔁", "Re-arm teleport persist", "queue_on_teleport now", nil, function()
+        armReexec(); notify("Persist", "Re-armed (needs Script URL).", "info")
+    end)
+
+    Misc:Section("Teleport persistence")
+    Misc:Input("Script URL", "Raw URL of this script (for queue_on_teleport)",
+        "https://...", CONFIG.scriptUrl, function(txt)
+            CONFIG.scriptUrl = txt or ""; saveSettings()
+        end)
+
+    Misc:Section("Links")
+    Misc:Button("💬", "Discord", "Copy invite", nil, function()
+        if setclipboard then pcall(setclipboard, "https://discord.gg/") end
+        notify("Discord", "Invite copied (edit link in script).", "info")
+    end)
+end
+buildUI()
+
+-- live status updater
+addThread(function()
+    while alive() do
+        if next(statusLabels) then
+            local lobby = inLobby()
+            pcall(function() statusLabels.place.Set("Place: " .. (lobby and "Lobby" or "Battle/Loading")) end)
+            if lobby then
+                local list = readBounties()
+                local active, traitCount = nil, 0
+                for _, b in ipairs(list) do
+                    if b.active then active = b end
+                    if b.trait then traitCount = traitCount + 1 end
+                end
+                pcall(function() statusLabels.tickets.Set("Tickets: " .. getTickets()) end)
+                pcall(function()
+                    if active then
+                        statusLabels.active.Set(("Active: %s  %d/%d%s")
+                            :format(active.world or "?", active.progress, active.required,
+                                active.trait and " (trait)" or ""))
+                    else
+                        statusLabels.active.Set("Active bounty: none")
+                    end
+                end)
+                pcall(function() statusLabels.trait.Set("Trait bounties available: " .. traitCount) end)
+                pcall(function() statusLabels.board.Set("Board: " .. #list .. " bounties") end)
+            end
+        end
+        task.wait(1)
+    end
+end)
+
+-- ============================================================
+-- Register cleanup for the next re-execution, then resume if needed
+-- ============================================================
+AB.cleanup = function()
+    pcall(cleanupAll)
+    if Win then pcall(function() Win:Destroy() end) end
+end
+
+if CONFIG.enabled then
+    -- resumed after a teleport: give the lobby a moment, then continue
+    addThread(function()
+        for _ = 1, 30 do
+            if inLobby() then break end
+            task.wait(1)
+        end
+        addThread(mainLoop)
+    end)
+end
+
+setStatus("Loaded. Toggle 'Enable Auto Bounty' to start.")
