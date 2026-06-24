@@ -65,7 +65,7 @@ local CONFIG = {
     -- anti-afk: prevent the 20-minute idle kick
     antiAfk          = (g.AutoBountyAntiAFK ~= false),
     antiAfkInterval  = 8,                               -- seconds between keep-alive nudges
-    maxNoProgressRuns = 3,                              -- give up on a bounty after N runs that add 0 progress
+    maxActs          = tonumber(g.AutoBountyMaxActs) or 7, -- acts to cycle through when finding the enemy
 }
 CONFIG.enabled = false                                 -- set from the saved session below
 
@@ -77,9 +77,10 @@ CONFIG.enabled = false                                 -- set from the saved ses
 -- survives the lobby <-> battle teleports and we reconcile progress on return.
 -- ============================================================
 local Session = { running = false, bounty = nil }
--- forward declarations (these are referenced by step() but defined later)
+-- forward declarations (these are referenced earlier than they are defined)
 local saveSession
 local setEnabled, mainLoop, rememberBounty, forgetBounty
+local armReexec
 
 -- ============================================================
 -- Cleanup system
@@ -280,10 +281,10 @@ local function bUseTicket()   return doAction("use_ticket",  "use_ticket",  nil)
 -- ============================================================
 -- Matchmaking (start the bounty's world)
 -- ============================================================
-local function startMap(world)
+local function startMap(world, act)
     local current = {
         world        = world,
-        act          = CONFIG.act,
+        act          = act or CONFIG.act,
         mode         = "Story",
         difficulty   = CONFIG.difficulty,
         only_friends = CONFIG.soloOnly and true or false,
@@ -293,6 +294,9 @@ local function startMap(world)
         return false, tostring(room or "create_room failed")
     end
     task.wait(0.3)
+    -- prime the re-exec queue RIGHT before we teleport, so the script comes
+    -- back automatically in the battle place (and again on the way to lobby)
+    if armReexec then pcall(armReexec) end
     local okS, sucS = invokeR("Play", "start")
     if okS and sucS then return true end
     -- couldn't start; clean up the room so we don't get stuck
@@ -366,35 +370,62 @@ local function step()
             return
         end
         if active.trait then
-            -- remember this target on disk so it survives the Story-mode teleport,
-            -- and reconcile eliminations: did the last run actually add progress?
+            -- remember this target on disk so it survives the Story-mode teleport.
+            -- We can't read the enemy in Story mode, so we MATCH the enemy to the
+            -- right act by trial: if the last run added 0 progress, that act has no
+            -- such enemy -> cycle to the next act. When progress moves, lock the act.
             local prev = Session.bounty
+            local madeProgress = true
             if prev and prev.id == active.id and prev.lastLaunchProgress ~= nil then
-                if active.progress <= prev.lastLaunchProgress then
-                    prev.noProgress = (prev.noProgress or 0) + 1
+                madeProgress = active.progress > prev.lastLaunchProgress
+            end
+            rememberBounty(active) -- preserves act / actsTried / foundAct for the same id
+            local s = Session.bounty
+
+            if madeProgress then
+                s.foundAct = true   -- this act spawns the enemy; lock it in
+                s.actsTried = 0
+                s.failRuns = 0
+            elseif prev and prev.lastLaunchProgress ~= nil then
+                if s.foundAct then
+                    -- right act, but the run didn't clear (lost / unlucky) - retry,
+                    -- but don't loop forever if the loadout simply can't do it
+                    s.failRuns = (s.failRuns or 0) + 1
+                    if s.failRuns >= CONFIG.maxActs then
+                        setStatus(("Runs on %s Act %d aren't clearing - stopping (loadout?)")
+                            :format(active.world or "?", s.act or CONFIG.act))
+                        notify("Auto Bounty", "Can't clear the stage for " ..
+                            (active.enemy or "the target") .. ". Stopped.", "error")
+                        setEnabled(false)
+                        return "done"
+                    end
                 else
-                    prev.noProgress = 0
+                    -- enemy not in this act yet -> cycle to the next act
+                    s.actsTried = (s.actsTried or 0) + 1
+                    if s.actsTried >= CONFIG.maxActs then
+                        setStatus(("Tried every act in %s, %s never appeared - stopping")
+                            :format(active.world or "?", active.enemy or "target"))
+                        notify("Auto Bounty", "Couldn't find " ..
+                            (active.enemy or "the target") .. " in any act of " ..
+                            (active.world or "that world") .. ".", "error")
+                        setEnabled(false)
+                        return "done"
+                    end
+                    s.act = ((s.act or CONFIG.act) % CONFIG.maxActs) + 1
+                    setStatus(("%s not found - trying %s Act %d")
+                        :format(active.enemy or "target", active.world or "?", s.act))
                 end
             end
-            rememberBounty(active)
-            if (Session.bounty.noProgress or 0) >= CONFIG.maxNoProgressRuns then
-                setStatus(("No progress after %d runs on %s - stopping (check Act/loadout)")
-                    :format(CONFIG.maxNoProgressRuns, active.world or "?"))
-                notify("Auto Bounty",
-                    "Runs aren't eliminating " .. (active.enemy or "the target") ..
-                    " - stopped. Try a different Act.", "error")
-                setEnabled(false)
-                return "done"
-            end
 
-            setStatus(("Farming %s: eliminate %s  %d/%d  (run #%d) - launching")
-                :format(active.world or "?", active.enemy or "target",
-                    active.progress, active.required, (Session.bounty.runs or 0) + 1))
-            Session.bounty.runs = (Session.bounty.runs or 0) + 1
-            Session.bounty.lastLaunchProgress = active.progress
+            local act = s.act or CONFIG.act
+            setStatus(("Farming %s Act %d: eliminate %s  %d/%d  (run #%d)")
+                :format(active.world or "?", act, active.enemy or "target",
+                    active.progress, active.required, (s.runs or 0) + 1))
+            s.runs = (s.runs or 0) + 1
+            s.lastLaunchProgress = active.progress
             saveSession()
 
-            local ok, err = startMap(active.world)
+            local ok, err = startMap(active.world, act)
             if ok then
                 waitForRun(active.id, active.progress)
             else
@@ -488,8 +519,9 @@ function rememberBounty(b)
     if not b then return end
     local s = Session.bounty
     if not s or s.id ~= b.id then
-        -- new target
-        s = { id = b.id, runs = 0, noProgress = 0, lastLaunchProgress = nil }
+        -- new target: start at the configured act, will auto-cycle if no enemy
+        s = { id = b.id, runs = 0, act = CONFIG.act, actsTried = 0,
+              foundAct = false, failRuns = 0, lastLaunchProgress = nil }
     end
     s.world    = b.world
     s.enemy    = b.enemy
@@ -584,25 +616,31 @@ CONFIG.enabled = Session.running == true
 -- ============================================================
 -- Teleport persistence (re-exec after returning to lobby)
 -- ============================================================
-local function armReexec()
+local function getQueueFn()
+    return (syn and syn.queue_on_teleport)
+        or (fluxus and fluxus.queue_on_teleport)
+        or queue_on_teleport
+        or queueonteleport
+        or (getgenv and getgenv().queue_on_teleport)
+end
+armReexec = function()
     if not CONFIG.autoExecute then return end
     local url = CONFIG.scriptUrl
     if type(url) ~= "string" or url == "" then return end
-    local q = (syn and syn.queue_on_teleport)
-        or queue_on_teleport
-        or (fluxus and fluxus.queue_on_teleport)
-    if not q then return end
-    -- guard against double-queue
+    local q = getQueueFn()
+    if not q then return false end
+    -- guard against double-queue within the same place
     local now = tick()
-    if AB._lastQueue and (now - AB._lastQueue) < 3 then return end
+    if AB._lastQueue and (now - AB._lastQueue) < 3 then return true end
     AB._lastQueue = now
     pcall(q, ([[loadstring(game:HttpGet("%s"))()]]):format(url))
+    return true
 end
+-- OnTeleport: compare by NAME string so a missing Enum member can't crash us
 addConn(LP.OnTeleport:Connect(function(state)
-    if state == Enum.TeleportState.Started
-        or state == Enum.TeleportState.RequestedByServer
-        or state == Enum.TeleportState.InProgress then
-        armReexec()
+    local name = (typeof(state) == "EnumItem") and state.Name or tostring(state)
+    if name == "Started" or name == "RequestedByServer" or name == "InProgress" then
+        pcall(armReexec)
     end
 end))
 armReexec()
@@ -749,6 +787,9 @@ local function buildUI()
             CONFIG.autoExecute = on; saveSettings()
             if on then armReexec() end
         end)
+    Misc:Label((getQueueFn() ~= nil)
+        and "Re-exec: supported by this executor ✓"
+        or  "Re-exec: NOT supported (queue_on_teleport missing) ✗")
 
     Misc:Section("Actions")
     Misc:Button("💾", "Save Settings", "Write settings to file", nil, function()
@@ -785,8 +826,9 @@ addThread(function()
             pcall(function()
                 local sb = Session.bounty
                 if sb then
-                    statusLabels.memory.Set(("Target: %s | %s | %s/%s | runs %d")
-                        :format(sb.world or "?", sb.enemy or "?",
+                    statusLabels.memory.Set(("Target: %s Act %s | %s | %s/%s | runs %d")
+                        :format(sb.world or "?", tostring(sb.act or CONFIG.act),
+                            sb.enemy or "?",
                             tostring(sb.progress or 0), tostring(sb.required or 0),
                             sb.runs or 0))
                 else
