@@ -20,7 +20,7 @@
       built-in AFK script). Toggle it in the Misc tab.
 --------------------------------------------------------------------------]]
 
-local VERSION = "1.5.0"   -- bump this each upload so you can confirm the live build
+local VERSION = "1.5.1"   -- bump this each upload so you can confirm the live build
 local NEXUSLIB_URL = "https://raw.githubusercontent.com/headshot7535-png/Nexuslib/main/Nexuslib"
 
 -- ============================================================
@@ -51,10 +51,14 @@ local SCRIPT_URL = "https://raw.githubusercontent.com/headshot7535-png/Anime-Squ
 local g = getgenv and getgenv() or {}
 local CONFIG = {
     traitReward      = "Trait Shards",                 -- reward keyword that marks a "trait reroll" bounty
+    traitKeywords    = { "trait", "reroll" },           -- any reward name/text containing these = keep it
     act              = tonumber(g.AutoBountyAct) or 1,  -- Story act to farm
     difficulty       = g.AutoBountyDifficulty or "Normal", -- "Normal" | "Hard"
     soloOnly         = (g.AutoBountySolo ~= false),     -- create a friends-only (solo) room
     declineNonTrait  = (g.AutoBountyDeclineNonTrait ~= false),
+    -- SAFETY: never decline anything unless the board has at least one detected
+    -- trait bounty. Prevents wiping the whole board if reward detection is off.
+    declineEvenIfNoTrait = (g.AutoBountyDeclineAlways == true),
     useRefreshTicket = (g.AutoBountyUseTicket == true), -- spend bounty tickets to roll new bounties when none left
     stopWhenDone     = (g.AutoBountyStopWhenDone ~= false),
     loopDelay        = 1.0,
@@ -200,6 +204,7 @@ local function parseProgress(text)
 end
 
 -- returns a list: { {id, world, progress, required, active, complete, trait}, ... }
+local _diagBounties = false
 local function readBounties()
     local out = {}
     local gui = getBountyGui()
@@ -233,17 +238,52 @@ local function readBounties()
                 if t == "Pending" or t == "Claim" then entry.active = true end
             end
 
+            -- Reward detection. The reward icons may be named by the item, OR be
+            -- generic icons that carry the item name in an attribute / child text.
+            -- So we scan every descendant's name, common attributes, and label text
+            -- for any of the trait keywords ("trait" / "reroll").
             local rew = f:FindFirstChild("Rewards")
+            entry.rewardNames = {}
             if rew then
+                local function consider(str)
+                    if type(str) ~= "string" or str == "" then return end
+                    local lc = str:lower()
+                    for _, kw in ipairs(CONFIG.traitKeywords) do
+                        if lc:find(kw, 1, true) then entry.trait = true end
+                    end
+                end
                 for _, r in ipairs(rew:GetChildren()) do
-                    if r:IsA("GuiObject") and r.Name == CONFIG.traitReward then
-                        entry.trait = true
+                    if r:IsA("GuiObject") then entry.rewardNames[#entry.rewardNames + 1] = r.Name end
+                end
+                for _, r in ipairs(rew:GetDescendants()) do
+                    consider(r.Name)
+                    if r:IsA("TextLabel") or r:IsA("TextButton") then consider(r.Text) end
+                    for _, an in ipairs({ "item", "Item", "name", "Name", "reward", "Reward", "id" }) do
+                        local ok, v = pcall(function() return r:GetAttribute(an) end)
+                        if ok and type(v) == "string" then consider(v) end
                     end
                 end
             end
 
             entry.complete = (entry.required > 0) and (entry.progress >= entry.required)
             out[#out + 1] = entry
+        end
+    end
+
+    -- one-time diagnostic: show what each bounty's rewards are actually called so
+    -- we can confirm trait detection (only when we found bounties but no traits)
+    if not _diagBounties and #out > 0 then
+        _diagBounties = true
+        local anyTrait = false
+        for _, e in ipairs(out) do if e.trait then anyTrait = true end end
+        if not anyTrait then
+            for _, e in ipairs(out) do
+                warn(("[Auto Bounty] Bounty %s (%s) rewards: %s"):format(
+                    tostring(e.id), tostring(e.world or "?"),
+                    #e.rewardNames > 0 and table.concat(e.rewardNames, ", ") or "(none read)"))
+            end
+            warn("[Auto Bounty] No trait bounty detected above. If one of these IS " ..
+                "a trait/reroll reward, tell me its exact name so I can match it.")
         end
     end
     return out
@@ -360,6 +400,14 @@ local function step()
         return
     end
 
+    -- SAFETY: figure out if ANY bounty on the board is a trait/reroll one. If not,
+    -- we refuse to decline (unless explicitly forced) so we never wipe the whole
+    -- board because of a reward-name mismatch. This is what caused "all bounties
+    -- disappear on execute".
+    local anyTrait = false
+    for _, b in ipairs(list) do if b.trait then anyTrait = true break end end
+    local mayDecline = CONFIG.declineNonTrait and (anyTrait or CONFIG.declineEvenIfNoTrait)
+
     -- 1) handle the active bounty first (one active at a time)
     local active
     for _, b in ipairs(list) do if b.active then active = b break end end
@@ -438,9 +486,12 @@ local function step()
             return
         end
         -- active bounty does NOT reward trait shards
-        if CONFIG.declineNonTrait then
+        if mayDecline then
             setStatus("Active bounty has no trait reward - declining it")
             bDecline(active.id)
+        elseif CONFIG.declineNonTrait then
+            setStatus("No trait bounty on board - NOT declining (safety). See console.")
+            task.wait(3)
         else
             setStatus("Active bounty has no trait reward (decline disabled) - idle")
             task.wait(2)
@@ -452,7 +503,7 @@ local function step()
     if Session.bounty then forgetBounty() end
 
     -- 2) no active bounty -> clear out a non-trait bounty (one per step)
-    if CONFIG.declineNonTrait then
+    if mayDecline then
         for _, b in ipairs(list) do
             if (not b.trait) and (not b.active) then
                 setStatus(("Declining non-trait bounty (%s)"):format(b.world or "?"))
@@ -474,15 +525,17 @@ local function step()
     end
 
     -- 4) nothing acceptable left
-    local anyTrait = false
-    for _, b in ipairs(list) do if b.trait then anyTrait = true break end end
     if not anyTrait then
         if CONFIG.useRefreshTicket and getTickets() > 0 then
             setStatus("No trait bounties - using a ticket to roll a new one")
             bUseTicket()
             return
         end
-        return "done"
+        -- don't claim "done" and stop; without declining we just idle and keep
+        -- watching in case the board changes (and we never wipe it)
+        setStatus("No trait/reroll bounty available - waiting (board left intact).")
+        task.wait(3)
+        return
     end
 end
 
