@@ -20,7 +20,7 @@
       built-in AFK script). Toggle it in the Misc tab.
 --------------------------------------------------------------------------]]
 
-local VERSION = "1.6.0"   -- bump this each upload so you can confirm the live build
+local VERSION = "1.7.0"   -- bump this each upload so you can confirm the live build
 local NEXUSLIB_URL = "https://raw.githubusercontent.com/headshot7535-png/Nexuslib/main/Nexuslib"
 
 -- ============================================================
@@ -67,6 +67,10 @@ local CONFIG = {
     -- auto-execute: re-run this script automatically after each teleport (lobby <-> battle)
     autoExecute      = (g.AutoBountyAutoExecute ~= false),
     scriptUrl        = g.AutoBountyScriptURL or SCRIPT_URL, -- for queue_on_teleport persistence
+    -- auto-exec install: write a game-guarded loader to the executor's autoexec
+    -- folder so the script ALSO re-runs after a manual rejoin / manual return to
+    -- lobby (queue_on_teleport only covers in-experience teleports).
+    autoexecInstall  = (g.AutoBountyAutoexecInstall ~= false),
     -- anti-afk: prevent the 20-minute idle kick
     antiAfk          = (g.AutoBountyAntiAFK ~= false),
     antiAfkInterval  = 8,                               -- seconds between keep-alive nudges
@@ -708,6 +712,7 @@ local function saveSettings()
             stopWhenDone     = CONFIG.stopWhenDone,
             scriptUrl        = CONFIG.scriptUrl,
             autoExecute      = CONFIG.autoExecute,
+            autoexecInstall  = CONFIG.autoexecInstall,
             antiAfk          = CONFIG.antiAfk,
             liveKills        = CONFIG.liveKills,
             leaveWhenDone    = CONFIG.leaveWhenDone,
@@ -730,6 +735,7 @@ local function loadSettings()
     CONFIG.stopWhenDone     = data.stopWhenDone == true
     -- default these to true when missing from an older settings file
     if data.autoExecute ~= nil then CONFIG.autoExecute = data.autoExecute == true end
+    if data.autoexecInstall ~= nil then CONFIG.autoexecInstall = data.autoexecInstall == true end
     if data.antiAfk ~= nil then CONFIG.antiAfk = data.antiAfk == true end
     if data.liveKills ~= nil then CONFIG.liveKills = data.liveKills == true end
     if data.leaveWhenDone ~= nil then CONFIG.leaveWhenDone = data.leaveWhenDone == true end
@@ -797,6 +803,74 @@ addConn(LP.OnTeleport:Connect(function(state)
     end
 end))
 armReexec()
+-- keep the queue armed at all times so ANY upcoming teleport (manual or server)
+-- re-runs us - some executors consume/clear the queue, so we keep re-arming.
+addThread(function()
+    while alive() do
+        task.wait(5)
+        if CONFIG.autoExecute then pcall(armReexec) end
+    end
+end)
+
+-- ============================================================
+-- Auto-exec install (covers MANUAL rejoins / manual return to lobby)
+-- queue_on_teleport only fires for in-experience TeleportService teleports. If
+-- the player leaves and rejoins (or the executor drops the queue), that won't
+-- fire. So we also drop a tiny loader into the executor's autoexec folder that
+-- runs on EVERY join - but guarded to this game's id so it never runs elsewhere.
+-- ============================================================
+local function installAutoexec()
+    if not CONFIG.autoexecInstall then return end
+    local url = CONFIG.scriptUrl
+    if type(url) ~= "string" or url == "" then return end
+    if type(writefile) ~= "function" then return false end
+    -- guarded loader: only fetch+run when we're actually in this game
+    local gid = tostring(game.GameId)
+    local loader = ([[
+-- Auto Bounty auto-loader (auto-generated). Delete this file to stop auto-run.
+if tostring(game.GameId) == "%s" then
+    task.spawn(function()
+        local ok, src = pcall(function() return game:HttpGet("%s") end)
+        if ok and src then pcall(function() loadstring(src)() end) end
+    end)
+end
+]]):format(gid, url)
+    -- try common autoexec folder layouts across executors
+    local targets = {
+        "autoexec/AutoBounty.lua",
+        "autoexec/autobounty.lua",
+        "auto_exec/AutoBounty.lua",
+        "Autoexec/AutoBounty.lua",
+    }
+    local wrote = false
+    for _, path in ipairs(targets) do
+        local ok = pcall(function()
+            if type(makefolder) == "function" then
+                local dir = path:match("^(.*)/")
+                if dir and type(isfolder) == "function" and not isfolder(dir) then
+                    pcall(makefolder, dir)
+                end
+            end
+            writefile(path, loader)
+        end)
+        if ok then wrote = true end
+    end
+    AB._autoexecPaths = targets
+    return wrote
+end
+local function uninstallAutoexec()
+    if type(delfile) ~= "function" then return false end
+    local any = false
+    for _, path in ipairs(AB._autoexecPaths or {
+        "autoexec/AutoBounty.lua", "autoexec/autobounty.lua",
+        "auto_exec/AutoBounty.lua", "Autoexec/AutoBounty.lua" }) do
+        if pcall(function() if type(isfile) == "function" and isfile(path) then delfile(path) end end) then
+            any = true
+        end
+    end
+    return any
+end
+pcall(installAutoexec)
 
 -- ============================================================
 -- Anti-AFK (prevents the 20-minute idle kick)
@@ -1023,6 +1097,21 @@ local function buildUI()
     Misc:Label((getQueueFn() ~= nil)
         and "Re-exec: supported by this executor ✓"
         or  "Re-exec: NOT supported (queue_on_teleport missing) ✗")
+    Misc:Toggle("Auto-exec on rejoin (autoexec file)",
+        "Re-run even after a manual rejoin / return to lobby", CONFIG.autoexecInstall, function(on)
+            CONFIG.autoexecInstall = on; saveSettings()
+            if on then
+                local ok = installAutoexec()
+                notify("Auto-exec", ok and "Installed - runs on every join of THIS game."
+                    or "Install failed (executor lacks writefile).", ok and "success" or "error")
+            else
+                uninstallAutoexec()
+                notify("Auto-exec", "Removed autoexec loader.", "info")
+            end
+        end)
+    Misc:Label((type(writefile) == "function")
+        and "Rejoin auto-exec: available (writefile ✓)"
+        or  "Rejoin auto-exec: unavailable (no writefile) ✗")
 
     Misc:Toggle("Live kill counter (in Story)",
         "Count the bounty enemy's kills during the stage", CONFIG.liveKills, function(on)
