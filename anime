@@ -20,7 +20,7 @@
       built-in AFK script). Toggle it in the Misc tab.
 --------------------------------------------------------------------------]]
 
-local VERSION = "1.5.1"   -- bump this each upload so you can confirm the live build
+local VERSION = "1.6.0"   -- bump this each upload so you can confirm the live build
 local NEXUSLIB_URL = "https://raw.githubusercontent.com/headshot7535-png/Nexuslib/main/Nexuslib"
 
 -- ============================================================
@@ -158,6 +158,41 @@ local function fireR(folder, name, ...)
 end
 
 -- ============================================================
+-- Authoritative bounty data (server-pushed, exact rewards table)
+-- ------------------------------------------------------------
+-- The game's server sends the full bounty list to the client via the
+-- Bounties.setup RemoteEvent, and accept/decline/claim/use_ticket all RETURN
+-- the updated list. Each bounty carries: world, enemy, difficulty, progress,
+-- required, active, rewards = { ["Trait Shards"] = qty, ... }. Reading this is
+-- 100% reliable - no fragile GUI/icon parsing. We cache it on AB so it survives
+-- re-execution within the same place; setup fires again on each lobby (re)join.
+-- ============================================================
+local function setBountyCache(bounties, tickets)
+    if type(bounties) == "table" then AB.bountyData = bounties end
+    if type(tickets) == "number" then AB.bountyTickets = tickets end
+end
+do
+    local setupR = getRemote("Bounties", "setup")
+    if setupR and setupR.OnClientEvent then
+        addConn(setupR.OnClientEvent:Connect(function(bounties, tickets)
+            setBountyCache(bounties, tickets)
+        end))
+    end
+end
+
+-- does a rewards table (or a list of reward names) contain a trait/reroll reward?
+local function rewardsAreTrait(rewards)
+    if type(rewards) ~= "table" then return false end
+    for itemName in pairs(rewards) do
+        local lc = tostring(itemName):lower()
+        for _, kw in ipairs(CONFIG.traitKeywords) do
+            if lc:find(kw, 1, true) then return true end
+        end
+    end
+    return false
+end
+
+-- ============================================================
 -- GUI helpers / place detection
 -- ============================================================
 local function getMenus()
@@ -205,7 +240,60 @@ end
 
 -- returns a list: { {id, world, progress, required, active, complete, trait}, ... }
 local _diagBounties = false
+
+-- Build the bounty list straight from the authoritative server data when we have
+-- it (exact rewards). Returns nil if we have no cached data yet.
+local function readBountiesFromData()
+    local data = AB.bountyData
+    if type(data) ~= "table" then return nil end
+    local out = {}
+    for k, b in pairs(data) do
+        if type(b) == "table" then
+            local entry = {
+                id       = tonumber(k) or k,
+                world    = b.world,
+                enemy    = b.enemy,
+                progress = tonumber(b.progress) or 0,
+                required = tonumber(b.required) or 0,
+                active   = b.active == true,
+                rewards  = b.rewards,
+                rewardNames = {},
+            }
+            for itemName in pairs(b.rewards or {}) do
+                entry.rewardNames[#entry.rewardNames + 1] = tostring(itemName)
+            end
+            entry.trait = rewardsAreTrait(b.rewards)
+            entry.complete = (entry.required > 0) and (entry.progress >= entry.required)
+            out[#out + 1] = entry
+        end
+    end
+    if #out == 0 then return nil end
+
+    -- one-time diagnostic if the (exact) server rewards still show no trait bounty
+    if not _diagBounties then
+        _diagBounties = true
+        local anyTrait = false
+        for _, e in ipairs(out) do if e.trait then anyTrait = true end end
+        if not anyTrait then
+            for _, e in ipairs(out) do
+                warn(("[Auto Bounty] (server) Bounty %s (%s) rewards: %s"):format(
+                    tostring(e.id), tostring(e.world or "?"),
+                    #e.rewardNames > 0 and table.concat(e.rewardNames, ", ") or "(none)"))
+            end
+            warn("[Auto Bounty] None match trait keywords " ..
+                table.concat(CONFIG.traitKeywords, "/") ..
+                ". Tell me which reward above is the trait/reroll one.")
+        end
+    end
+    return out
+end
+
 local function readBounties()
+    -- 1) authoritative server data (preferred - exact rewards)
+    local fromData = readBountiesFromData()
+    if fromData then return fromData end
+
+    -- 2) fallback: parse the live GUI (cold start before setup has fired)
     local out = {}
     local gui = getBountyGui()
     if not gui then return out end
@@ -238,31 +326,28 @@ local function readBounties()
                 if t == "Pending" or t == "Claim" then entry.active = true end
             end
 
-            -- Reward detection. The reward icons may be named by the item, OR be
-            -- generic icons that carry the item name in an attribute / child text.
-            -- So we scan every descendant's name, common attributes, and label text
-            -- for any of the trait keywords ("trait" / "reroll").
-            local rew = f:FindFirstChild("Rewards")
+            -- Reward detection (GUI fallback). Reward icons are clones of
+            -- Templates.item, parented under a "Rewards" frame, named by the item
+            -- and carrying an "ItemName" TextLabel = item name. We scan the whole
+            -- entry for any "trait"/"reroll" reward (covers it even if the Rewards
+            -- frame is structured differently than expected).
             entry.rewardNames = {}
-            if rew then
-                local function consider(str)
-                    if type(str) ~= "string" or str == "" then return end
-                    local lc = str:lower()
-                    for _, kw in ipairs(CONFIG.traitKeywords) do
-                        if lc:find(kw, 1, true) then entry.trait = true end
-                    end
+            local function consider(str)
+                if type(str) ~= "string" or str == "" then return end
+                local lc = str:lower()
+                for _, kw in ipairs(CONFIG.traitKeywords) do
+                    if lc:find(kw, 1, true) then entry.trait = true end
                 end
-                for _, r in ipairs(rew:GetChildren()) do
-                    if r:IsA("GuiObject") then entry.rewardNames[#entry.rewardNames + 1] = r.Name end
+            end
+            local rew = f:FindFirstChild("Rewards")
+            local scanRoot = rew or f
+            for _, r in ipairs(scanRoot:GetDescendants()) do
+                -- record an ItemName text (or named icon) for diagnostics
+                if r.Name == "ItemName" and (r:IsA("TextLabel") or r:IsA("TextButton")) then
+                    entry.rewardNames[#entry.rewardNames + 1] = r.Text
                 end
-                for _, r in ipairs(rew:GetDescendants()) do
-                    consider(r.Name)
-                    if r:IsA("TextLabel") or r:IsA("TextButton") then consider(r.Text) end
-                    for _, an in ipairs({ "item", "Item", "name", "Name", "reward", "Reward", "id" }) do
-                        local ok, v = pcall(function() return r:GetAttribute(an) end)
-                        if ok and type(v) == "string" then consider(v) end
-                    end
-                end
+                consider(r.Name)
+                if r:IsA("TextLabel") or r:IsA("TextButton") then consider(r.Text) end
             end
 
             entry.complete = (entry.required > 0) and (entry.progress >= entry.required)
@@ -306,14 +391,21 @@ end
 -- Prefer the game's module fn (it InvokeServers + rebuilds the GUI in one go),
 -- fall back to a direct remote call + manual GUI refresh.
 local function doAction(method, remoteName, id)
+    -- Direct remote first: it RETURNS (success, bounties, tickets) so we can keep
+    -- our authoritative cache fresh AND refresh the game's GUI ourselves.
+    local ok, suc, bounties, tickets = invokeR("Bounties", remoteName, id)
+    if ok and suc then
+        setBountyCache(bounties, tickets)
+        refreshGUI(bounties, tickets)
+        return true
+    end
+    -- fallback to the game's own module fn (it InvokeServers + rebuilds the GUI)
     local m = ensureModule()
     if m and m[method] then
         throttle()
-        local ok = pcall(m[method], id)
-        if ok then return true end
+        local ok2 = pcall(m[method], id)
+        if ok2 then return true end
     end
-    local ok, suc, bounties, tickets = invokeR("Bounties", remoteName, id)
-    if ok and suc then refreshGUI(bounties, tickets); return true end
     return false, suc
 end
 local function bAccept(id)    return doAction("accept",      "accept",      id) end
@@ -474,6 +566,7 @@ local function step()
                     active.progress, active.required, (s.runs or 0) + 1))
             s.runs = (s.runs or 0) + 1
             s.lastLaunchProgress = active.progress
+            Session.runKills = 0 -- reset live counter for this new run
             saveSession()
 
             local ok, err = startMap(active.world, act)
@@ -777,87 +870,70 @@ startAntiAFK()
 -- kill. This is a live readout; the server still credits the real bounty count
 -- (reconciled in the lobby). Solo room => every kill is yours.
 -- ============================================================
+local function norm(s) return tostring(s):lower():gsub("%s+", "") end
+-- This is exactly how the game itself registers a kill on the client: the enemy
+-- is a Model in workspace.Characters tagged with attribute type=="Enemies", and
+-- when it dies the server's "destroy" event makes the client Destroy that model
+-- -> fires ChildRemoved. We listen to the SAME removal and count it for the
+-- bounty enemy. Works whether the stage is in-place or a separate place, and we
+-- never depend on lobby detection (which can stay true during in-place battles).
+local function isTargetEnemy(m)
+    local enemy = Session.bounty and Session.bounty.enemy
+    if not enemy then return false end
+    if not (m and m:IsA("Model")) then return false end
+    local ok, t = pcall(function() return m:GetAttribute("type") end)
+    if not ok or t ~= "Enemies" then return false end
+    return norm(m.Name) == norm(enemy)
+end
 local function startKillTracker()
-    addThread(function()
-        local tracking = false
-        local conns = {}
-        local function stop()
-            for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
-            conns = {}
-            tracking = false
-        end
-        local function norm(s) return tostring(s):lower():gsub("%s+", "") end
-        -- in this game enemies are Models cloned into workspace.Characters, tagged
-        -- with attribute type=="Enemies" (allies are "Allies"); a kill Destroys the
-        -- model -> fires ChildRemoved. We count those, filtered to the bounty enemy.
-        while alive() do
-            local battle = not inLobby()
-            local enemy = Session.bounty and Session.bounty.enemy
-            if CONFIG.liveKills and battle and enemy and CONFIG.enabled then
-                if not tracking then
-                    tracking = true
-                    Session.runKills = 0
-                    local target = norm(enemy)
-                    local chars = workspace:FindFirstChild("Characters")
-                    local function isTargetEnemy(m)
-                        if not (m and m:IsA("Model")) then return false end
-                        local ok, t = pcall(function() return m:GetAttribute("type") end)
-                        if not ok or t ~= "Enemies" then return false end
-                        return norm(m.Name) == target
-                    end
-                    local function bind(container)
-                        if not container then return end
-                        conns[#conns + 1] = container.ChildRemoved:Connect(function(m)
-                            if isTargetEnemy(m) then
-                                Session.runKills = (Session.runKills or 0) + 1
-                            end
-                        end)
-                    end
-                    bind(chars)
-                    -- if Characters folder isn't there yet, wait for it then bind
-                    if not chars then
-                        conns[#conns + 1] = workspace.ChildAdded:Connect(function(c)
-                            if c.Name == "Characters" then bind(c) end
-                        end)
-                    end
+    local bound = setmetatable({}, { __mode = "k" })
+    local function bind(container)
+        if not container or bound[container] then return end
+        bound[container] = true
+        addConn(container.ChildRemoved:Connect(function(m)
+            if CONFIG.liveKills and isTargetEnemy(m) then
+                Session.runKills = (Session.runKills or 0) + 1
+            end
+        end))
+    end
+    local existing = workspace:FindFirstChild("Characters")
+    if existing then bind(existing) end
+    -- workspace.Characters may be (re)created per place/stage - rebind on add
+    addConn(workspace.ChildAdded:Connect(function(c)
+        if c.Name == "Characters" then bind(c) end
+    end))
 
-                    -- diagnostic: after a few seconds, if we found no enemy of the
-                    -- target name, print what enemies ARE present so we can verify
-                    task.delay(6, function()
-                        if not alive() or inLobby() then return end
-                        local c = workspace:FindFirstChild("Characters")
-                        if not c then
-                            warn("[Auto Bounty] workspace.Characters not found in battle.")
-                            return
-                        end
-                        local seen, names, found = {}, {}, false
-                        for _, m in ipairs(c:GetChildren()) do
-                            local ok, t = pcall(function() return m:GetAttribute("type") end)
-                            if ok and t == "Enemies" and m:IsA("Model") then
-                                if norm(m.Name) == target then found = true end
-                                if not seen[m.Name] then
-                                    seen[m.Name] = true
-                                    names[#names + 1] = m.Name
-                                end
-                            end
-                        end
-                        if not found then
-                            warn("[Auto Bounty] No enemy named '" .. tostring(enemy) ..
-                                "'. Enemies currently present: " ..
-                                (#names > 0 and table.concat(names, ", ") or "(none yet)"))
-                        end
-                    end)
+    addThread(function()
+        local warned = false
+        while alive() do
+            -- optional: bail out of the stage as soon as the target is met
+            if CONFIG.leaveWhenDone and Session.bounty and Session.bounty.required then
+                local total = (Session.bounty.progress or 0) + (Session.runKills or 0)
+                if total >= Session.bounty.required then
+                    setStatus("Target reached in-stage - leaving to claim...")
+                    pcall(function() fireR("Play", "leave") end)
                 end
-                -- optional: bail out of the stage as soon as the target is met
-                if CONFIG.leaveWhenDone and Session.bounty and Session.bounty.required then
-                    local total = (Session.bounty.progress or 0) + (Session.runKills or 0)
-                    if total >= Session.bounty.required then
-                        setStatus("Target reached in-stage - leaving to claim...")
-                        pcall(function() fireR("Play", "leave") end)
+            end
+            -- diagnostic: bounty active, enemies present, but none match the name
+            if not warned and Session.bounty and Session.bounty.enemy then
+                local c = workspace:FindFirstChild("Characters")
+                if c then
+                    local target, names, seen, found, anyEnemy = norm(Session.bounty.enemy), {}, {}, false, false
+                    for _, m in ipairs(c:GetChildren()) do
+                        local ok, t = pcall(function() return m:GetAttribute("type") end)
+                        if ok and t == "Enemies" and m:IsA("Model") then
+                            anyEnemy = true
+                            if norm(m.Name) == target then found = true end
+                            if not seen[m.Name] then seen[m.Name] = true; names[#names + 1] = m.Name end
+                        end
+                    end
+                    if anyEnemy and not found then
+                        warned = true
+                        warn("[Auto Bounty] Bounty enemy is '" .. tostring(Session.bounty.enemy) ..
+                            "' but enemies present are: " .. table.concat(names, ", ") ..
+                            ". Tell me the right one if the live count stays 0.")
                     end
                 end
-            elseif tracking and (inLobby() or not enemy) then
-                stop()
             end
             task.wait(1)
         end
@@ -1003,7 +1079,7 @@ addThread(function()
             end)
             pcall(function()
                 local sb = Session.bounty
-                if (not lobby) and sb then
+                if sb then
                     local need = sb.required and ((sb.required - (sb.progress or 0))) or "?"
                     statusLabels.kills.Set(("Live kills this run: %d  (need ~%s more)")
                         :format(Session.runKills or 0, tostring(need)))
