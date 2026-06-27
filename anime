@@ -20,7 +20,7 @@
       built-in AFK script). Toggle it in the Misc tab.
 --------------------------------------------------------------------------]]
 
-local VERSION = "1.7.0"   -- bump this each upload so you can confirm the live build
+local VERSION = "1.8.0"   -- bump this each upload so you can confirm the live build
 local NEXUSLIB_URL = "https://raw.githubusercontent.com/headshot7535-png/Nexuslib/main/Nexuslib"
 
 -- ============================================================
@@ -76,7 +76,7 @@ local CONFIG = {
     antiAfkInterval  = 8,                               -- seconds between keep-alive nudges
     maxActs          = tonumber(g.AutoBountyMaxActs) or 7, -- acts to cycle through when finding the enemy
     liveKills        = (g.AutoBountyLiveKills ~= false), -- count bounty-enemy kills live while in Story mode
-    leaveWhenDone    = (g.AutoBountyLeaveWhenDone == true), -- leave the stage early once the target count is met (experimental)
+    leaveWhenDone    = (g.AutoBountyLeaveWhenDone ~= false), -- leave the stage the moment the target count is met (self-disables if the server only banks on stage finish)
 }
 CONFIG.enabled = false                                 -- set from the saved session below
 
@@ -526,6 +526,17 @@ local function step()
             if prev and prev.id == active.id and prev.lastLaunchProgress ~= nil then
                 madeProgress = active.progress > prev.lastLaunchProgress
             end
+            -- self-correct: if we left early last run but the server didn't credit
+            -- the kills, stop early-leaving and just finish stages fully instead.
+            if AB._earlyLeft then
+                AB._earlyLeft = false
+                if not madeProgress then
+                    AB._noEarlyLeave = true
+                    madeProgress = true -- banking issue, not a wrong-act issue
+                    setStatus("Early-leave didn't bank progress - switching to full runs.")
+                    notify("Auto Bounty", "Leaving early didn't credit kills; finishing stages fully now.", "info")
+                end
+            end
             rememberBounty(active) -- preserves act / actsTried / foundAct for the same id
             local s = Session.bounty
 
@@ -571,6 +582,7 @@ local function step()
             s.runs = (s.runs or 0) + 1
             s.lastLaunchProgress = active.progress
             Session.runKills = 0 -- reset live counter for this new run
+            AB._leftRun = false  -- allow one early-leave for this new run
             saveSession()
 
             local ok, err = startMap(active.world, act)
@@ -980,10 +992,16 @@ local function startKillTracker()
     addThread(function()
         local warned = false
         while alive() do
-            -- optional: bail out of the stage as soon as the target is met
-            if CONFIG.leaveWhenDone and Session.bounty and Session.bounty.required then
+            -- leave the stage the moment the target is met, so we return to the
+            -- lobby to claim + accept the next one. Fires once per run (AB._leftRun),
+            -- and self-disables (AB._noEarlyLeave) if it turns out the server only
+            -- banks progress on stage completion (see step()).
+            if CONFIG.leaveWhenDone and not AB._noEarlyLeave and not AB._leftRun
+                and Session.bounty and Session.bounty.required then
                 local total = (Session.bounty.progress or 0) + (Session.runKills or 0)
-                if total >= Session.bounty.required then
+                if (Session.runKills or 0) > 0 and total >= Session.bounty.required then
+                    AB._leftRun = true
+                    AB._earlyLeft = true
                     setStatus("Target reached in-stage - leaving to claim...")
                     pcall(function() fireR("Play", "leave") end)
                 end
@@ -1118,8 +1136,8 @@ local function buildUI()
             CONFIG.liveKills = on; saveSettings()
         end)
     Misc:Toggle("Leave stage when target met",
-        "Experimental: exit early once enough kills (server must bank live)", CONFIG.leaveWhenDone, function(on)
-            CONFIG.leaveWhenDone = on; saveSettings()
+        "Exit to lobby the instant kills hit the goal, then claim + accept next", CONFIG.leaveWhenDone, function(on)
+            CONFIG.leaveWhenDone = on; AB._noEarlyLeave = false; saveSettings()
         end)
 
     Misc:Section("Actions")
@@ -1169,7 +1187,10 @@ addThread(function()
             pcall(function()
                 local sb = Session.bounty
                 if sb then
-                    local need = sb.required and ((sb.required - (sb.progress or 0))) or "?"
+                    local need = "?"
+                    if sb.required then
+                        need = math.max(0, sb.required - (sb.progress or 0) - (Session.runKills or 0))
+                    end
                     statusLabels.kills.Set(("Live kills this run: %d  (need ~%s more)")
                         :format(Session.runKills or 0, tostring(need)))
                 else
