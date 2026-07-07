@@ -25,9 +25,17 @@
     ANTI-AFK:
       Blocks the 20-minute idle kick (Idled hook + input nudge + disables any
       built-in AFK script). Toggle it in the Misc tab.
+
+    DPS METER (v1.9.5):
+      Live team DPS from leaderstats.Damage + theoretical per-slot DPS (dmg/cd)
+      for equipped units. See the DPS tab.
+
+    DAILY TRAIT LEAVE (v1.9.6):
+      Leaves the stage as soon as a map's daily Trait Shard cap is full (no more
+      waiting for the whole raid to finish).
 --------------------------------------------------------------------------]]
 
-local VERSION = "1.9.3"   -- bump this each upload so you can confirm the live build
+local VERSION = "1.9.6"   -- bump this each upload so you can confirm the live build
 local NEXUSLIB_URL = "https://raw.githubusercontent.com/headshot7535-png/Nexuslib/main/Nexuslib"
 
 -- ============================================================
@@ -124,6 +132,7 @@ local CONFIG = {
     dailyDifficulty  = g.AutoBountyDailyDifficulty or "Normal", -- "Normal" | "Hard" for daily maps
     dailyStopWhenDone = (g.AutoBountyDailyStopWhenDone ~= false),
     dailyStallRuns   = tonumber(g.AutoBountyDailyStallRuns) or 3, -- no cap gain after N clears => treat as maxed
+    dpsMeter         = (g.AutoBountyDpsMeter ~= false),           -- live team DPS + theoretical per-unit panel
 }
 CONFIG.enabled = false                                 -- set from the saved session below
 
@@ -590,6 +599,209 @@ local function countOpenTraitMaps()
     return open
 end
 
+-- ============================================================
+-- DPS meter (live team DPS via leaderstats + theoretical per-unit)
+-- CombatProbe confirmed: leaderstats.Damage replicates; no per-unit damage counter.
+-- ============================================================
+local _Helper
+local function getHelper()
+    if _Helper then return _Helper end
+    local ok, h = pcall(function() return require(ReplicatedStorage.Shared.Helper) end)
+    if ok then _Helper = h end
+    return _Helper
+end
+
+local function fmtNum(n)
+    n = tonumber(n) or 0
+    if math.abs(n) >= 1e9 then return string.format("%.2fB", n / 1e9)
+    elseif math.abs(n) >= 1e6 then return string.format("%.2fM", n / 1e6)
+    elseif math.abs(n) >= 1e4 then return string.format("%.1fK", n / 1e3)
+    elseif math.abs(n) >= 1e3 then return string.format("%.2fK", n / 1e3)
+    else return string.format("%.0f", n) end
+end
+
+local Dps = { dps = 0, peak = 0, stageBase = nil, lastVal = nil, lastTick = nil, takedowns = nil }
+
+local function resetDpsStage()
+    Dps.stageBase = nil
+    Dps.lastVal = nil
+    Dps.lastTick = nil
+    Dps.peak = 0
+    Dps.dps = 0
+end
+
+local function findLeaderstat(keyword)
+    local ls = LP:FindFirstChild("leaderstats")
+    if not ls then return nil end
+    local exact = ls:FindFirstChild(keyword)
+    if exact and (exact:IsA("IntValue") or exact:IsA("NumberValue")) then return exact end
+    local kw = tostring(keyword):lower()
+    for _, c in ipairs(ls:GetChildren()) do
+        if (c:IsA("IntValue") or c:IsA("NumberValue")) and c.Name:lower():find(kw, 1, true) then
+            return c
+        end
+    end
+    return nil
+end
+
+local function getDamageStat()
+    return findLeaderstat("Damage")
+end
+
+local function getTakedownStat()
+    return findLeaderstat("Takedowns")
+end
+
+local function sampleTeamDps()
+    local d = getDamageStat()
+    if not d then Dps.dps = 0; return end
+    local now = tick()
+    local val = d.Value
+    if Dps.lastVal == nil or Dps.stageBase == nil then
+        Dps.stageBase = val
+        Dps.lastVal = val
+        Dps.lastTick = now
+        return
+    end
+    local dt = now - (Dps.lastTick or now)
+    if dt < 0.4 then return end
+    local delta = val - Dps.lastVal
+    if delta < 0 then
+        Dps.stageBase = val
+        Dps.peak = 0
+        delta = 0
+    end
+    Dps.dps = delta / dt
+    if Dps.dps > Dps.peak then Dps.peak = Dps.dps end
+    Dps.lastVal = val
+    Dps.lastTick = now
+    local tk = getTakedownStat()
+    if tk then Dps.takedowns = tk.Value end
+end
+
+local function getEquippedUnits()
+    local data = getPlayerData()
+    if not data then return {}, data end
+    local list = {}
+    for i = 1, 6 do
+        local unit
+        if type(data.equipped) == "table" and type(data.equipped[i]) == "table" and data.equipped[i].name then
+            unit = data.equipped[i]
+        elseif type(data.characters) == "table" then
+            for _, ch in pairs(data.characters) do
+                if type(ch) == "table" and ch.equipped == true and ch.name and tonumber(ch.index) == i then
+                    unit = ch
+                    break
+                end
+            end
+        end
+        list[i] = unit
+    end
+    return list, data
+end
+
+local function calcUnitDps(unit, playerData)
+    local h = getHelper()
+    if not h or type(h.calculate_stat) ~= "function" then return 0, 0, 0 end
+    local dmg = tonumber(h.calculate_stat(unit, "damage", playerData)) or 0
+    local cd = tonumber(h.calculate_stat(unit, "cooldown", playerData)) or 1
+    if cd <= 0.05 then cd = 1 end
+    return dmg / cd, dmg, cd
+end
+
+local function getLiveAllies()
+    local ok, chars = pcall(function() return require(LP.PlayerScripts.Client.Characters) end)
+    if not ok or type(chars) ~= "table" or type(chars.all) ~= "table" then return {} end
+    local list = {}
+    for _, ent in pairs(chars.all) do
+        if type(ent) == "table" and ent.type == "Allies" and ent.owner == LP.Name and ent.name then
+            list[#list + 1] = {
+                name = ent.name,
+                hp = tonumber(ent.health) or 0,
+                maxHp = tonumber(ent.max_health) or tonumber(ent.health) or 0,
+            }
+        end
+    end
+    table.sort(list, function(a, b) return a.name < b.name end)
+    return list
+end
+
+-- Must exist before refreshDpsLabels (defined above UI build); locals below are not visible here.
+local statusLabels = {}
+local function setLabel(lbl, text)
+    if not lbl then return end
+    pcall(function()
+        if type(lbl.Set) == "function" then lbl.Set(text)
+        elseif lbl.Text ~= nil then lbl.Text = text end
+    end)
+end
+
+local function refreshDpsLabels()
+    if not CONFIG.dpsMeter then return end
+    sampleTeamDps()
+    local d = getDamageStat()
+    local stageDmg = 0
+    if d and Dps.stageBase then stageDmg = math.max(0, d.Value - Dps.stageBase) end
+
+    setLabel(statusLabels.teamDps, d
+        and ("Team DPS: %s/s  |  peak %s/s"):format(fmtNum(Dps.dps), fmtNum(Dps.peak))
+        or  "Team DPS: - (enter a stage)")
+    local tkStr = Dps.takedowns and ("  |  takedowns %d"):format(Dps.takedowns) or ""
+    setLabel(statusLabels.teamDmg, d
+        and ("Stage damage: %s  |  total %s%s"):format(fmtNum(stageDmg), fmtNum(d.Value), tkStr)
+        or  "Stage damage: -")
+
+    local equipped, pdata = getEquippedUnits()
+    for i = 1, 6 do
+        local lbl = statusLabels["unit" .. i]
+        if lbl then
+            local u = equipped[i]
+            if u then
+                local dps, dmg, cd = calcUnitDps(u, pdata)
+                setLabel(lbl, ("Slot %d: %s  —  %s/s  (dmg %s / cd %.2fs)")
+                    :format(i, u.name, fmtNum(dps), fmtNum(dmg), cd))
+            else
+                setLabel(lbl, ("Slot %d: empty"):format(i))
+            end
+        end
+    end
+
+    local allies = getLiveAllies()
+    if #allies == 0 then
+        setLabel(statusLabels.liveAllies, "Live allies on map: -")
+    else
+        local parts = {}
+        for _, a in ipairs(allies) do
+            parts[#parts + 1] = ("%s %s/%s"):format(a.name, fmtNum(a.hp), fmtNum(a.maxHp))
+        end
+        setLabel(statusLabels.liveAllies, "Live allies: " .. table.concat(parts, "  |  "))
+    end
+end
+
+local function startDpsTracker()
+    local function hookDamage()
+        local d = getDamageStat()
+        if not d or d:GetAttribute("_ab_dps") then return end
+        d:SetAttribute("_ab_dps", true)
+        addConn(d:GetPropertyChangedSignal("Value"):Connect(function()
+            if CONFIG.dpsMeter then sampleTeamDps() end
+        end))
+    end
+    hookDamage()
+    addConn(LP.ChildAdded:Connect(function(c)
+        if c.Name == "leaderstats" then task.defer(hookDamage) end
+    end))
+    local function onCharacters(folder)
+        resetDpsStage()
+        task.defer(hookDamage)
+    end
+    local existing = workspace:FindFirstChild("Characters")
+    if existing then onCharacters(existing) end
+    addConn(workspace.ChildAdded:Connect(function(c)
+        if c.Name == "Characters" then onCharacters(c) end
+    end))
+end
+
 local function nextTraitMap(startIdx)
     local n = #TRAIT_DAILY_MAPS
     if n == 0 then return nil end
@@ -620,6 +832,88 @@ end
 local function forgetDailyMap()
     Session.dailyFarm = nil
     if saveSession then saveSession() end
+end
+
+local function findTraitMapEntry(world, mode, act)
+    for _, m in ipairs(TRAIT_DAILY_MAPS) do
+        if m.world == world and m.mode == mode and tonumber(m.act) == tonumber(act) then
+            return m
+        end
+    end
+    return nil
+end
+
+local function getCurrentPlayMap()
+    local ok, play = pcall(function() return require(LP.PlayerScripts.Client.Play) end)
+    if ok and play and type(play.current) == "table" then
+        local c = play.current
+        if c.world and c.mode and c.act then
+            return findTraitMapEntry(c.world, c.mode, c.act) or {
+                world = c.world, mode = c.mode, act = c.act, cap = 100,
+            }
+        end
+    end
+    return nil
+end
+
+local function resolveDailyMap()
+    local df = Session.dailyFarm
+    if df and df.world and df.mode and df.act then
+        return findTraitMapEntry(df.world, df.mode, df.act) or {
+            world = df.world, mode = df.mode, act = df.act, cap = df.cap or 100,
+        }
+    end
+    return getCurrentPlayMap()
+end
+
+local function leaveStageIfCapped(map, reason)
+    if not map or not isTraitCapMaxed(map) then return false end
+    setStatus(reason or ("Daily cap full on " .. map.world .. " - leaving stage..."))
+    notify("Daily Traits", map.world .. " cap reached (" .. getTraitCapCount(map) .. "/" .. map.cap .. ") — leaving.", "success")
+    pcall(function() fireR("Play", "leave") end)
+    AB._dailyLeftCap = true
+    return true
+end
+
+local function waitForLobbyReturn(timeout)
+    local t0 = tick()
+    while alive() and not inLobby() and (tick() - t0) < (timeout or 45) do
+        task.wait(1)
+    end
+    if inLobby() then
+        task.wait(2)
+        setStatus("Returned to lobby.")
+        return true
+    end
+    return false
+end
+
+-- block until stage ends; leave early the moment this map's daily cap is full
+local function waitForDailyRun(map)
+    local t0 = tick()
+    while alive() and CONFIG.enabled and inLobby() and (tick() - t0) < 12 do
+        task.wait(0.5)
+    end
+    if not alive() or not CONFIG.enabled then return false end
+
+    if inLobby() then
+        setStatus("Daily traits - waiting for stage to start...")
+        local t1 = tick()
+        while alive() and CONFIG.enabled and inLobby() and (tick() - t1) < CONFIG.farmTimeout do
+            task.wait(2)
+        end
+        if inLobby() then return false end
+    end
+
+    setStatus(("Daily traits - fighting %s %s Act %d, watching cap..."):format(map.mode, map.world, map.act))
+    local t2 = tick()
+    while alive() and CONFIG.enabled and not inLobby() and (tick() - t2) < CONFIG.farmTimeout do
+        if leaveStageIfCapped(map) then break end
+        task.wait(1)
+    end
+
+    waitForLobbyReturn(45)
+    return true
 end
 
 -- block until we leave lobby (battle started) then return to lobby
@@ -686,8 +980,20 @@ end
 -- one decision step for daily trait caps; returns "done" when all maps are maxed
 local function dailyTraitStep()
     if not CONFIG.dailyTraitFarm then return end
+
     if not inLobby() then
-        setStatus("Daily traits - not in lobby, waiting...")
+        local map = resolveDailyMap()
+        if map then
+            local cur = getTraitCapCount(map)
+            if leaveStageIfCapped(map) then
+                waitForLobbyReturn(45)
+                return
+            end
+            setStatus(("Daily traits - in %s %s Act %d  %d/%d"):format(
+                map.mode, map.world, map.act, cur, map.cap))
+        else
+            setStatus("Daily traits - in stage, watching cap...")
+        end
         return
     end
 
@@ -713,6 +1019,15 @@ local function dailyTraitStep()
     end
 
     local beforeCap = getTraitCapCount(map)
+    if isTraitCapMaxed(map) then
+        local skipDf = Session.dailyFarm or {}
+        skipDf.idx = (idx % #TRAIT_DAILY_MAPS) + 1
+        Session.dailyFarm = skipDf
+        saveSession()
+        setStatus(map.world .. " already capped - skipping to next map")
+        return
+    end
+
     rememberDailyMap(map, idx)
     local df = Session.dailyFarm
     df.runs = (df.runs or 0) + 1
@@ -735,7 +1050,7 @@ local function dailyTraitStep()
         return
     end
 
-    waitForStageReturn()
+    waitForDailyRun(map)
 
     local afterCap = getTraitCapCount(map)
     if afterCap > beforeCap then
@@ -747,7 +1062,10 @@ local function dailyTraitStep()
     saveSession()
 
     if isTraitCapMaxed(map) then
-        notify("Daily Traits", map.world .. " cap reached (" .. map.cap .. ")", "success")
+        if not AB._dailyLeftCap then
+            notify("Daily Traits", map.world .. " cap reached (" .. map.cap .. ")", "success")
+        end
+        AB._dailyLeftCap = nil
         df.idx = (idx % #TRAIT_DAILY_MAPS) + 1
         saveSession()
         return
@@ -1038,6 +1356,7 @@ local function saveSettings()
             bountyFarm       = CONFIG.bountyFarm,
             dailyDifficulty  = CONFIG.dailyDifficulty,
             dailyStopWhenDone = CONFIG.dailyStopWhenDone,
+            dpsMeter          = CONFIG.dpsMeter,
         }
         pcall(function() writefile(SETTINGS_FILE, HttpService:JSONEncode(data)) end)
     end)
@@ -1067,6 +1386,7 @@ local function loadSettings()
         CONFIG.dailyDifficulty = data.dailyDifficulty
     end
     if data.dailyStopWhenDone ~= nil then CONFIG.dailyStopWhenDone = data.dailyStopWhenDone == true end
+    if data.dpsMeter ~= nil then CONFIG.dpsMeter = data.dpsMeter == true end
     if type(data.scriptUrl) == "string" and data.scriptUrl ~= "" then CONFIG.scriptUrl = data.scriptUrl end
 end
 loadSettings()
@@ -1452,6 +1772,7 @@ local function startKillTracker()
     end)
 end
 startKillTracker()
+startDpsTracker()
 
 -- ============================================================
 -- UI
@@ -1462,14 +1783,6 @@ do
     if ok then Lib = lib end
 end
 
-local statusLabels = {}
-local function setLabel(lbl, text)
-    if not lbl then return end
-    pcall(function()
-        if type(lbl.Set) == "function" then lbl.Set(text)
-        elseif lbl.Text ~= nil then lbl.Text = text end
-    end)
-end
 local function refreshDailyCapLabels()
     local df = Session.dailyFarm
     if df then
@@ -1571,6 +1884,29 @@ local function buildUI()
     St:Section("Remembered (survives Story teleport)")
     statusLabels.memory  = St:Label("Target: none")
     statusLabels.kills   = St:Label("Live kills this run: -")
+
+    -- ----- DPS tab -----
+    local DpsTab = Win:Tab("📈", "DPS")
+    DpsTab:Section("Live team (leaderstats.Damage)")
+    statusLabels.teamDps = DpsTab:Label("Team DPS: -")
+    statusLabels.teamDmg = DpsTab:Label("Stage damage: -")
+    DpsTab:Label("Updates in-stage from your leaderstats Damage stat.")
+    DpsTab:Section("Equipped team (theoretical DPS = dmg / cd)")
+    for i = 1, 6 do
+        statusLabels["unit" .. i] = DpsTab:Label(("Slot %d: -"):format(i))
+    end
+    DpsTab:Section("Live allies on map")
+    statusLabels.liveAllies = DpsTab:Label("Live allies on map: -")
+    DpsTab:Section("Settings")
+    DpsTab:Toggle("Enable DPS meter",
+        "Live team DPS + theoretical per-slot DPS readout", CONFIG.dpsMeter, function(on)
+            CONFIG.dpsMeter = on; saveSettings()
+            if on then task.defer(refreshDpsLabels) end
+        end)
+    DpsTab:Button("🔄", "Reset stage DPS", "Clear peak/session baseline", nil, function()
+        resetDpsStage(); refreshDpsLabels(); notify("DPS", "Stage baseline reset.", "info")
+    end)
+    task.defer(refreshDpsLabels)
 
     -- ----- Misc tab -----
     local Misc = Win:Tab("⚙️", "Misc")
@@ -1693,6 +2029,7 @@ addThread(function()
             end
             -- daily trait cap readout (lobby or battle)
             pcall(refreshDailyCapLabels)
+            pcall(refreshDpsLabels)
         end
         task.wait(1)
     end
