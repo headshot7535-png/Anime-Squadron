@@ -16,25 +16,56 @@
       map. Loops through all maps until every daily trait cap is filled.
 
     AUTO EXECUTE:
-      Starting a stage teleports you to a battle place. Auto Execute uses
-      queue_on_teleport to re-run this script (from SCRIPT_URL) after every
-      teleport so the loop resumes automatically. Toggle it in Misc, or
-      override the url with getgenv().AutoBountyScriptURL = "...".
+      queue_on_teleport re-runs this script after EVERY teleport (manual or
+      script-initiated). The queue is kept armed continuously + re-armed on
+      OnTeleport so manual lobby/stage hops still resume. Autoexec file (Misc
+      tab) is ONLY for full manual rejoins - it skips when a teleport queue
+      already fired, preventing double execution.
 
     ANTI-AFK:
       Blocks the 20-minute idle kick (Idled hook + input nudge + disables any
       built-in AFK script). Toggle it in the Misc tab.
 --------------------------------------------------------------------------]]
 
-local VERSION = "1.9.0"   -- bump this each upload so you can confirm the live build
+local VERSION = "1.9.2"   -- bump this each upload so you can confirm the live build
 local NEXUSLIB_URL = "https://raw.githubusercontent.com/headshot7535-png/Nexuslib/main/Nexuslib"
 
 -- ============================================================
--- Anti-stacking generation token
+-- Anti-stacking generation token + boot lock (prevents double GUI on teleport)
 -- ============================================================
 _G.AutoBountyGen = (_G.AutoBountyGen or 0) + 1
 local GEN = _G.AutoBountyGen
 local function alive() return _G.AutoBountyGen == GEN end
+
+local BOOT_LOCK_FILE = "AutoBounty_boot_lock.json"
+local function canFileEarly()
+    return (writefile and readfile and isfile) and true or false
+end
+local function claimScriptBoot()
+    local now = tick()
+    if _G.AB_BootAt and (now - _G.AB_BootAt) < 4 then return false end
+    _G.AB_BootAt = now
+    if not canFileEarly() then return true end
+    local job = game.JobId
+    if isfile(BOOT_LOCK_FILE) then
+        local ok, raw = pcall(readfile, BOOT_LOCK_FILE)
+        if ok and raw and raw ~= "" then
+            local ok2, d = pcall(function()
+                return game:GetService("HttpService"):JSONDecode(raw)
+            end)
+            if ok2 and type(d) == "table" and d.job == job and (now - (d.at or 0)) < 4 then
+                return false
+            end
+        end
+    end
+    pcall(function()
+        writefile(BOOT_LOCK_FILE, game:GetService("HttpService"):JSONEncode({
+            job = job, at = now,
+        }))
+    end)
+    return true
+end
+if not claimScriptBoot() then return end
 
 -- persistent state (survives re-execution / teleport)
 _G.AB = _G.AB or {}
@@ -73,10 +104,10 @@ local CONFIG = {
     -- auto-execute: re-run this script automatically after each teleport (lobby <-> battle)
     autoExecute      = (g.AutoBountyAutoExecute ~= false),
     scriptUrl        = g.AutoBountyScriptURL or SCRIPT_URL, -- for queue_on_teleport persistence
-    -- auto-exec install: write a game-guarded loader to the executor's autoexec
-    -- folder so the script ALSO re-runs after a manual rejoin / manual return to
-    -- lobby (queue_on_teleport only covers in-experience teleports).
-    autoexecInstall  = (g.AutoBountyAutoexecInstall ~= false),
+    -- auto-exec install: optional loader for MANUAL rejoins only (not teleports).
+    -- Disabled by default because queue_on_teleport handles in-game teleports
+    -- and running both caused double script execution on arrival.
+    autoexecInstall  = (g.AutoBountyAutoexecInstall == true),
     -- anti-afk: prevent the 20-minute idle kick
     antiAfk          = (g.AutoBountyAntiAFK ~= false),
     antiAfkInterval  = 8,                               -- seconds between keep-alive nudges
@@ -461,24 +492,34 @@ end
 -- ============================================================
 -- Maps with Trait Shards + daily cap (fallback if runtime discovery fails).
 local TRAIT_DAILY_MAPS = {
-    { world = "GT City",          mode = "Raid",      act = 4, cap = 100 },
-    { world = "Eclipse (Before)", mode = "Raid",      act = 4, cap = 100 },
-    { world = "Katakara Bridge",  mode = "Challenge", act = 1, cap = 100 },
+    { world = "GT City",            mode = "Raid",      act = 4, cap = 100 },
+    { world = "Eclipse (Before)",   mode = "Raid",      act = 4, cap = 100 },
+    { world = "Katakara Bridge",    mode = "Challenge", act = 1, cap = 100 },
+    { world = "The Hero Hunter",    mode = "Challenge", act = 1, cap = 30 },
+    { world = "The Lava Continent", mode = "Invasion",  act = 4, cap = 100 },
 }
+
+local WORLD_INDICES = { 1, 2, 3, 4, 5, -1, -2, -3, -4, -5 }
 
 local function discoverTraitMaps()
     local found, seen = {}, {}
     local function add(m)
         if type(m) ~= "table" or not m.world or not m.mode or not m.act then return end
         local key = m.mode .. "|" .. m.world .. "|" .. tostring(m.act)
-        if seen[key] then return end
-        seen[key] = true
-        found[#found + 1] = m
+        local cap = tonumber(m.cap) or 100
+        if seen[key] then
+            -- same map can list different caps per difficulty; keep the higher one
+            if cap > seen[key].cap then seen[key].cap = cap end
+            return
+        end
+        local entry = { world = m.world, mode = m.mode, act = m.act, cap = cap }
+        seen[key] = entry
+        found[#found + 1] = entry
     end
     for _, m in ipairs(TRAIT_DAILY_MAPS) do add(m) end
     local ok, Worlds = pcall(function() return require(LP.PlayerScripts.Client.Play.Worlds) end)
     if ok and type(Worlds) == "table" then
-        for _, idx in ipairs({ 1, 2, 3, 4, -1, -2 }) do
+        for _, idx in ipairs(WORLD_INDICES) do
             local w = Worlds[idx]
             if type(w) == "table" and w.name and type(w.Rewards) == "table" then
                 for mode, modeData in pairs(w.Rewards) do
@@ -1059,8 +1100,12 @@ loadSession()
 CONFIG.enabled = Session.running == true
 
 -- ============================================================
--- Teleport persistence (re-exec after returning to lobby)
+-- Teleport persistence (re-exec after ANY teleport - manual or script)
+-- queue_on_teleport MUST be armed BEFORE the teleport happens. We keep it
+-- armed at all times + re-arm instantly on OnTeleport so manual hops work.
 -- ============================================================
+local QUEUE_ARM_FILE = "AutoBounty_queue_arm.json"
+
 local function getQueueFn()
     return (syn and syn.queue_on_teleport)
         or (fluxus and fluxus.queue_on_teleport)
@@ -1068,60 +1113,91 @@ local function getQueueFn()
         or queueonteleport
         or (getgenv and getgenv().queue_on_teleport)
 end
+
+local function markQueueArmed()
+    if not canFile() then return end
+    pcall(function()
+        writefile(QUEUE_ARM_FILE, HttpService:JSONEncode({
+            ts    = os.time(),
+            job   = game.JobId,
+            place = game.PlaceId,
+        }))
+    end)
+end
+
+local function buildQueuePayload(url)
+    -- boot guard inside the queued chunk prevents double-run if two sources fire
+    return ([[
+-- Auto Bounty teleport loader
+if _G.AB_TP_BOOT and (tick() - _G.AB_TP_BOOT) < 8 then return end
+_G.AB_TP_BOOT = tick()
+local _u = %q
+task.defer(function()
+    local ok, src = pcall(function() return game:HttpGet(_u) end)
+    if ok and src then pcall(function() loadstring(src)() end) end
+end)
+]]):format(url)
+end
+
 armReexec = function()
-    if not CONFIG.autoExecute then return end
+    if not CONFIG.autoExecute then return false end
     local url = CONFIG.scriptUrl
-    if type(url) ~= "string" or url == "" then return end
+    if type(url) ~= "string" or url == "" then return false end
     local q = getQueueFn()
     if not q then return false end
-    -- guard against double-queue within the same place
+    -- debounce rapid re-arms in the same place (periodic loop + OnTeleport)
     local now = tick()
-    if AB._lastQueue and (now - AB._lastQueue) < 3 then return true end
+    if AB._lastQueue and (now - AB._lastQueue) < 1.5 then return true end
     AB._lastQueue = now
-    pcall(q, ([[loadstring(game:HttpGet("%s"))()]]):format(url))
+    markQueueArmed()
+    pcall(q, buildQueuePayload(url))
     return true
 end
--- OnTeleport: compare by NAME string so a missing Enum member can't crash us
-addConn(LP.OnTeleport:Connect(function(state)
-    local name = (typeof(state) == "EnumItem") and state.Name or tostring(state)
-    if name == "Started" or name == "RequestedByServer" or name == "InProgress" then
-        pcall(armReexec)
-    end
+
+-- Re-arm on ANY teleport state (manual return-to-lobby, stage start, server TP, etc.)
+addConn(LP.OnTeleport:Connect(function(_)
+    if CONFIG.autoExecute then pcall(armReexec) end
 end))
-armReexec()
--- keep the queue armed at all times so ANY upcoming teleport (manual or server)
--- re-runs us - some executors consume/clear the queue, so we keep re-arming.
+
+-- Arm immediately on load, then keep armed forever (executors may consume the queue)
+pcall(armReexec)
 addThread(function()
     while alive() do
-        task.wait(5)
+        task.wait(3)
         if CONFIG.autoExecute then pcall(armReexec) end
     end
 end)
 
 -- ============================================================
--- Auto-exec install (covers MANUAL rejoins / manual return to lobby)
--- queue_on_teleport only fires for in-experience TeleportService teleports. If
--- the player leaves and rejoins (or the executor drops the queue), that won't
--- fire. So we also drop a tiny loader into the executor's autoexec folder that
--- runs on EVERY join - but guarded to this game's id so it never runs elsewhere.
+-- Auto-exec install (MANUAL rejoin only - NOT in-game teleports)
+-- Skips when queue_on_teleport recently armed, which prevents double execution.
 -- ============================================================
 local function installAutoexec()
     if not CONFIG.autoexecInstall then return end
     local url = CONFIG.scriptUrl
     if type(url) ~= "string" or url == "" then return end
     if type(writefile) ~= "function" then return false end
-    -- guarded loader: only fetch+run when we're actually in this game
     local gid = tostring(game.GameId)
     local loader = ([[
--- Auto Bounty auto-loader (auto-generated). Delete this file to stop auto-run.
-if tostring(game.GameId) == "%s" then
-    task.spawn(function()
-        local ok, src = pcall(function() return game:HttpGet("%s") end)
-        if ok and src then pcall(function() loadstring(src)() end) end
-    end)
-end
+-- Auto Bounty rejoin loader (auto-generated). Delete to stop auto-run on rejoin.
+if tostring(game.GameId) ~= %q then return end
+task.defer(function()
+    task.wait(0.6)
+    if _G.AB_TP_BOOT and (tick() - _G.AB_TP_BOOT) < 8 then return end
+    local HS = game:GetService("HttpService")
+    local arm = "AutoBounty_queue_arm.json"
+    if readfile and isfile and isfile(arm) then
+        local ok, r = pcall(readfile, arm)
+        if ok and r and r ~= "" then
+            local ok2, d = pcall(function() return HS:JSONDecode(r) end)
+            if ok2 and d and os.time() - (tonumber(d.ts) or 0) < 25 then return end
+        end
+    end
+    if _G.AB_BootAt and (tick() - _G.AB_BootAt) < 5 then return end
+    local ok, src = pcall(function() return game:HttpGet(%q) end)
+    if ok and src then pcall(function() loadstring(src)() end) end
+end)
 ]]):format(gid, url)
-    -- try common autoexec folder layouts across executors
     local targets = {
         "autoexec/AutoBounty.lua",
         "autoexec/autobounty.lua",
@@ -1159,12 +1235,78 @@ end
 pcall(installAutoexec)
 
 -- ============================================================
--- Anti-AFK (prevents the 20-minute idle kick)
+-- Anti-AFK (Roblox idle kick + block game's AFK Chamber popup)
 -- ============================================================
+local function blockGameAFK()
+    local hooked = {}
+
+    local function neuterYes(btn)
+        if not btn or not btn:IsA("GuiButton") then return end
+        pcall(function()
+            btn.Active = false
+            btn.AutoButtonColor = false
+        end)
+        if hooked[btn] then return end
+        hooked[btn] = true
+        addConn(btn.Activated:Connect(function() end))
+        addConn(btn.MouseButton1Click:Connect(function() end))
+    end
+
+    local function hideAfkGui(gui)
+        if not gui then return end
+        pcall(function() gui.Visible = false end)
+        if not hooked[gui] then
+            hooked[gui] = true
+            if gui:IsA("GuiObject") then
+                addConn(gui:GetPropertyChangedSignal("Visible"):Connect(function()
+                    if CONFIG.antiAfk and gui.Visible then
+                        pcall(function() gui.Visible = false end)
+                    end
+                end))
+            end
+        end
+        for _, d in ipairs(gui:GetDescendants()) do
+            if d.Name == "Yes" and d:IsA("GuiButton") then neuterYes(d) end
+        end
+    end
+
+    local function scanMenus(menus)
+        if not menus then return end
+        hideAfkGui(menus:FindFirstChild("AFK Chamber"))
+        local prompts = menus:FindFirstChild("Prompts")
+        if prompts then
+            hideAfkGui(prompts:FindFirstChild("AFK Chamber"))
+            if not hooked[prompts] then
+                hooked[prompts] = true
+                addConn(prompts.ChildAdded:Connect(function(c)
+                    if CONFIG.antiAfk and c.Name == "AFK Chamber" then hideAfkGui(c) end
+                end))
+            end
+        end
+    end
+
+    scanMenus(getMenus())
+    addConn(LP.ChildAdded:Connect(function(c)
+        if c.Name == "PlayerGui" then
+            task.defer(function() scanMenus(c:FindFirstChild("Menus")) end)
+        end
+    end))
+
+    -- stop the game's own teleport_afk_chamber handler from firing
+    pcall(function()
+        local pm = require(LP.PlayerScripts.Client.Players)
+        if type(pm) == "table" then
+            pm.teleport_afk_chamber = function() end
+        end
+    end)
+end
+
 local function startAntiAFK()
     local VirtualUser = game:GetService("VirtualUser")
     local VIM = nil
     pcall(function() VIM = game:GetService("VirtualInputManager") end)
+
+    blockGameAFK()
 
     -- 1) definitive backstop: reset idle the instant Roblox fires Idled
     addConn(LP.Idled:Connect(function()
@@ -1183,7 +1325,7 @@ local function startAntiAFK()
         for _, d in ipairs(root:GetDescendants()) do
             if d:IsA("LocalScript") then
                 local n = d.Name:lower()
-                if n:find("afk") or n:find("idle") then
+                if n:find("afk") or n:find("idle") or n:find("kick") then
                     pcall(function() d.Disabled = true end)
                 end
             end
@@ -1194,18 +1336,18 @@ local function startAntiAFK()
         addConn(ps.ChildAdded:Connect(function(c)
             if CONFIG.antiAfk and c:IsA("LocalScript") then
                 local n = c.Name:lower()
-                if n:find("afk") or n:find("idle") then
+                if n:find("afk") or n:find("idle") or n:find("kick") then
                     pcall(function() c.Disabled = true end)
                 end
             end
         end))
     end
 
-    -- 2) proactive keep-alive: send a harmless input (VirtualInputManager
-    --    preferred per its broader detection coverage) + re-disable afk scripts
+    -- 2) proactive keep-alive + re-block game AFK UI if it reappears
     addThread(function()
         while alive() do
             if CONFIG.antiAfk then
+                blockGameAFK()
                 disableAfkScripts(LP:FindFirstChild("PlayerScripts"))
                 disableAfkScripts(LP:FindFirstChildOfClass("PlayerGui"))
                 if VIM then
@@ -1407,19 +1549,20 @@ local function buildUI()
 
     Misc:Section("Session")
     Misc:Toggle("Anti-AFK",
-        "Block the 20-min idle kick", CONFIG.antiAfk, function(on)
+        "Block Roblox idle kick + game's AFK Chamber popup", CONFIG.antiAfk, function(on)
             CONFIG.antiAfk = on; saveSettings()
+            if on then pcall(blockGameAFK) end
         end)
     Misc:Toggle("Auto Execute (on teleport)",
-        "Re-run this script after each teleport", CONFIG.autoExecute, function(on)
+        "Re-run after EVERY teleport (manual or script)", CONFIG.autoExecute, function(on)
             CONFIG.autoExecute = on; saveSettings()
             if on then armReexec() end
         end)
     Misc:Label((getQueueFn() ~= nil)
-        and "Re-exec: supported by this executor ✓"
-        or  "Re-exec: NOT supported (queue_on_teleport missing) ✗")
+        and "Teleport re-exec: supported ✓ (queue kept armed + OnTeleport)"
+        or  "Teleport re-exec: NOT supported (queue_on_teleport missing) ✗")
     Misc:Toggle("Auto-exec on rejoin (autoexec file)",
-        "Re-run even after a manual rejoin / return to lobby", CONFIG.autoexecInstall, function(on)
+        "Only for full manual rejoins - OFF by default to avoid double-run", CONFIG.autoexecInstall, function(on)
             CONFIG.autoexecInstall = on; saveSettings()
             if on then
                 local ok = installAutoexec()
@@ -1431,7 +1574,7 @@ local function buildUI()
             end
         end)
     Misc:Label((type(writefile) == "function")
-        and "Rejoin auto-exec: available (writefile ✓)"
+        and "Rejoin auto-exec: available (enable toggle if you fully leave + rejoin)"
         or  "Rejoin auto-exec: unavailable (no writefile) ✗")
 
     Misc:Toggle("Live kill counter (in Story)",
