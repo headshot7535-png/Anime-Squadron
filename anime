@@ -9,6 +9,12 @@
       returns to the lobby, claims the reward and accepts the next trait bounty
     - Repeats until there are no trait-reroll bounties left
 
+    DAILY TRAIT FARM:
+      Farms every Story/Raid/Challenge map that drops capped Trait Shards.
+      Reads your daily cap progress from player data (same X/100 the Play menu
+      shows). When a map hits its cap, returns to lobby and moves to the next
+      map. Loops through all maps until every daily trait cap is filled.
+
     AUTO EXECUTE:
       Starting a stage teleports you to a battle place. Auto Execute uses
       queue_on_teleport to re-run this script (from SCRIPT_URL) after every
@@ -20,7 +26,7 @@
       built-in AFK script). Toggle it in the Misc tab.
 --------------------------------------------------------------------------]]
 
-local VERSION = "1.8.0"   -- bump this each upload so you can confirm the live build
+local VERSION = "1.9.0"   -- bump this each upload so you can confirm the live build
 local NEXUSLIB_URL = "https://raw.githubusercontent.com/headshot7535-png/Nexuslib/main/Nexuslib"
 
 -- ============================================================
@@ -77,6 +83,12 @@ local CONFIG = {
     maxActs          = tonumber(g.AutoBountyMaxActs) or 7, -- acts to cycle through when finding the enemy
     liveKills        = (g.AutoBountyLiveKills ~= false), -- count bounty-enemy kills live while in Story mode
     leaveWhenDone    = (g.AutoBountyLeaveWhenDone ~= false), -- leave the stage the moment the target count is met (self-disables if the server only banks on stage finish)
+    -- daily trait farm: clear capped Trait Shard drops on every eligible map
+    dailyTraitFarm   = (g.AutoBountyDailyTraits ~= false),
+    bountyFarm       = (g.AutoBountyBountyFarm ~= false),
+    dailyDifficulty  = g.AutoBountyDailyDifficulty or "Normal", -- "Normal" | "Hard" for daily maps
+    dailyStopWhenDone = (g.AutoBountyDailyStopWhenDone ~= false),
+    dailyStallRuns   = tonumber(g.AutoBountyDailyStallRuns) or 3, -- no cap gain after N clears => treat as maxed
 }
 CONFIG.enabled = false                                 -- set from the saved session below
 
@@ -87,7 +99,7 @@ CONFIG.enabled = false                                 -- set from the saved ses
 -- bounty target (world / enemy / required / progress / run count) to DISK so it
 -- survives the lobby <-> battle teleports and we reconcile progress on return.
 -- ============================================================
-local Session = { running = false, bounty = nil }
+local Session = { running = false, bounty = nil, dailyFarm = nil }
 -- forward declarations (these are referenced earlier than they are defined)
 local saveSession
 local setEnabled, mainLoop, rememberBounty, forgetBounty
@@ -418,14 +430,14 @@ local function bClaim(id)     return doAction("claim",       "claim",       id) 
 local function bUseTicket()   return doAction("use_ticket",  "use_ticket",  nil) end
 
 -- ============================================================
--- Matchmaking (start the bounty's world)
+-- Matchmaking (start a stage)
 -- ============================================================
-local function startMap(world, act)
+local function startMap(world, act, mode, difficulty)
     local current = {
         world        = world,
         act          = act or CONFIG.act,
-        mode         = "Story",
-        difficulty   = CONFIG.difficulty,
+        mode         = mode or "Story",
+        difficulty   = difficulty or CONFIG.difficulty,
         only_friends = CONFIG.soloOnly and true or false,
     }
     local okC, sucC, room = invokeR("Play", "create_room", current)
@@ -441,6 +453,150 @@ local function startMap(world, act)
     -- couldn't start; clean up the room so we don't get stuck
     pcall(function() fireR("Play", "leave") end)
     return false, "start failed"
+end
+
+-- ============================================================
+-- Daily trait farm (capped Trait Shard drops per map)
+-- The Play client tracks caps in player data: caps["raid_gt city_4_trait shards"]
+-- ============================================================
+-- Maps with Trait Shards + daily cap (fallback if runtime discovery fails).
+local TRAIT_DAILY_MAPS = {
+    { world = "GT City",          mode = "Raid",      act = 4, cap = 100 },
+    { world = "Eclipse (Before)", mode = "Raid",      act = 4, cap = 100 },
+    { world = "Katakara Bridge",  mode = "Challenge", act = 1, cap = 100 },
+}
+
+local function discoverTraitMaps()
+    local found, seen = {}, {}
+    local function add(m)
+        if type(m) ~= "table" or not m.world or not m.mode or not m.act then return end
+        local key = m.mode .. "|" .. m.world .. "|" .. tostring(m.act)
+        if seen[key] then return end
+        seen[key] = true
+        found[#found + 1] = m
+    end
+    for _, m in ipairs(TRAIT_DAILY_MAPS) do add(m) end
+    local ok, Worlds = pcall(function() return require(LP.PlayerScripts.Client.Play.Worlds) end)
+    if ok and type(Worlds) == "table" then
+        for _, idx in ipairs({ 1, 2, 3, 4, -1, -2 }) do
+            local w = Worlds[idx]
+            if type(w) == "table" and w.name and type(w.Rewards) == "table" then
+                for mode, modeData in pairs(w.Rewards) do
+                    if type(modeData) == "table" then
+                        for _, diffData in pairs(modeData) do
+                            if type(diffData) == "table" then
+                                for act, actRewards in ipairs(diffData) do
+                                    local ts = actRewards["Trait Shards"]
+                                    if type(ts) == "table" and ts.cap then
+                                        add({
+                                            world = w.name,
+                                            mode  = mode,
+                                            act   = act,
+                                            cap   = tonumber(ts.cap) or 100,
+                                        })
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    table.sort(found, function(a, b)
+        if a.world ~= b.world then return a.world < b.world end
+        if a.mode ~= b.mode then return a.mode < b.mode end
+        return a.act < b.act
+    end)
+    return #found > 0 and found or TRAIT_DAILY_MAPS
+end
+TRAIT_DAILY_MAPS = discoverTraitMaps()
+
+local function capKey(mode, world, act)
+    local s = ("%s %s %s Trait Shards"):format(tostring(mode), tostring(world), tostring(act))
+    return string.lower(s):gsub(" ", "_")
+end
+
+local function getPlayerData()
+    local ok, util = pcall(function() return require(LP.PlayerScripts.Client.Utility) end)
+    if ok and util and type(util.data) == "table" then
+        AB.playerData = util.data
+        return util.data
+    end
+    return AB.playerData
+end
+
+local function getTraitCapCount(map)
+    local data = getPlayerData()
+    if not data or type(data.caps) ~= "table" then return 0 end
+    return tonumber(data.caps[capKey(map.mode, map.world, map.act)]) or 0
+end
+
+local function isTraitCapMaxed(map)
+    local cap = tonumber(map.cap) or 100
+    return getTraitCapCount(map) >= cap
+end
+
+local function countOpenTraitMaps()
+    local open = 0
+    for _, m in ipairs(TRAIT_DAILY_MAPS) do
+        if not isTraitCapMaxed(m) then open = open + 1 end
+    end
+    return open
+end
+
+local function nextTraitMap(startIdx)
+    local n = #TRAIT_DAILY_MAPS
+    if n == 0 then return nil end
+    local idx = startIdx or 1
+    for _ = 1, n do
+        if idx > n then idx = 1 end
+        local m = TRAIT_DAILY_MAPS[idx]
+        if not isTraitCapMaxed(m) then return m, idx end
+        idx = idx + 1
+    end
+    return nil
+end
+
+local function rememberDailyMap(map, idx)
+    Session.dailyFarm = {
+        world = map.world,
+        mode  = map.mode,
+        act   = map.act,
+        cap   = map.cap,
+        idx   = idx,
+        runs  = (Session.dailyFarm and Session.dailyFarm.runs) or 0,
+        stall = (Session.dailyFarm and Session.dailyFarm.stall) or 0,
+        lastCap = getTraitCapCount(map),
+    }
+    if saveSession then saveSession() end
+end
+
+local function forgetDailyMap()
+    Session.dailyFarm = nil
+    if saveSession then saveSession() end
+end
+
+-- block until we leave lobby (battle started) then return to lobby
+local function waitForStageReturn()
+    local t0 = tick()
+    while alive() and CONFIG.enabled and inLobby() and (tick() - t0) < 12 do
+        task.wait(0.5)
+    end
+    if not inLobby() then
+        setStatus("Daily traits - in battle, waiting to return...")
+        while alive() and not inLobby() do task.wait(1) end
+        task.wait(2)
+        setStatus("Returned to lobby.")
+        return true
+    end
+    -- same-place fallback: wait until we leave the lobby UI or timeout
+    setStatus("Daily traits - waiting for stage to start...")
+    local t1 = tick()
+    while alive() and CONFIG.enabled and inLobby() and (tick() - t1) < CONFIG.farmTimeout do
+        task.wait(2)
+    end
+    return not inLobby()
 end
 
 -- ============================================================
@@ -482,8 +638,87 @@ local function waitForRun(bountyId, startProg)
     end
 end
 
+-- one decision step for daily trait caps; returns "done" when all maps are maxed
+local function dailyTraitStep()
+    if not CONFIG.dailyTraitFarm then return end
+    if not inLobby() then
+        setStatus("Daily traits - not in lobby, waiting...")
+        return
+    end
+
+    local open = countOpenTraitMaps()
+    if open == 0 then
+        setStatus("All daily trait caps filled!")
+        if CONFIG.dailyStopWhenDone then
+            notify("Daily Traits", "Every map's daily Trait Shard cap is full.", "success")
+            return "done"
+        end
+        task.wait(3)
+        return
+    end
+
+    local startIdx = 1
+    if Session.dailyFarm and Session.dailyFarm.idx then
+        startIdx = Session.dailyFarm.idx
+    end
+    local map, idx = nextTraitMap(startIdx)
+    if not map then
+        setStatus("All daily trait caps filled!")
+        return "done"
+    end
+
+    local beforeCap = getTraitCapCount(map)
+    rememberDailyMap(map, idx)
+    local df = Session.dailyFarm
+    df.runs = (df.runs or 0) + 1
+
+    setStatus(("Daily traits: %s %s Act %d  %d/%d  (run #%d, %d maps left)")
+        :format(map.mode, map.world, map.act, beforeCap, map.cap, df.runs, open))
+
+    local ok, err = startMap(map.world, map.act, map.mode, CONFIG.dailyDifficulty)
+    if not ok then
+        setStatus("Daily launch failed: " .. tostring(err))
+        -- try the next map instead of getting stuck on one we can't enter
+        df.idx = (idx % #TRAIT_DAILY_MAPS) + 1
+        df.stall = (df.stall or 0) + 1
+        saveSession()
+        if df.stall >= #TRAIT_DAILY_MAPS then
+            notify("Daily Traits", "Couldn't enter any daily-trait map. Stopped.", "error")
+            return "done"
+        end
+        task.wait(2)
+        return
+    end
+
+    waitForStageReturn()
+
+    local afterCap = getTraitCapCount(map)
+    if afterCap > beforeCap then
+        df.stall = 0
+        df.lastCap = afterCap
+    else
+        df.stall = (df.stall or 0) + 1
+    end
+    saveSession()
+
+    if isTraitCapMaxed(map) then
+        notify("Daily Traits", map.world .. " cap reached (" .. map.cap .. ")", "success")
+        df.idx = (idx % #TRAIT_DAILY_MAPS) + 1
+        saveSession()
+        return
+    end
+    if df.stall >= CONFIG.dailyStallRuns then
+        setStatus(map.world .. " cap stalled - moving to next map")
+        notify("Daily Traits", map.world .. " cap not increasing - skipping.", "info")
+        df.idx = (idx % #TRAIT_DAILY_MAPS) + 1
+        df.stall = 0
+        saveSession()
+    end
+end
+
 -- one decision step; returns "done" when there is nothing left to do
 local function step()
+    if not CONFIG.bountyFarm then return end
     if not inLobby() then
         setStatus("Not in lobby (battle/loading) - waiting...")
         return
@@ -654,17 +889,43 @@ function mainLoop()
     _looping = true
     setStatus("Auto Bounty started.")
     while alive() and CONFIG.enabled do
-        local ok, res = pcall(step)
-        if not ok then
-            setStatus("Error: " .. tostring(res))
-        elseif res == "done" then
-            if CONFIG.stopWhenDone then
-                setStatus("No trait-reroll bounties left - stopped.")
-                notify("Auto Bounty", "No trait bounties left. Done.", "success")
-                setEnabled(false)
-                break
+        local bountyDone, dailyDone = false, false
+
+        if CONFIG.bountyFarm then
+            local ok, res = pcall(step)
+            if not ok then
+                setStatus("Error: " .. tostring(res))
+            elseif res == "done" then
+                bountyDone = true
+                if CONFIG.stopWhenDone and not CONFIG.dailyTraitFarm then
+                    setStatus("No trait-reroll bounties left - stopped.")
+                    notify("Auto Bounty", "No trait bounties left. Done.", "success")
+                    setEnabled(false)
+                    break
+                end
             end
         end
+
+        if CONFIG.dailyTraitFarm and alive() and CONFIG.enabled then
+            local ok2, res2 = pcall(dailyTraitStep)
+            if not ok2 then
+                setStatus("Daily error: " .. tostring(res2))
+            elseif res2 == "done" then
+                dailyDone = true
+                if CONFIG.dailyStopWhenDone and (not CONFIG.bountyFarm or bountyDone) then
+                    setEnabled(false)
+                    break
+                end
+            end
+        end
+
+        if CONFIG.bountyFarm and CONFIG.dailyTraitFarm and bountyDone and dailyDone then
+            setStatus("Bounty + daily trait caps all done - stopped.")
+            notify("Auto Bounty", "Nothing left to farm. Done.", "success")
+            setEnabled(false)
+            break
+        end
+
         task.wait(CONFIG.loopDelay)
     end
     _looping = false
@@ -728,6 +989,10 @@ local function saveSettings()
             antiAfk          = CONFIG.antiAfk,
             liveKills        = CONFIG.liveKills,
             leaveWhenDone    = CONFIG.leaveWhenDone,
+            dailyTraitFarm   = CONFIG.dailyTraitFarm,
+            bountyFarm       = CONFIG.bountyFarm,
+            dailyDifficulty  = CONFIG.dailyDifficulty,
+            dailyStopWhenDone = CONFIG.dailyStopWhenDone,
         }
         pcall(function() writefile(SETTINGS_FILE, HttpService:JSONEncode(data)) end)
     end)
@@ -751,6 +1016,12 @@ local function loadSettings()
     if data.antiAfk ~= nil then CONFIG.antiAfk = data.antiAfk == true end
     if data.liveKills ~= nil then CONFIG.liveKills = data.liveKills == true end
     if data.leaveWhenDone ~= nil then CONFIG.leaveWhenDone = data.leaveWhenDone == true end
+    if data.dailyTraitFarm ~= nil then CONFIG.dailyTraitFarm = data.dailyTraitFarm == true end
+    if data.bountyFarm ~= nil then CONFIG.bountyFarm = data.bountyFarm == true end
+    if data.dailyDifficulty == "Normal" or data.dailyDifficulty == "Hard" then
+        CONFIG.dailyDifficulty = data.dailyDifficulty
+    end
+    if data.dailyStopWhenDone ~= nil then CONFIG.dailyStopWhenDone = data.dailyStopWhenDone == true end
     if type(data.scriptUrl) == "string" and data.scriptUrl ~= "" then CONFIG.scriptUrl = data.scriptUrl end
 end
 loadSettings()
@@ -777,6 +1048,9 @@ local function loadSession()
         Session.running = data.running == true
         if type(data.bounty) == "table" and data.bounty.id then
             Session.bounty = data.bounty
+        end
+        if type(data.dailyFarm) == "table" then
+            Session.dailyFarm = data.dailyFarm
         end
     end
 end
@@ -1051,9 +1325,19 @@ local function buildUI()
     local Main = Win:Tab("⚔️", "Bounty")
     Main:Section("Automation")
 
-    Main:Toggle("Enable Auto Bounty",
-        "Accept trait bounties, farm, claim, repeat", CONFIG.enabled, function(on)
+    Main:Toggle("Enable (master)",
+        "Master on/off for all automation loops", CONFIG.enabled, function(on)
             setEnabled(on)
+        end)
+
+    Main:Toggle("Auto Bounty",
+        "Accept trait bounties, farm, claim, repeat", CONFIG.bountyFarm, function(on)
+            CONFIG.bountyFarm = on; saveSettings()
+        end)
+
+    Main:Toggle("Auto Daily Trait Farm",
+        "Farm every map with daily Trait Shard caps until maxed", CONFIG.dailyTraitFarm, function(on)
+            CONFIG.dailyTraitFarm = on; saveSettings()
         end)
 
     Main:Toggle("Decline non-trait bounties",
@@ -1085,6 +1369,25 @@ local function buildUI()
         (CONFIG.difficulty == "Hard") and 2 or 1, function(opt)
             CONFIG.difficulty = opt; saveSettings()
         end)
+
+    -- ----- Daily Traits tab -----
+    local Daily = Win:Tab("🌀", "Daily Traits")
+    Daily:Section("Eligible maps (auto-detected)")
+    for _, m in ipairs(TRAIT_DAILY_MAPS) do
+        Daily:Label(("%s %s Act %d  (cap %d)"):format(m.mode, m.world, m.act, m.cap))
+    end
+    Daily:Section("Settings")
+    Daily:Dropdown("Daily difficulty", "Difficulty for daily-trait maps", { "Normal", "Hard" },
+        (CONFIG.dailyDifficulty == "Hard") and 2 or 1, function(opt)
+            CONFIG.dailyDifficulty = opt; saveSettings()
+        end)
+    Daily:Toggle("Auto-stop when all caps full",
+        "Stop once every map's daily trait cap is reached", CONFIG.dailyStopWhenDone, function(on)
+            CONFIG.dailyStopWhenDone = on; saveSettings()
+        end)
+    Daily:Section("Live caps (from player data)")
+    statusLabels.dailyMap  = Daily:Label("Current map: -")
+    statusLabels.dailyCaps = Daily:Label("Caps: -")
 
     -- ----- Status tab -----
     local St = Win:Tab("📊", "Status")
@@ -1217,6 +1520,29 @@ addThread(function()
                 pcall(function() statusLabels.trait.Set("Trait bounties available: " .. traitCount) end)
                 pcall(function() statusLabels.board.Set("Board: " .. #list .. " bounties") end)
             end
+            -- daily trait cap readout (works in lobby)
+            pcall(function()
+                if statusLabels.dailyMap then
+                    local df = Session.dailyFarm
+                    if df then
+                        statusLabels.dailyMap.Set(("Current map: %s %s Act %d")
+                            :format(df.mode or "?", df.world or "?", df.act or "?"))
+                    else
+                        statusLabels.dailyMap.Set("Current map: none")
+                    end
+                end
+            end)
+            pcall(function()
+                if statusLabels.dailyCaps then
+                    local parts = {}
+                    for _, m in ipairs(TRAIT_DAILY_MAPS) do
+                        local cur = getTraitCapCount(m)
+                        local mark = cur >= m.cap and "✓" or ""
+                        parts[#parts + 1] = ("%s %s:%d/%d%s"):format(m.mode, m.world, cur, m.cap, mark)
+                    end
+                    statusLabels.dailyCaps.Set("Caps: " .. table.concat(parts, "  |  "))
+                end
+            end)
         end
         task.wait(1)
     end
@@ -1241,6 +1567,6 @@ if CONFIG.enabled then
     end)
 end
 
-setStatus(("v%s loaded. Toggle 'Enable Auto Bounty' to start."):format(VERSION))
+setStatus(("v%s loaded. Toggle 'Enable (master)' to start."):format(VERSION))
 notify("Auto Bounty", "Loaded v" .. VERSION, "success")
 print("[Auto Bounty] loaded v" .. VERSION)
