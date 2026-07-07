@@ -35,7 +35,7 @@
       Play/leave, game Play.leave(), Matchmaking/leave, and GUI Leave buttons.
 --------------------------------------------------------------------------]]
 
-local VERSION = "1.10.4"   -- bump this each upload so you can confirm the live build
+local VERSION = "1.10.5"   -- bump this each upload so you can confirm the live build
 local NEXUSLIB_URL = "https://raw.githubusercontent.com/headshot7535-png/Nexuslib/main/Nexuslib"
 
 -- ============================================================
@@ -1706,18 +1706,24 @@ if CONFIG.enabled then
 end
 
 -- ============================================================
--- Teleport persistence (re-exec after ANY teleport - manual or script)
--- queue_on_teleport MUST be armed BEFORE the teleport happens. We keep it
--- armed at all times + re-arm instantly on OnTeleport so manual hops work.
+-- Teleport + reconnect persistence
+-- queue_on_teleport = in-game teleports (lobby <-> raid)
+-- autoexec loader   = full disconnect / Roblox reconnect button
 -- ============================================================
 local QUEUE_ARM_FILE = "AutoBounty_queue_arm.json"
+local LOCAL_SCRIPT   = "AutoBounty.lua"
 
 local function getQueueFn()
     return (syn and syn.queue_on_teleport)
         or (fluxus and fluxus.queue_on_teleport)
         or queue_on_teleport
         or queueonteleport
-        or (getgenv and getgenv().queue_on_teleport)
+        or (getgenv and (getgenv().queue_on_teleport or getgenv().queueonteleport))
+        or (potassium and potassium.queue_on_teleport)
+end
+
+local function shouldInstallReconnect()
+    return CONFIG.autoExecute or CONFIG.autoexecInstall
 end
 
 local function markQueueArmed()
@@ -1731,82 +1737,91 @@ local function markQueueArmed()
     end)
 end
 
+-- compact loader injected into queue_on_teleport (runs after teleport)
 local function buildQueuePayload(url)
-    -- boot guard inside the queued chunk prevents double-run if two sources fire
     return ([[
 -- Auto Bounty teleport loader
 if _G.AB_TP_BOOT and (tick() - _G.AB_TP_BOOT) < 8 then return end
 _G.AB_TP_BOOT = tick()
 local _u = %q
+local function abGet(u)
+    local ok, s = pcall(function() return game:HttpGet(u) end)
+    if ok and s and #s > 500 then return s end
+    local req = (syn and syn.request) or request or http_request or (http and http.request)
+    if req then
+        local ok2, r = pcall(function() return req({Url=u, Method="GET"}).Body end)
+        if ok2 and r and #r > 500 then return r end
+    end
+end
 task.defer(function()
-    local ok, src = pcall(function() return game:HttpGet(_u) end)
-    if ok and src then pcall(function() loadstring(src)() end) end
+    if not game:IsLoaded() then pcall(function() game.Loaded:Wait() end) end
+    task.wait(0.6)
+    local src
+    if readfile and isfile and isfile("AutoBounty.lua") then
+        local ok, loc = pcall(readfile, "AutoBounty.lua")
+        if ok and loc and #loc > 1000 then src = loc end
+    end
+    if not src then src = abGet(_u) end
+    if src then pcall(function() loadstring(src)() end) end
 end)
 ]]):format(url)
 end
 
-armReexec = function()
-    if not CONFIG.autoExecute then return false end
-    local url = CONFIG.scriptUrl
-    if type(url) ~= "string" or url == "" then return false end
-    local q = getQueueFn()
-    if not q then return false end
-    -- debounce rapid re-arms in the same place (periodic loop + OnTeleport)
-    local now = tick()
-    if AB._lastQueue and (now - AB._lastQueue) < 1.5 then return true end
-    AB._lastQueue = now
-    markQueueArmed()
-    pcall(q, buildQueuePayload(url))
-    return true
-end
-
--- Re-arm on ANY teleport state (manual return-to-lobby, stage start, server TP, etc.)
-addConn(LP.OnTeleport:Connect(function(_)
-    if CONFIG.autoExecute then pcall(armReexec) end
-end))
-
--- Arm immediately on load, then keep armed forever (executors may consume the queue)
-pcall(armReexec)
-addThread(function()
-    while alive() do
-        task.wait(3)
-        if CONFIG.autoExecute then pcall(armReexec) end
-    end
-end)
-
--- ============================================================
--- Auto-exec install (MANUAL rejoin only - NOT in-game teleports)
--- Skips when queue_on_teleport recently armed, which prevents double execution.
--- ============================================================
-local function installAutoexec()
-    if not CONFIG.autoexecInstall then return end
-    local url = CONFIG.scriptUrl
-    if type(url) ~= "string" or url == "" then return end
-    if type(writefile) ~= "function" then return false end
+local function buildReconnectLoader(url)
     local gid = tostring(game.GameId)
-    local loader = ([[
--- Auto Bounty rejoin loader (auto-generated). Delete to stop auto-run on rejoin.
+    return ([[
+-- Auto Bounty reconnect loader (auto-generated)
 if tostring(game.GameId) ~= %q then return end
+if _G.AB_TP_BOOT and (tick() - _G.AB_TP_BOOT) < 8 then return end
+local _u = %q
+local function abGet(u)
+    local ok, s = pcall(function() return game:HttpGet(u) end)
+    if ok and s and #s > 500 then return s end
+    local req = (syn and syn.request) or request or http_request or (http and http.request)
+    if req then
+        local ok2, r = pcall(function() return req({Url=u, Method="GET"}).Body end)
+        if ok2 and r and #r > 500 then return r end
+    end
+end
 task.defer(function()
-    task.wait(0.6)
+    if not game:IsLoaded() then pcall(function() game.Loaded:Wait() end) end
+    task.wait(0.8)
     if _G.AB_TP_BOOT and (tick() - _G.AB_TP_BOOT) < 8 then return end
+    if _G.AB_BootAt and (tick() - _G.AB_BootAt) < 5 then return end
     local HS = game:GetService("HttpService")
     local arm = "AutoBounty_queue_arm.json"
     if readfile and isfile and isfile(arm) then
         local ok, r = pcall(readfile, arm)
         if ok and r and r ~= "" then
             local ok2, d = pcall(function() return HS:JSONDecode(r) end)
-            if ok2 and d and os.time() - (tonumber(d.ts) or 0) < 25 then return end
+            if ok2 and d and d.job == game.JobId and os.time() - (tonumber(d.ts) or 0) < 20 then
+                return
+            end
         end
     end
-    if _G.AB_BootAt and (tick() - _G.AB_BootAt) < 5 then return end
-    local ok, src = pcall(function() return game:HttpGet(%q) end)
-    if ok and src then pcall(function() loadstring(src)() end) end
+    _G.AB_TP_BOOT = tick()
+    local src
+    if readfile and isfile and isfile("AutoBounty.lua") then
+        local ok, loc = pcall(readfile, "AutoBounty.lua")
+        if ok and loc and #loc > 1000 then src = loc end
+    end
+    if not src then src = abGet(_u) end
+    if src then pcall(function() loadstring(src)() end) end
 end)
 ]]):format(gid, url)
+end
+
+local function installReconnectLoader()
+    if not shouldInstallReconnect() then return false end
+    local url = CONFIG.scriptUrl
+    if type(url) ~= "string" or url == "" then return false end
+    if type(writefile) ~= "function" then return false end
+    local loader = buildReconnectLoader(url)
     local targets = {
         "autoexec/AutoBounty.lua",
         "autoexec/autobounty.lua",
+        "../autoexec/AutoBounty.lua",
+        "../autoexec/autobounty.lua",
         "auto_exec/AutoBounty.lua",
         "Autoexec/AutoBounty.lua",
     }
@@ -1826,19 +1841,72 @@ end)
     AB._autoexecPaths = targets
     return wrote
 end
-local function uninstallAutoexec()
+
+local function uninstallReconnectLoader()
     if type(delfile) ~= "function" then return false end
     local any = false
     for _, path in ipairs(AB._autoexecPaths or {
         "autoexec/AutoBounty.lua", "autoexec/autobounty.lua",
-        "auto_exec/AutoBounty.lua", "Autoexec/AutoBounty.lua" }) do
-        if pcall(function() if type(isfile) == "function" and isfile(path) then delfile(path) end end) then
-            any = true
-        end
+        "../autoexec/AutoBounty.lua", "../autoexec/autobounty.lua",
+        "auto_exec/AutoBounty.lua", "Autoexec/AutoBounty.lua",
+    }) do
+        pcall(function()
+            if type(isfile) == "function" and isfile(path) then
+                delfile(path)
+                any = true
+            end
+        end)
     end
     return any
 end
-pcall(installAutoexec)
+
+armReexec = function()
+    if not CONFIG.autoExecute then return false end
+    local url = CONFIG.scriptUrl
+    if type(url) ~= "string" or url == "" then return false end
+    local q = getQueueFn()
+    if not q then
+        if not AB._queueWarned then
+            AB._queueWarned = true
+            warn("[Auto Bounty] queue_on_teleport missing — enable reconnect loader or use Misc > Re-arm")
+        end
+        return false
+    end
+    local now = tick()
+    if AB._lastQueue and (now - AB._lastQueue) < 1.5 then return true end
+    AB._lastQueue = now
+    markQueueArmed()
+    pcall(q, buildQueuePayload(url))
+    return true
+end
+
+-- Re-arm on teleport (lobby <-> raid, server hop, reconnect-via-teleport)
+addConn(LP.OnTeleport:Connect(function(_)
+    if CONFIG.autoExecute then pcall(armReexec) end
+end))
+
+-- Arm before Roblox closes the client (disconnect / reconnect flow)
+pcall(function()
+    game:BindToClose(function()
+        if CONFIG.autoExecute then pcall(armReexec) end
+        if shouldInstallReconnect() then pcall(installReconnectLoader) end
+    end)
+end)
+
+pcall(armReexec)
+if shouldInstallReconnect() then pcall(installReconnectLoader) end
+
+addThread(function()
+    local lastInstall = 0
+    while alive() do
+        task.wait(3)
+        if CONFIG.autoExecute then pcall(armReexec) end
+        if shouldInstallReconnect() and tick() - lastInstall > 60 then
+            lastInstall = tick()
+            pcall(installReconnectLoader)
+        end
+    end
+end)
 
 -- ============================================================
 -- Anti-AFK (Roblox idle kick + block game's AFK Chamber popup)
@@ -2224,28 +2292,35 @@ local function buildUI()
             if on then pcall(blockGameAFK) end
         end)
     Misc:Toggle("Auto Execute (on teleport)",
-        "Re-run after EVERY teleport (manual or script)", CONFIG.autoExecute, function(on)
+        "Re-run after lobby/raid teleports + installs reconnect loader", CONFIG.autoExecute, function(on)
             CONFIG.autoExecute = on; saveSettings()
-            if on then armReexec() end
+            if on then
+                armReexec()
+                local ok = installReconnectLoader()
+                notify("Auto Execute", ok and "Armed queue + reconnect loader installed."
+                    or "Queue armed (reconnect file install failed).", ok and "success" or "info")
+            elseif not CONFIG.autoexecInstall then
+                uninstallReconnectLoader()
+            end
         end)
     Misc:Label((getQueueFn() ~= nil)
         and "Teleport re-exec: supported ✓ (queue kept armed + OnTeleport)"
         or  "Teleport re-exec: NOT supported (queue_on_teleport missing) ✗")
     Misc:Toggle("Auto-exec on rejoin (autoexec file)",
-        "Only for full manual rejoins - OFF by default to avoid double-run", CONFIG.autoexecInstall, function(on)
+        "Extra: keep reconnect loader even if teleport toggle is off", CONFIG.autoexecInstall, function(on)
             CONFIG.autoexecInstall = on; saveSettings()
             if on then
-                local ok = installAutoexec()
-                notify("Auto-exec", ok and "Installed - runs on every join of THIS game."
+                local ok = installReconnectLoader()
+                notify("Auto-exec", ok and "Reconnect loader installed (Potassium/autoexec + workspace)."
                     or "Install failed (executor lacks writefile).", ok and "success" or "error")
-            else
-                uninstallAutoexec()
-                notify("Auto-exec", "Removed autoexec loader.", "info")
+            elseif not CONFIG.autoExecute then
+                uninstallReconnectLoader()
+                notify("Auto-exec", "Removed reconnect loader.", "info")
             end
         end)
     Misc:Label((type(writefile) == "function")
-        and "Rejoin auto-exec: available (enable toggle if you fully leave + rejoin)"
-        or  "Rejoin auto-exec: unavailable (no writefile) ✗")
+        and "Reconnect: loads workspace/AutoBounty.lua first, then Script URL"
+        or  "Reconnect: unavailable (no writefile) ✗")
 
     Misc:Toggle("Live kill counter (in Story)",
         "Count the bounty enemy's kills during the stage", CONFIG.liveKills, function(on)
@@ -2263,8 +2338,11 @@ local function buildUI()
     Misc:Button("🛑", "Stop All Loops", "Emergency stop", nil, function()
         setEnabled(false)
     end)
-    Misc:Button("🔁", "Re-arm teleport persist", "queue_on_teleport now", nil, function()
-        armReexec(); notify("Persist", "Re-armed (needs Script URL).", "info")
+    Misc:Button("🔁", "Re-arm teleport persist", "queue + reconnect loader", nil, function()
+        local q = armReexec()
+        local f = installReconnectLoader()
+        notify("Persist", (q and "Queue armed. " or "Queue failed. ")
+            .. (f and "Reconnect loader OK." or "Reconnect loader failed."), (q or f) and "success" or "error")
     end)
 
     Misc:Section("Teleport persistence")
