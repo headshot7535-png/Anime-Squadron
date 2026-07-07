@@ -35,7 +35,7 @@
       Play/leave, game Play.leave(), Matchmaking/leave, and GUI Leave buttons.
 --------------------------------------------------------------------------]]
 
-local VERSION = "1.10.0"   -- bump this each upload so you can confirm the live build
+local VERSION = "1.10.4"   -- bump this each upload so you can confirm the live build
 local NEXUSLIB_URL = "https://raw.githubusercontent.com/headshot7535-png/Nexuslib/main/Nexuslib"
 
 -- ============================================================
@@ -263,14 +263,30 @@ local function getBountyGui()
     local m = getMenus()
     return m and m:FindFirstChild("Bounty")
 end
+
+local function inBattle()
+    local chars = workspace:FindFirstChild("Characters")
+    if not chars then return false end
+    for _, ch in ipairs(chars:GetChildren()) do
+        if ch:IsA("Model") then return true end
+    end
+    return false
+end
+
 -- We're "in the lobby" if the Bounty menu exists and we're not mid-fight
 local function inLobby()
     if inBattle() then return false end
     return getBountyGui() ~= nil
 end
 
--- forward declare — defined below
-local inBattle
+-- UI handle (set later) + status helpers — must be before leaveStage / daily helpers
+local Win
+local function setStatus(msg)
+    if Win then pcall(function() Win:Status(msg) end) end
+end
+local function notify(title, msg, typ)
+    if Win then pcall(function() Win:Notify(title, msg, 4, typ or "info") end) end
+end
 
 -- Stage leave (Settings > Gameplay > Back To Lobby > Teleport during raids)
 local function guiText(node)
@@ -279,37 +295,50 @@ local function guiText(node)
     return ""
 end
 
-local function clickGui(btn)
-    if not btn then return false end
+local function guiTextDeep(node)
+    if not node then return "" end
+    local direct = guiText(node)
+    if direct ~= "" then return direct end
+    for _, d in ipairs(node:GetDescendants()) do
+        if d:IsA("TextLabel") or d:IsA("TextButton") then
+            local t = d.Text
+            if t and t ~= "" then return t end
+        end
+    end
+    return ""
+end
+
+local function invokeGui(btn)
+    if not btn or not btn.Parent then return false end
     local targets = { btn }
     local rb = btn:FindFirstChild("RealButton")
     if rb then targets[#targets + 1] = rb end
-    for _, t in ipairs(targets) do
-        if firesignal then
-            if pcall(firesignal, t.Activated) then return true end
-            if pcall(firesignal, t.MouseButton1Click) then return true end
-        end
-        if getconnections then
+    local fired = false
+    if getconnections then
+        for _, t in ipairs(targets) do
             for _, sig in ipairs({ "Activated", "MouseButton1Click" }) do
                 local ev = t[sig]
                 if ev then
                     for _, conn in ipairs(getconnections(ev)) do
-                        if conn.Function and pcall(conn.Function) then return true end
+                        if conn.Function then
+                            fired = pcall(conn.Function) or fired
+                        end
                     end
                 end
             end
         end
     end
-    return false
+    if not fired and firesignal then
+        for _, t in ipairs(targets) do
+            fired = pcall(firesignal, t.Activated) or fired
+            fired = pcall(firesignal, t.MouseButton1Click) or fired
+        end
+    end
+    return fired
 end
 
-inBattle = function()
-    local chars = workspace:FindFirstChild("Characters")
-    if not chars then return false end
-    for _, ch in ipairs(chars:GetChildren()) do
-        if ch:IsA("Model") then return true end
-    end
-    return false
+local function clickGui(btn)
+    return invokeGui(btn)
 end
 
 local function openGameSettingsGameplay()
@@ -322,14 +351,20 @@ local function openGameSettingsGameplay()
         local openBtn = menus:FindFirstChild("Buttons")
             and menus.Buttons:FindFirstChild("Buttons2")
             and menus.Buttons.Buttons2:FindFirstChild("Settings")
-        if openBtn then clickGui(openBtn) end
+        if openBtn then
+            local rb = openBtn:FindFirstChild("RealButton")
+            invokeGui(rb or openBtn)
+        end
         task.wait(0.35)
         if not settings.Visible then settings.Visible = true end
     end
 
-    local gameplayTab = settings:FindFirstChild("Filters")
-        and settings.Filters:FindFirstChild("Gameplay")
-    if gameplayTab then clickGui(gameplayTab) end
+    local filters = settings:FindFirstChild("Filters")
+    local gameplayTab = filters and filters:FindFirstChild("Gameplay")
+    if gameplayTab then
+        local rb = gameplayTab:FindFirstChild("RealButton")
+        invokeGui(rb or gameplayTab)
+    end
 
     local sf = settings:FindFirstChild("ScrollingFrame")
     local gameplay = sf and sf:FindFirstChild("Gameplay")
@@ -338,21 +373,25 @@ local function openGameSettingsGameplay()
     return gameplay
 end
 
-local function clickBackToLobby()
-    local gameplay = openGameSettingsGameplay()
+local function findBackToLobbyTeleportBtn()
     local menus = getMenus()
     local settings = menus and menus:FindFirstChild("Settings")
+    if not settings then return nil end
     local searchRoots = {}
-    if gameplay then searchRoots[#searchRoots + 1] = gameplay end
-    if settings then searchRoots[#searchRoots + 1] = settings end
+    local sf = settings:FindFirstChild("ScrollingFrame")
+    if sf then
+        local gameplay = sf:FindFirstChild("Gameplay")
+        if gameplay then searchRoots[#searchRoots + 1] = gameplay end
+        searchRoots[#searchRoots + 1] = sf
+    end
+    searchRoots[#searchRoots + 1] = settings
 
     for _, root in ipairs(searchRoots) do
         for _, key in ipairs({ "back_to_lobby", "return_to_lobby", "to_lobby", "back_to_lobby_button" }) do
             local row = root:FindFirstChild(key, true)
             if row then
-                local action = row:FindFirstChild("button") or row:FindFirstChild("action") or row:FindFirstChild("Teleport")
-                if action and clickGui(action) then return true end
-                if clickGui(row) then return true end
+                local action = row:FindFirstChild("button") or row:FindFirstChild("action")
+                if action and not action:FindFirstChild("slider") then return action end
             end
         end
     end
@@ -366,51 +405,74 @@ local function clickBackToLobby()
                     if txt:find("back", 1, true) and txt:find("lobby", 1, true) then
                         for _, ch in ipairs(row:GetDescendants()) do
                             if (ch:IsA("GuiButton") or ch:IsA("TextButton")) and ch ~= row then
-                                if guiText(ch):lower():find("teleport", 1, true) and clickGui(ch) then
-                                    return true
+                                if guiTextDeep(ch):lower():find("teleport", 1, true) then
+                                    return ch
                                 end
                             end
                         end
                         local action = row:FindFirstChild("button")
-                        if action and not action:FindFirstChild("slider") and clickGui(action) then
-                            return true
-                        end
+                        if action and not action:FindFirstChild("slider") then return action end
                     end
                 end
             end
         end
         for _, d in ipairs(root:GetDescendants()) do
-            if guiText(d):lower() == "teleport" then
+            if d:IsA("TextLabel") and guiText(d):lower() == "teleport" then
                 local parent = d.Parent
-                if parent and (parent:IsA("GuiButton") or parent:IsA("TextButton") or parent:IsA("ImageButton")) then
-                    if clickGui(parent) then return true end
+                while parent and parent ~= root do
+                    if parent:IsA("GuiButton") or parent:IsA("TextButton") or parent:IsA("ImageButton") then
+                        return parent
+                    end
+                    parent = parent.Parent
                 end
             end
         end
     end
-    return false
+    return nil
+end
+
+local function clientForceLeave()
+    pcall(function()
+        local gui = require(LP.PlayerScripts.Client.Gui)
+        local play = require(LP.PlayerScripts.Client.Play)
+        if gui and type(gui.transition) == "function" then
+            task.spawn(gui.transition)
+        end
+        task.wait(0.45)
+        if play and type(play.leave) == "function" then
+            play.leave(nil, true)
+        end
+    end)
+end
+
+local function clickBackToLobby()
+    local btn = findBackToLobbyTeleportBtn()
+    if not btn then
+        openGameSettingsGameplay()
+        btn = findBackToLobbyTeleportBtn()
+    end
+    if not btn then return false end
+    if not invokeGui(btn) then return false end
+    task.wait(1.2)
+    return not inBattle()
 end
 
 local _lastLeaveAt = 0
-local function leaveStage()
+local function leaveStage(force)
     local now = tick()
-    if now - _lastLeaveAt < 1.5 then return false end
+    if not force and now - _lastLeaveAt < 0.8 then return false end
     _lastLeaveAt = now
 
     if armReexec then pcall(armReexec) end
 
-    -- primary: in-game Settings > Gameplay > Back To Lobby > Teleport
-    if clickBackToLobby() then return true end
+    setStatus("Leaving stage (Settings Teleport + client leave)...")
+
+    local clicked = clickBackToLobby()
+    clientForceLeave()
+
+    if clicked or (not inBattle()) then return true end
 
     fireR("Play", "leave")
-
-    pcall(function()
-        local play = require(LP.PlayerScripts.Client.Play)
-        if type(play.leave) == "function" then
-            play.leave(nil, true)
-        end
-    end)
-
     fireR("Matchmaking", "leave")
     pcall(function() invokeR("Player", "physical_teleport", "play") end)
 
@@ -418,14 +480,8 @@ local function leaveStage()
         local menus = getMenus()
         if not menus then return end
         local stage = menus:FindFirstChild("StageInfo")
-        local btn = stage and stage:FindFirstChild("Buttons") and stage.Buttons:FindFirstChild("Leave")
-        if btn and btn.Visible then clickGui(btn) end
-        local ps = menus:FindFirstChild("Play_Start")
-        local psLeave = ps and ps:FindFirstChild("Buttons") and ps.Buttons:FindFirstChild("Leave")
-        if psLeave and psLeave.Visible then clickGui(psLeave) end
-        local lobby = menus:FindFirstChild("Lobby")
-        local exitBtn = lobby and lobby:FindFirstChild("Exit")
-        if exitBtn and exitBtn.Visible then clickGui(exitBtn) end
+        local leaveBtn = stage and stage:FindFirstChild("Buttons") and stage.Buttons:FindFirstChild("Leave")
+        if leaveBtn and leaveBtn.Visible then invokeGui(leaveBtn) end
     end)
 
     return true
@@ -766,14 +822,6 @@ end
 -- DPS meter (live team DPS via leaderstats + theoretical per-unit)
 -- CombatProbe confirmed: leaderstats.Damage replicates; no per-unit damage counter.
 -- ============================================================
-local _Helper
-local function getHelper()
-    if _Helper then return _Helper end
-    local ok, h = pcall(function() return require(ReplicatedStorage.Shared.Helper) end)
-    if ok then _Helper = h end
-    return _Helper
-end
-
 local function fmtNum(n)
     n = tonumber(n) or 0
     if math.abs(n) >= 1e9 then return string.format("%.2fB", n / 1e9)
@@ -863,13 +911,55 @@ local function getEquippedUnits()
     return list, data
 end
 
-local function calcUnitDps(unit, playerData)
-    local h = getHelper()
-    if not h or type(h.calculate_stat) ~= "function" then return 0, 0, 0 end
-    local dmg = tonumber(h.calculate_stat(unit, "damage", playerData)) or 0
-    local cd = tonumber(h.calculate_stat(unit, "cooldown", playerData)) or 1
+local _charDataCache = {}
+local _charDataFailed = {}
+local function safeCharData(name)
+    if not name then return nil end
+    if _charDataCache[name] then return _charDataCache[name] end
+    if _charDataFailed[name] then return nil end
+    local ch = ReplicatedStorage:FindFirstChild("Characters")
+    ch = ch and ch:FindFirstChild(name)
+    local dataMod = ch and ch:FindFirstChild("data")
+    if not dataMod then
+        _charDataFailed[name] = true
+        return nil
+    end
+    -- game client may have already required this module — reuse cache, no new require
+    if package and type(package.loaded) == "table" then
+        local cached = package.loaded[dataMod]
+        if type(cached) == "table" then
+            _charDataCache[name] = cached
+            return cached
+        end
+    end
+    local ok, data = pcall(require, dataMod)
+    if ok and type(data) == "table" then
+        _charDataCache[name] = data
+        return data
+    end
+    _charDataFailed[name] = true
+    return nil
+end
+
+local function simpleUnitDps(unit, data)
+    local baseDmg = tonumber(data.damage) or 0
+    local baseCd = tonumber(data.cooldown) or 1
+    local level = tonumber(unit.level) or 1
+    local dmg = baseDmg * (1.02 ^ math.max(0, level - 1))
+    local cd = baseCd
     if cd <= 0.05 then cd = 1 end
     return dmg / cd, dmg, cd
+end
+
+local function calcUnitDps(unit, playerData)
+    if not unit or not unit.name then return nil, nil, nil end
+    -- Helper.calculate_stat require()s character data modules internally, which
+    -- throws "Cannot require a non-RobloxScript module" from executor scripts.
+    local data = safeCharData(unit.name)
+    if data then
+        return simpleUnitDps(unit, data)
+    end
+    return nil, nil, nil
 end
 
 local function getLiveAllies()
@@ -901,43 +991,52 @@ end
 
 local function refreshDpsLabels()
     if not CONFIG.dpsMeter then return end
-    sampleTeamDps()
-    local d = getDamageStat()
-    local stageDmg = 0
-    if d and Dps.stageBase then stageDmg = math.max(0, d.Value - Dps.stageBase) end
+    local ok, err = pcall(function()
+        sampleTeamDps()
+        local d = getDamageStat()
+        local stageDmg = 0
+        if d and Dps.stageBase then stageDmg = math.max(0, d.Value - Dps.stageBase) end
 
-    setLabel(statusLabels.teamDps, d
-        and ("Team DPS: %s/s  |  peak %s/s"):format(fmtNum(Dps.dps), fmtNum(Dps.peak))
-        or  "Team DPS: - (enter a stage)")
-    local tkStr = Dps.takedowns and ("  |  takedowns %d"):format(Dps.takedowns) or ""
-    setLabel(statusLabels.teamDmg, d
-        and ("Stage damage: %s  |  total %s%s"):format(fmtNum(stageDmg), fmtNum(d.Value), tkStr)
-        or  "Stage damage: -")
+        setLabel(statusLabels.teamDps, d
+            and ("Team DPS: %s/s  |  peak %s/s"):format(fmtNum(Dps.dps), fmtNum(Dps.peak))
+            or  "Team DPS: - (enter a stage)")
+        local tkStr = Dps.takedowns and ("  |  takedowns %d"):format(Dps.takedowns) or ""
+        setLabel(statusLabels.teamDmg, d
+            and ("Stage damage: %s  |  total %s%s"):format(fmtNum(stageDmg), fmtNum(d.Value), tkStr)
+            or  "Stage damage: -")
 
-    local equipped, pdata = getEquippedUnits()
-    for i = 1, 6 do
-        local lbl = statusLabels["unit" .. i]
-        if lbl then
-            local u = equipped[i]
-            if u then
-                local dps, dmg, cd = calcUnitDps(u, pdata)
-                setLabel(lbl, ("Slot %d: %s  —  %s/s  (dmg %s / cd %.2fs)")
-                    :format(i, u.name, fmtNum(dps), fmtNum(dmg), cd))
-            else
-                setLabel(lbl, ("Slot %d: empty"):format(i))
+        local equipped = getEquippedUnits()
+        for i = 1, 6 do
+            local lbl = statusLabels["unit" .. i]
+            if lbl then
+                local u = equipped[i]
+                if u then
+                    local dps, dmg, cd = calcUnitDps(u)
+                    if dps then
+                        setLabel(lbl, ("Slot %d: %s  —  ~%s/s  (dmg %s / cd %.2fs)")
+                            :format(i, u.name, fmtNum(dps), fmtNum(dmg), cd))
+                    else
+                        setLabel(lbl, ("Slot %d: %s  —  est. n/a (base stats locked)"):format(i, u.name))
+                    end
+                else
+                    setLabel(lbl, ("Slot %d: empty"):format(i))
+                end
             end
         end
-    end
 
-    local allies = getLiveAllies()
-    if #allies == 0 then
-        setLabel(statusLabels.liveAllies, "Live allies on map: -")
-    else
-        local parts = {}
-        for _, a in ipairs(allies) do
-            parts[#parts + 1] = ("%s %s/%s"):format(a.name, fmtNum(a.hp), fmtNum(a.maxHp))
+        local allies = getLiveAllies()
+        if #allies == 0 then
+            setLabel(statusLabels.liveAllies, "Live allies on map: -")
+        else
+            local parts = {}
+            for _, a in ipairs(allies) do
+                parts[#parts + 1] = ("%s %s/%s"):format(a.name, fmtNum(a.hp), fmtNum(a.maxHp))
+            end
+            setLabel(statusLabels.liveAllies, "Live allies: " .. table.concat(parts, "  |  "))
         end
-        setLabel(statusLabels.liveAllies, "Live allies: " .. table.concat(parts, "  |  "))
+    end)
+    if not ok then
+        setLabel(statusLabels.teamDps, "Team DPS: error")
     end
 end
 
@@ -998,16 +1097,8 @@ local function forgetDailyMap()
 end
 
 -- ============================================================
--- UI handle (set later) + status helper — must be before daily leave helpers
+-- Daily trait farm helpers
 -- ============================================================
-local Win
-local function setStatus(msg)
-    if Win then pcall(function() Win:Status(msg) end) end
-end
-local function notify(title, msg, typ)
-    if Win then pcall(function() Win:Notify(title, msg, 4, typ or "info") end) end
-end
-
 local function findTraitMapEntry(world, mode, act)
     for _, m in ipairs(TRAIT_DAILY_MAPS) do
         if m.world == world and m.mode == mode and tonumber(m.act) == tonumber(act) then
@@ -1419,6 +1510,7 @@ local function step()
 end
 
 local _looping = false
+local _inSetEnabled = false
 function mainLoop()
     if _looping then return end
     _looping = true
@@ -1468,15 +1560,23 @@ function mainLoop()
 end
 
 function setEnabled(on)
-    CONFIG.enabled = on and true or false
+    on = on and true or false
+    if _inSetEnabled then return end
+    if CONFIG.enabled == on then
+        Session.running = on
+        AB.enabled = on
+        return
+    end
+    _inSetEnabled = true
+    CONFIG.enabled = on
     AB.enabled = CONFIG.enabled
     Session.running = CONFIG.enabled
-    saveSettings()
-    -- write session immediately so manual re-exec within 0.3s still resumes
+    pcall(saveSettings)
     if canFile and canFile() then
         pcall(function() writefile("AutoBounty_session.json", HttpService:JSONEncode(Session)) end)
     end
     if CONFIG.enabled then addThread(mainLoop) end
+    _inSetEnabled = false
 end
 
 -- remember/forget the bounty we are currently farming (persists across teleport)
@@ -1956,6 +2056,30 @@ end
 startKillTracker()
 startDpsTracker()
 
+-- independent cap watcher — leaves mid-raid even if main loop is blocked
+local function startDailyCapWatcher()
+    addThread(function()
+        local lastTry = 0
+        while alive() do
+            if CONFIG.enabled and CONFIG.dailyTraitFarm and inBattle() then
+                local map = resolveDailyMap()
+                if map and isTraitCapMaxed(map) then
+                    local now = tick()
+                    if now - lastTry >= 2 then
+                        lastTry = now
+                        setStatus(("Cap full %s %d/%d — leaving stage...")
+                            :format(map.world, getTraitCapCount(map), map.cap))
+                        leaveStage(true)
+                        AB._dailyLeftCap = true
+                    end
+                end
+            end
+            task.wait(0.5)
+        end
+    end)
+end
+startDailyCapWatcher()
+
 -- ============================================================
 -- UI
 -- ============================================================
@@ -1993,11 +2117,6 @@ local function buildUI()
         "Master on/off for all automation loops", CONFIG.enabled, function(on)
             setEnabled(on)
         end)
-    task.defer(function()
-        if CONFIG.enabled and masterToggle then
-            pcall(function() masterToggle.Set(true) end)
-        end
-    end)
 
     Main:Toggle("Auto Bounty",
         "Accept trait bounties, farm, claim, repeat", CONFIG.bountyFarm, function(on)
@@ -2231,13 +2350,9 @@ AB.cleanup = function()
 end
 
 if CONFIG.enabled then
-    -- resumed after a teleport: give the lobby a moment, then continue
     addThread(function()
-        for _ = 1, 30 do
-            if inLobby() then break end
-            task.wait(1)
-        end
-        addThread(mainLoop)
+        task.wait(0.5)
+        if not _looping then addThread(mainLoop) end
     end)
 end
 
