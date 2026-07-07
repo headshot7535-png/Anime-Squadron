@@ -35,7 +35,7 @@
       Play/leave, game Play.leave(), Matchmaking/leave, and GUI Leave buttons.
 --------------------------------------------------------------------------]]
 
-local VERSION = "1.9.9"   -- bump this each upload so you can confirm the live build
+local VERSION = "1.10.0"   -- bump this each upload so you can confirm the live build
 local NEXUSLIB_URL = "https://raw.githubusercontent.com/headshot7535-png/Nexuslib/main/Nexuslib"
 
 -- ============================================================
@@ -263,13 +263,47 @@ local function getBountyGui()
     local m = getMenus()
     return m and m:FindFirstChild("Bounty")
 end
--- We're "in the lobby" if the Bounty menu exists (battle place won't have it)
+-- We're "in the lobby" if the Bounty menu exists and we're not mid-fight
 local function inLobby()
+    if inBattle() then return false end
     return getBountyGui() ~= nil
 end
 
--- Stage leave (multi-path — Play/leave alone often fails mid-raid)
-local function inBattle()
+-- forward declare — defined below
+local inBattle
+
+-- Stage leave (Settings > Gameplay > Back To Lobby > Teleport during raids)
+local function guiText(node)
+    if not node then return "" end
+    if node:IsA("TextLabel") or node:IsA("TextButton") then return node.Text or "" end
+    return ""
+end
+
+local function clickGui(btn)
+    if not btn then return false end
+    local targets = { btn }
+    local rb = btn:FindFirstChild("RealButton")
+    if rb then targets[#targets + 1] = rb end
+    for _, t in ipairs(targets) do
+        if firesignal then
+            if pcall(firesignal, t.Activated) then return true end
+            if pcall(firesignal, t.MouseButton1Click) then return true end
+        end
+        if getconnections then
+            for _, sig in ipairs({ "Activated", "MouseButton1Click" }) do
+                local ev = t[sig]
+                if ev then
+                    for _, conn in ipairs(getconnections(ev)) do
+                        if conn.Function and pcall(conn.Function) then return true end
+                    end
+                end
+            end
+        end
+    end
+    return false
+end
+
+inBattle = function()
     local chars = workspace:FindFirstChild("Characters")
     if not chars then return false end
     for _, ch in ipairs(chars:GetChildren()) do
@@ -278,19 +312,81 @@ local function inBattle()
     return false
 end
 
-local function clickBtn(btn)
-    if not btn then return false end
-    if firesignal then
-        return pcall(firesignal, btn.MouseButton1Click)
+local function openGameSettingsGameplay()
+    local menus = getMenus()
+    if not menus then return nil end
+    local settings = menus:FindFirstChild("Settings")
+    if not settings then return nil end
+
+    if not settings.Visible then
+        local openBtn = menus:FindFirstChild("Buttons")
+            and menus.Buttons:FindFirstChild("Buttons2")
+            and menus.Buttons.Buttons2:FindFirstChild("Settings")
+        if openBtn then clickGui(openBtn) end
+        task.wait(0.35)
+        if not settings.Visible then settings.Visible = true end
     end
-    if getconnections then
-        local ok = false
-        for _, conn in ipairs(getconnections(btn.MouseButton1Click)) do
-            if conn.Function then
-                ok = pcall(conn.Function) or ok
+
+    local gameplayTab = settings:FindFirstChild("Filters")
+        and settings.Filters:FindFirstChild("Gameplay")
+    if gameplayTab then clickGui(gameplayTab) end
+
+    local sf = settings:FindFirstChild("ScrollingFrame")
+    local gameplay = sf and sf:FindFirstChild("Gameplay")
+    if gameplay then gameplay.Visible = true end
+    task.wait(0.15)
+    return gameplay
+end
+
+local function clickBackToLobby()
+    local gameplay = openGameSettingsGameplay()
+    local menus = getMenus()
+    local settings = menus and menus:FindFirstChild("Settings")
+    local searchRoots = {}
+    if gameplay then searchRoots[#searchRoots + 1] = gameplay end
+    if settings then searchRoots[#searchRoots + 1] = settings end
+
+    for _, root in ipairs(searchRoots) do
+        for _, key in ipairs({ "back_to_lobby", "return_to_lobby", "to_lobby", "back_to_lobby_button" }) do
+            local row = root:FindFirstChild(key, true)
+            if row then
+                local action = row:FindFirstChild("button") or row:FindFirstChild("action") or row:FindFirstChild("Teleport")
+                if action and clickGui(action) then return true end
+                if clickGui(row) then return true end
             end
         end
-        return ok
+    end
+
+    for _, root in ipairs(searchRoots) do
+        for _, row in ipairs(root:GetDescendants()) do
+            if row:IsA("GuiButton") then
+                local nameLbl = row:FindFirstChild("name")
+                if nameLbl and nameLbl:IsA("TextLabel") then
+                    local txt = nameLbl.Text:lower()
+                    if txt:find("back", 1, true) and txt:find("lobby", 1, true) then
+                        for _, ch in ipairs(row:GetDescendants()) do
+                            if (ch:IsA("GuiButton") or ch:IsA("TextButton")) and ch ~= row then
+                                if guiText(ch):lower():find("teleport", 1, true) and clickGui(ch) then
+                                    return true
+                                end
+                            end
+                        end
+                        local action = row:FindFirstChild("button")
+                        if action and not action:FindFirstChild("slider") and clickGui(action) then
+                            return true
+                        end
+                    end
+                end
+            end
+        end
+        for _, d in ipairs(root:GetDescendants()) do
+            if guiText(d):lower() == "teleport" then
+                local parent = d.Parent
+                if parent and (parent:IsA("GuiButton") or parent:IsA("TextButton") or parent:IsA("ImageButton")) then
+                    if clickGui(parent) then return true end
+                end
+            end
+        end
     end
     return false
 end
@@ -300,6 +396,11 @@ local function leaveStage()
     local now = tick()
     if now - _lastLeaveAt < 1.5 then return false end
     _lastLeaveAt = now
+
+    if armReexec then pcall(armReexec) end
+
+    -- primary: in-game Settings > Gameplay > Back To Lobby > Teleport
+    if clickBackToLobby() then return true end
 
     fireR("Play", "leave")
 
@@ -318,13 +419,13 @@ local function leaveStage()
         if not menus then return end
         local stage = menus:FindFirstChild("StageInfo")
         local btn = stage and stage:FindFirstChild("Buttons") and stage.Buttons:FindFirstChild("Leave")
-        if btn and btn.Visible then clickBtn(btn) end
+        if btn and btn.Visible then clickGui(btn) end
         local ps = menus:FindFirstChild("Play_Start")
         local psLeave = ps and ps:FindFirstChild("Buttons") and ps.Buttons:FindFirstChild("Leave")
-        if psLeave and psLeave.Visible then clickBtn(psLeave) end
+        if psLeave and psLeave.Visible then clickGui(psLeave) end
         local lobby = menus:FindFirstChild("Lobby")
         local exitBtn = lobby and lobby:FindFirstChild("Exit")
-        if exitBtn and exitBtn.Visible then clickBtn(exitBtn) end
+        if exitBtn and exitBtn.Visible then clickGui(exitBtn) end
     end)
 
     return true
