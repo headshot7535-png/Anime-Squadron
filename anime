@@ -35,7 +35,7 @@
       waiting for the whole raid to finish).
 --------------------------------------------------------------------------]]
 
-local VERSION = "1.9.6"   -- bump this each upload so you can confirm the live build
+local VERSION = "1.9.7"   -- bump this each upload so you can confirm the live build
 local NEXUSLIB_URL = "https://raw.githubusercontent.com/headshot7535-png/Nexuslib/main/Nexuslib"
 
 -- ============================================================
@@ -834,6 +834,17 @@ local function forgetDailyMap()
     if saveSession then saveSession() end
 end
 
+-- ============================================================
+-- UI handle (set later) + status helper — must be before daily leave helpers
+-- ============================================================
+local Win
+local function setStatus(msg)
+    if Win then pcall(function() Win:Status(msg) end) end
+end
+local function notify(title, msg, typ)
+    if Win then pcall(function() Win:Notify(title, msg, 4, typ or "info") end) end
+end
+
 local function findTraitMapEntry(world, mode, act)
     for _, m in ipairs(TRAIT_DAILY_MAPS) do
         if m.world == world and m.mode == mode and tonumber(m.act) == tonumber(act) then
@@ -936,17 +947,6 @@ local function waitForStageReturn()
         task.wait(2)
     end
     return not inLobby()
-end
-
--- ============================================================
--- UI handle (set later) + status helper
--- ============================================================
-local Win
-local function setStatus(msg)
-    if Win then pcall(function() Win:Status(msg) end) end
-end
-local function notify(title, msg, typ)
-    if Win then pcall(function() Win:Notify(title, msg, 4, typ or "info") end) end
 end
 
 -- ============================================================
