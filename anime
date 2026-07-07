@@ -30,12 +30,12 @@
       Live team DPS from leaderstats.Damage + theoretical per-slot DPS (dmg/cd)
       for equipped units. See the DPS tab.
 
-    DAILY TRAIT LEAVE (v1.9.6):
-      Leaves the stage as soon as a map's daily Trait Shard cap is full (no more
-      waiting for the whole raid to finish).
+    DAILY TRAIT LEAVE (v1.9.8):
+      Leaves the stage as soon as a map's daily Trait Shard cap is full. Tries
+      Play/leave, game Play.leave(), Matchmaking/leave, and GUI Leave buttons.
 --------------------------------------------------------------------------]]
 
-local VERSION = "1.9.7"   -- bump this each upload so you can confirm the live build
+local VERSION = "1.9.9"   -- bump this each upload so you can confirm the live build
 local NEXUSLIB_URL = "https://raw.githubusercontent.com/headshot7535-png/Nexuslib/main/Nexuslib"
 
 -- ============================================================
@@ -268,6 +268,68 @@ local function inLobby()
     return getBountyGui() ~= nil
 end
 
+-- Stage leave (multi-path — Play/leave alone often fails mid-raid)
+local function inBattle()
+    local chars = workspace:FindFirstChild("Characters")
+    if not chars then return false end
+    for _, ch in ipairs(chars:GetChildren()) do
+        if ch:IsA("Model") then return true end
+    end
+    return false
+end
+
+local function clickBtn(btn)
+    if not btn then return false end
+    if firesignal then
+        return pcall(firesignal, btn.MouseButton1Click)
+    end
+    if getconnections then
+        local ok = false
+        for _, conn in ipairs(getconnections(btn.MouseButton1Click)) do
+            if conn.Function then
+                ok = pcall(conn.Function) or ok
+            end
+        end
+        return ok
+    end
+    return false
+end
+
+local _lastLeaveAt = 0
+local function leaveStage()
+    local now = tick()
+    if now - _lastLeaveAt < 1.5 then return false end
+    _lastLeaveAt = now
+
+    fireR("Play", "leave")
+
+    pcall(function()
+        local play = require(LP.PlayerScripts.Client.Play)
+        if type(play.leave) == "function" then
+            play.leave(nil, true)
+        end
+    end)
+
+    fireR("Matchmaking", "leave")
+    pcall(function() invokeR("Player", "physical_teleport", "play") end)
+
+    pcall(function()
+        local menus = getMenus()
+        if not menus then return end
+        local stage = menus:FindFirstChild("StageInfo")
+        local btn = stage and stage:FindFirstChild("Buttons") and stage.Buttons:FindFirstChild("Leave")
+        if btn and btn.Visible then clickBtn(btn) end
+        local ps = menus:FindFirstChild("Play_Start")
+        local psLeave = ps and ps:FindFirstChild("Buttons") and ps.Buttons:FindFirstChild("Leave")
+        if psLeave and psLeave.Visible then clickBtn(psLeave) end
+        local lobby = menus:FindFirstChild("Lobby")
+        local exitBtn = lobby and lobby:FindFirstChild("Exit")
+        if exitBtn and exitBtn.Visible then clickBtn(exitBtn) end
+    end)
+
+    return true
+end
+
 -- the game's own bounty client module (calls remotes AND refreshes the GUI)
 local _bModule
 local function ensureModule()
@@ -495,7 +557,7 @@ local function startMap(world, act, mode, difficulty)
     local okS, sucS = invokeR("Play", "start")
     if okS and sucS then return true end
     -- couldn't start; clean up the room so we don't get stuck
-    pcall(function() fireR("Play", "leave") end)
+    pcall(function() leaveStage() end)
     return false, "start failed"
 end
 
@@ -877,19 +939,24 @@ local function resolveDailyMap()
     return getCurrentPlayMap()
 end
 
+local _lastCapLeaveNotify = 0
 local function leaveStageIfCapped(map, reason)
     if not map or not isTraitCapMaxed(map) then return false end
     setStatus(reason or ("Daily cap full on " .. map.world .. " - leaving stage..."))
-    notify("Daily Traits", map.world .. " cap reached (" .. getTraitCapCount(map) .. "/" .. map.cap .. ") — leaving.", "success")
-    pcall(function() fireR("Play", "leave") end)
+    if tick() - _lastCapLeaveNotify > 10 then
+        _lastCapLeaveNotify = tick()
+        notify("Daily Traits", map.world .. " cap reached (" .. getTraitCapCount(map) .. "/" .. map.cap .. ") — leaving.", "success")
+    end
+    leaveStage()
     AB._dailyLeftCap = true
     return true
 end
 
 local function waitForLobbyReturn(timeout)
     local t0 = tick()
-    while alive() and not inLobby() and (tick() - t0) < (timeout or 45) do
-        task.wait(1)
+    while alive() and (not inLobby() or inBattle()) and (tick() - t0) < (timeout or 60) do
+        leaveStage()
+        task.wait(2)
     end
     if inLobby() then
         task.wait(2)
@@ -918,12 +985,16 @@ local function waitForDailyRun(map)
 
     setStatus(("Daily traits - fighting %s %s Act %d, watching cap..."):format(map.mode, map.world, map.act))
     local t2 = tick()
-    while alive() and CONFIG.enabled and not inLobby() and (tick() - t2) < CONFIG.farmTimeout do
-        if leaveStageIfCapped(map) then break end
+    while alive() and CONFIG.enabled and (not inLobby() or inBattle()) and (tick() - t2) < CONFIG.farmTimeout do
+        if leaveStageIfCapped(map) then
+            waitForLobbyReturn(60)
+            return true
+        end
         task.wait(1)
     end
 
-    waitForLobbyReturn(45)
+    if inLobby() and not inBattle() then return true end
+    waitForLobbyReturn(30)
     return true
 end
 
@@ -1299,7 +1370,11 @@ function setEnabled(on)
     CONFIG.enabled = on and true or false
     AB.enabled = CONFIG.enabled
     Session.running = CONFIG.enabled
-    if saveSession then saveSession() end
+    saveSettings()
+    -- write session immediately so manual re-exec within 0.3s still resumes
+    if canFile and canFile() then
+        pcall(function() writefile("AutoBounty_session.json", HttpService:JSONEncode(Session)) end)
+    end
     if CONFIG.enabled then addThread(mainLoop) end
 end
 
@@ -1340,6 +1415,7 @@ local function saveSettings()
         task.wait(0.6)
         _saveQueued = false
         local data = {
+            enabled          = CONFIG.enabled,
             act              = CONFIG.act,
             difficulty       = CONFIG.difficulty,
             soloOnly         = CONFIG.soloOnly,
@@ -1368,6 +1444,7 @@ local function loadSettings()
     if not ok or not raw then return end
     local ok2, data = pcall(function() return HttpService:JSONDecode(raw) end)
     if not ok2 or type(data) ~= "table" then return end
+    if data.enabled ~= nil then CONFIG.enabled = data.enabled == true end
     CONFIG.act              = math.clamp(tonumber(data.act) or CONFIG.act, 1, 7)
     if data.difficulty == "Normal" or data.difficulty == "Hard" then CONFIG.difficulty = data.difficulty end
     CONFIG.soloOnly         = data.soloOnly == true
@@ -1420,8 +1497,12 @@ local function loadSession()
     end
 end
 loadSession()
--- resume the running state captured before the last teleport
-CONFIG.enabled = Session.running == true
+-- resume master toggle: session file + settings + in-memory AB (same-place re-exec)
+CONFIG.enabled = (Session.running == true) or (CONFIG.enabled == true) or (AB.enabled == true)
+if CONFIG.enabled then
+    Session.running = true
+    AB.enabled = true
+end
 
 -- ============================================================
 -- Teleport persistence (re-exec after ANY teleport - manual or script)
@@ -1743,7 +1824,7 @@ local function startKillTracker()
                     AB._leftRun = true
                     AB._earlyLeft = true
                     setStatus("Target reached in-stage - leaving to claim...")
-                    pcall(function() fireR("Play", "leave") end)
+                    leaveStage()
                 end
             end
             -- diagnostic: bounty active, enemies present, but none match the name
@@ -1807,10 +1888,15 @@ local function buildUI()
     local Main = Win:Tab("⚔️", "Bounty")
     Main:Section("Automation")
 
-    Main:Toggle("Enable (master)",
+    local masterToggle = Main:Toggle("Enable (master)",
         "Master on/off for all automation loops", CONFIG.enabled, function(on)
             setEnabled(on)
         end)
+    task.defer(function()
+        if CONFIG.enabled and masterToggle then
+            pcall(function() masterToggle.Set(true) end)
+        end
+    end)
 
     Main:Toggle("Auto Bounty",
         "Accept trait bounties, farm, claim, repeat", CONFIG.bountyFarm, function(on)
@@ -2054,6 +2140,11 @@ if CONFIG.enabled then
     end)
 end
 
-setStatus(("v%s loaded. Toggle 'Enable (master)' to start."):format(VERSION))
-notify("Auto Bounty", "Loaded v" .. VERSION, "success")
-print("[Auto Bounty] loaded v" .. VERSION)
+if CONFIG.enabled then
+    setStatus(("v%s resumed — master ON, automation running."):format(VERSION))
+    notify("Auto Bounty", "Resumed v" .. VERSION .. " (master ON)", "success")
+else
+    setStatus(("v%s loaded. Toggle 'Enable (master)' to start."):format(VERSION))
+    notify("Auto Bounty", "Loaded v" .. VERSION, "success")
+end
+print("[Auto Bounty] loaded v" .. VERSION .. (CONFIG.enabled and " (resumed)" or ""))
