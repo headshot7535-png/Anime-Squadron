@@ -27,16 +27,13 @@
       built-in AFK script). Toggle it in the Misc tab.
 --------------------------------------------------------------------------]]
 
-local VERSION = "1.9.2"   -- bump this each upload so you can confirm the live build
+local VERSION = "1.9.3"   -- bump this each upload so you can confirm the live build
 local NEXUSLIB_URL = "https://raw.githubusercontent.com/headshot7535-png/Nexuslib/main/Nexuslib"
 
 -- ============================================================
--- Anti-stacking generation token + boot lock (prevents double GUI on teleport)
+-- Boot lock (prevents double GUI on teleport) — claim BEFORE bumping GEN
+-- so a rejected duplicate boot does not kill the live instance's status thread.
 -- ============================================================
-_G.AutoBountyGen = (_G.AutoBountyGen or 0) + 1
-local GEN = _G.AutoBountyGen
-local function alive() return _G.AutoBountyGen == GEN end
-
 local BOOT_LOCK_FILE = "AutoBounty_boot_lock.json"
 local function canFileEarly()
     return (writefile and readfile and isfile) and true or false
@@ -70,6 +67,13 @@ if not claimScriptBoot() then return end
 -- persistent state (survives re-execution / teleport)
 _G.AB = _G.AB or {}
 local AB = _G.AB
+
+-- ============================================================
+-- Anti-stacking generation token (only after boot claimed)
+-- ============================================================
+_G.AutoBountyGen = (_G.AutoBountyGen or 0) + 1
+local GEN = _G.AutoBountyGen
+local function alive() return _G.AutoBountyGen == GEN end
 
 -- ============================================================
 -- Services
@@ -1459,6 +1463,29 @@ do
 end
 
 local statusLabels = {}
+local function setLabel(lbl, text)
+    if not lbl then return end
+    pcall(function()
+        if type(lbl.Set) == "function" then lbl.Set(text)
+        elseif lbl.Text ~= nil then lbl.Text = text end
+    end)
+end
+local function refreshDailyCapLabels()
+    local df = Session.dailyFarm
+    if df then
+        setLabel(statusLabels.dailyMap, ("Current map: %s %s Act %d")
+            :format(df.mode or "?", df.world or "?", df.act or "?"))
+    else
+        setLabel(statusLabels.dailyMap, "Current map: none")
+    end
+    local parts = {}
+    for _, m in ipairs(TRAIT_DAILY_MAPS) do
+        local cur = getTraitCapCount(m)
+        local mark = cur >= m.cap and " OK" or ""
+        parts[#parts + 1] = ("%s %s %d/%d%s"):format(m.mode, m.world, cur, m.cap, mark)
+    end
+    setLabel(statusLabels.dailyCaps, "Caps: " .. table.concat(parts, " | "))
+end
 local function buildUI()
     if not Lib then return end
     Win = Lib:Window({ title = "Auto Bounty  v" .. VERSION })
@@ -1530,6 +1557,7 @@ local function buildUI()
     Daily:Section("Live caps (from player data)")
     statusLabels.dailyMap  = Daily:Label("Current map: -")
     statusLabels.dailyCaps = Daily:Label("Caps: -")
+    task.defer(refreshDailyCapLabels)
 
     -- ----- Status tab -----
     local St = Win:Tab("📊", "Status")
@@ -1663,29 +1691,8 @@ addThread(function()
                 pcall(function() statusLabels.trait.Set("Trait bounties available: " .. traitCount) end)
                 pcall(function() statusLabels.board.Set("Board: " .. #list .. " bounties") end)
             end
-            -- daily trait cap readout (works in lobby)
-            pcall(function()
-                if statusLabels.dailyMap then
-                    local df = Session.dailyFarm
-                    if df then
-                        statusLabels.dailyMap.Set(("Current map: %s %s Act %d")
-                            :format(df.mode or "?", df.world or "?", df.act or "?"))
-                    else
-                        statusLabels.dailyMap.Set("Current map: none")
-                    end
-                end
-            end)
-            pcall(function()
-                if statusLabels.dailyCaps then
-                    local parts = {}
-                    for _, m in ipairs(TRAIT_DAILY_MAPS) do
-                        local cur = getTraitCapCount(m)
-                        local mark = cur >= m.cap and "✓" or ""
-                        parts[#parts + 1] = ("%s %s:%d/%d%s"):format(m.mode, m.world, cur, m.cap, mark)
-                    end
-                    statusLabels.dailyCaps.Set("Caps: " .. table.concat(parts, "  |  "))
-                end
-            end)
+            -- daily trait cap readout (lobby or battle)
+            pcall(refreshDailyCapLabels)
         end
         task.wait(1)
     end
