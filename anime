@@ -35,7 +35,7 @@
       Play/leave, game Play.leave(), Matchmaking/leave, and GUI Leave buttons.
 --------------------------------------------------------------------------]]
 
-local VERSION = "1.10.5"   -- bump this each upload so you can confirm the live build
+local VERSION = "1.10.6"   -- bump this each upload so you can confirm the live build
 local NEXUSLIB_URL = "https://raw.githubusercontent.com/headshot7535-png/Nexuslib/main/Nexuslib"
 
 -- ============================================================
@@ -799,21 +799,72 @@ local function getPlayerData()
     return AB.playerData
 end
 
+local function refreshPlayerData()
+    local ok, data = invokeR("Player", "get")
+    if ok and type(data) == "table" then
+        AB.playerData = data
+        pcall(function()
+            local util = require(LP.PlayerScripts.Client.Utility)
+            if util then util.data = data end
+        end)
+        return data
+    end
+    return getPlayerData()
+end
+
 local function getTraitCapCount(map)
     local data = getPlayerData()
     if not data or type(data.caps) ~= "table" then return 0 end
-    return tonumber(data.caps[capKey(map.mode, map.world, map.act)]) or 0
+    local key = capKey(map.mode, map.world, map.act)
+    local count = tonumber(data.caps[key]) or 0
+    -- fuzzy match if exact key missing (world name spacing variants)
+    if count == 0 then
+        local want = key:gsub("_", "")
+        for k, v in pairs(data.caps) do
+            if type(k) == "string" and k:gsub("_", "") == want then
+                count = tonumber(v) or 0
+                break
+            end
+        end
+    end
+    return count
 end
 
 local function isTraitCapMaxed(map)
+    if not map then return false end
     local cap = tonumber(map.cap) or 100
     return getTraitCapCount(map) >= cap
 end
 
+local function advanceDailyMapIdx(fromIdx, cappedMap)
+    local n = #TRAIT_DAILY_MAPS
+    if n == 0 then return 1 end
+    local cur = tonumber(fromIdx) or 1
+    local df = Session.dailyFarm or {}
+    df.idx = (cur % n) + 1
+    df.world = nil
+    df.mode = nil
+    df.act = nil
+    if cappedMap then
+        AB._lastCapLeaveKey = capKey(cappedMap.mode, cappedMap.world, cappedMap.act)
+        AB._lastCapLeaveAt = tick()
+    end
+    Session.dailyFarm = df
+    saveSession()
+    return df.idx
+end
+
+local function shouldSkipMapAfterCapLeave(map)
+    if not map then return false end
+    local ck = capKey(map.mode, map.world, map.act)
+    return AB._lastCapLeaveKey == ck and (tick() - (AB._lastCapLeaveAt or 0)) < 45
+end
+
 local function countOpenTraitMaps()
+    refreshPlayerData()
     local open = 0
     for _, m in ipairs(TRAIT_DAILY_MAPS) do
-        if not isTraitCapMaxed(m) then open = open + 1 end
+        if not isTraitCapMaxed(m) and not shouldSkipMapAfterCapLeave(m) then open = open + 1 end
     end
     return open
 end
@@ -1065,13 +1116,16 @@ local function startDpsTracker()
 end
 
 local function nextTraitMap(startIdx)
+    refreshPlayerData()
     local n = #TRAIT_DAILY_MAPS
     if n == 0 then return nil end
     local idx = startIdx or 1
     for _ = 1, n do
         if idx > n then idx = 1 end
         local m = TRAIT_DAILY_MAPS[idx]
-        if not isTraitCapMaxed(m) then return m, idx end
+        if m and not isTraitCapMaxed(m) and not shouldSkipMapAfterCapLeave(m) then
+            return m, idx
+        end
         idx = idx + 1
     end
     return nil
@@ -1132,15 +1186,18 @@ local function resolveDailyMap()
 end
 
 local _lastCapLeaveNotify = 0
-local function leaveStageIfCapped(map, reason)
-    if not map or not isTraitCapMaxed(map) then return false end
+local function leaveStageIfCapped(map, reason, fromIdx)
+    refreshPlayerData()
+    if not map then return false end
+    if not isTraitCapMaxed(map) and not shouldSkipMapAfterCapLeave(map) then return false end
     setStatus(reason or ("Daily cap full on " .. map.world .. " - leaving stage..."))
     if tick() - _lastCapLeaveNotify > 10 then
         _lastCapLeaveNotify = tick()
-        notify("Daily Traits", map.world .. " cap reached (" .. getTraitCapCount(map) .. "/" .. map.cap .. ") — leaving.", "success")
+        notify("Daily Traits", map.world .. " cap reached (" .. getTraitCapCount(map) .. "/" .. map.cap .. ") — next map.", "success")
     end
-    leaveStage()
+    leaveStage(true)
     AB._dailyLeftCap = true
+    advanceDailyMapIdx(fromIdx or (Session.dailyFarm and Session.dailyFarm.idx), map)
     return true
 end
 
@@ -1178,7 +1235,7 @@ local function waitForDailyRun(map)
     setStatus(("Daily traits - fighting %s %s Act %d, watching cap..."):format(map.mode, map.world, map.act))
     local t2 = tick()
     while alive() and CONFIG.enabled and (not inLobby() or inBattle()) and (tick() - t2) < CONFIG.farmTimeout do
-        if leaveStageIfCapped(map) then
+        if leaveStageIfCapped(map, nil, Session.dailyFarm and Session.dailyFarm.idx) then
             waitForLobbyReturn(60)
             return true
         end
@@ -1244,16 +1301,18 @@ end
 local function dailyTraitStep()
     if not CONFIG.dailyTraitFarm then return end
 
+    refreshPlayerData()
+
     if not inLobby() then
         local map = resolveDailyMap()
         if map then
-            local cur = getTraitCapCount(map)
-            if leaveStageIfCapped(map) then
+            local curIdx = Session.dailyFarm and Session.dailyFarm.idx
+            if leaveStageIfCapped(map, nil, curIdx) then
                 waitForLobbyReturn(45)
                 return
             end
             setStatus(("Daily traits - in %s %s Act %d  %d/%d"):format(
-                map.mode, map.world, map.act, cur, map.cap))
+                map.mode, map.world, map.act, getTraitCapCount(map), map.cap))
         else
             setStatus("Daily traits - in stage, watching cap...")
         end
@@ -1282,12 +1341,9 @@ local function dailyTraitStep()
     end
 
     local beforeCap = getTraitCapCount(map)
-    if isTraitCapMaxed(map) then
-        local skipDf = Session.dailyFarm or {}
-        skipDf.idx = (idx % #TRAIT_DAILY_MAPS) + 1
-        Session.dailyFarm = skipDf
-        saveSession()
-        setStatus(map.world .. " already capped - skipping to next map")
+    if isTraitCapMaxed(map) or shouldSkipMapAfterCapLeave(map) then
+        advanceDailyMapIdx(idx, map)
+        setStatus(map.world .. " capped — rotating to next map")
         return
     end
 
@@ -1301,8 +1357,7 @@ local function dailyTraitStep()
     local ok, err = startMap(map.world, map.act, map.mode, CONFIG.dailyDifficulty)
     if not ok then
         setStatus("Daily launch failed: " .. tostring(err))
-        -- try the next map instead of getting stuck on one we can't enter
-        df.idx = (idx % #TRAIT_DAILY_MAPS) + 1
+        advanceDailyMapIdx(idx, nil)
         df.stall = (df.stall or 0) + 1
         saveSession()
         if df.stall >= #TRAIT_DAILY_MAPS then
@@ -1315,6 +1370,7 @@ local function dailyTraitStep()
 
     waitForDailyRun(map)
 
+    refreshPlayerData()
     local afterCap = getTraitCapCount(map)
     if afterCap > beforeCap then
         df.stall = 0
@@ -1324,19 +1380,18 @@ local function dailyTraitStep()
     end
     saveSession()
 
-    if isTraitCapMaxed(map) then
+    if isTraitCapMaxed(map) or shouldSkipMapAfterCapLeave(map) then
         if not AB._dailyLeftCap then
-            notify("Daily Traits", map.world .. " cap reached (" .. map.cap .. ")", "success")
+            notify("Daily Traits", map.world .. " cap reached (" .. map.cap .. ") — next map.", "success")
         end
         AB._dailyLeftCap = nil
-        df.idx = (idx % #TRAIT_DAILY_MAPS) + 1
-        saveSession()
+        advanceDailyMapIdx(idx, map)
         return
     end
     if df.stall >= CONFIG.dailyStallRuns then
         setStatus(map.world .. " cap stalled - moving to next map")
         notify("Daily Traits", map.world .. " cap not increasing - skipping.", "info")
-        df.idx = (idx % #TRAIT_DAILY_MAPS) + 1
+        advanceDailyMapIdx(idx, map)
         df.stall = 0
         saveSession()
     end
@@ -2130,15 +2185,15 @@ local function startDailyCapWatcher()
         local lastTry = 0
         while alive() do
             if CONFIG.enabled and CONFIG.dailyTraitFarm and inBattle() then
+                refreshPlayerData()
                 local map = resolveDailyMap()
-                if map and isTraitCapMaxed(map) then
+                if map and (isTraitCapMaxed(map) or shouldSkipMapAfterCapLeave(map)) then
                     local now = tick()
                     if now - lastTry >= 2 then
                         lastTry = now
-                        setStatus(("Cap full %s %d/%d — leaving stage...")
-                            :format(map.world, getTraitCapCount(map), map.cap))
-                        leaveStage(true)
-                        AB._dailyLeftCap = true
+                        leaveStageIfCapped(map, ("Cap full %s %d/%d — leaving stage...")
+                            :format(map.world, getTraitCapCount(map), map.cap),
+                            Session.dailyFarm and Session.dailyFarm.idx)
                     end
                 end
             end
