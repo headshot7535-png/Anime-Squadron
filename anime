@@ -38,7 +38,7 @@
       data + world rewards), handle special-quest items, then invoke awaken.
 --------------------------------------------------------------------------]]
 
-local VERSION = "2.2.9"   -- bump this each upload so you can confirm the live build
+local VERSION = "2.3.1"   -- bump this each upload so you can confirm the live build
 local NEXUSLIB_URL = "https://raw.githubusercontent.com/headshot7535-png/Nexuslib/main/Nexuslib"
 
 -- ============================================================
@@ -1420,7 +1420,26 @@ local function countPendingChallenges()
     return n
 end
 
+local function forgetChallenge()
+    Session.challengeFarm = nil
+    saveSession()
+end
+
+local function clearStaleChallengeSession()
+    if not CONFIG.autoDailyChallenge and not CONFIG.autoRegularChallenge then
+        if Session.challengeFarm then forgetChallenge() end
+        return
+    end
+    if Session.challengeFarm and inLobby() and countPendingChallenges() == 0 then
+        forgetChallenge()
+    end
+end
+
 local function challengesTakePriority()
+    clearStaleChallengeSession()
+    if not CONFIG.autoDailyChallenge and not CONFIG.autoRegularChallenge then
+        return false
+    end
     if Session.challengeFarm then return true end
     return countPendingChallenges() > 0
 end
@@ -1431,11 +1450,6 @@ local function rememberChallenge(key, ch)
         world = ch.world,
         act   = ch.act,
     }
-    saveSession()
-end
-
-local function forgetChallenge()
-    Session.challengeFarm = nil
     saveSession()
 end
 
@@ -1519,7 +1533,10 @@ local function waitForChallengeRun(key, ch)
 end
 
 local function challengeStep()
-    if not CONFIG.autoDailyChallenge and not CONFIG.autoRegularChallenge then return end
+    if not CONFIG.autoDailyChallenge and not CONFIG.autoRegularChallenge then
+        if Session.challengeFarm then forgetChallenge() end
+        return
+    end
 
     if not inLobby() then
         local cf = Session.challengeFarm
@@ -1946,6 +1963,31 @@ local function discoverItemDropMaps(itemName)
     return found
 end
 
+local function normalizeAwakeningDifficulty(itemDifficulty)
+    if itemDifficulty == "Hard" then return "Hard" end
+    return (CONFIG.awakeningDifficulty == "Hard") and "Hard" or "Normal"
+end
+
+local function filterTargetsByDifficulty(targets)
+    if type(targets) ~= "table" or #targets == 0 then return targets end
+    local want = normalizeAwakeningDifficulty()
+    local filtered = {}
+    for _, t in ipairs(targets) do
+        if normalizeAwakeningDifficulty(t.difficulty) == want then
+            filtered[#filtered + 1] = t
+        end
+    end
+    if #filtered > 0 then return filtered end
+    if want == "Hard" then
+        for _, t in ipairs(targets) do
+            if normalizeAwakeningDifficulty(t.difficulty) == "Normal" then
+                filtered[#filtered + 1] = t
+            end
+        end
+    end
+    return #filtered > 0 and filtered or targets
+end
+
 local function buildFarmTargetsForItem(itemName)
     local targets = {}
     local seen = {}
@@ -1984,6 +2026,13 @@ local function buildFarmTargetsForItem(itemName)
             act = (parsed.acts and parsed.acts[1]) or 1,
             difficulty = parsed.difficulty or CONFIG.awakeningDifficulty,
         })
+    end
+
+    if type(targets) == "table" and #targets > 0 then
+        for _, t in ipairs(targets) do
+            t.difficulty = normalizeAwakeningDifficulty(t.difficulty)
+        end
+        targets = filterTargetsByDifficulty(targets)
     end
 
     return targets
@@ -2175,8 +2224,8 @@ local function getAwakeningFarmPreview(unitName)
         return "special quest: " .. tostring(target.quest)
     end
     if target.world and target.mode then
-        return ("next: %s %s Act %d for %s"):format(
-            target.mode, target.world, target.act or 0, target.item or "?")
+        return ("next: %s %s Act %d (%s) for %s"):format(
+            target.mode, target.world, target.act or 0, target.difficulty or CONFIG.awakeningDifficulty, target.item or "?")
     end
     return "planning route..."
 end
@@ -2519,7 +2568,9 @@ mainLoop = function()
         if CONFIG.autoAwakening then
             if challengesTakePriority() then
                 local pending = countPendingChallenges()
-                if pending > 0 then
+                if Session.challengeFarm then
+                    setStatus("Challenge session clearing — awakening next...")
+                elseif pending > 0 then
                     setStatus(("Challenges first (%d pending) — awakening queued"):format(pending))
                 end
             else
@@ -2708,6 +2759,9 @@ local function loadSession()
 end
 loadSession()
 syncChallengeDoneFlags()
+if not CONFIG.autoDailyChallenge and not CONFIG.autoRegularChallenge then
+    Session.challengeFarm = nil
+end
 -- Master toggle comes ONLY from settings (not session.running / AS.enabled OR chain)
 Session.running = CONFIG.enabled == true
 AS.enabled = CONFIG.enabled == true
@@ -3143,14 +3197,16 @@ local function refreshAwakeningLabels()
     end
     local af = Session.awakeningFarm
     if af and af.world and af.mode then
-        setLabel(statusLabels.awakenFarm, ("Farming: %s %s Act %d for %s"):format(
-            af.mode, af.world, af.act or 0, af.item or "?"))
+        setLabel(statusLabels.awakenFarm, ("Farming: %s %s Act %d (%s) for %s"):format(
+            af.mode, af.world, af.act or 0, af.difficulty or CONFIG.awakeningDifficulty, af.item or "?"))
     elseif af and af.quest then
         setLabel(statusLabels.awakenFarm, "Special quest: " .. tostring(af.quest))
     elseif not CONFIG.autoAwakening then
         setLabel(statusLabels.awakenFarm, "Farm target: auto awakening OFF")
     elseif challengesTakePriority() and countPendingChallenges() > 0 then
         setLabel(statusLabels.awakenFarm, ("Waiting: %d challenge(s) first"):format(countPendingChallenges()))
+    elseif challengesTakePriority() and Session.challengeFarm then
+        setLabel(statusLabels.awakenFarm, "Waiting: stale challenge session clearing...")
     elseif #missing > 0 then
         setLabel(statusLabels.awakenFarm, getAwakeningFarmPreview(unit.name))
     else
@@ -3295,11 +3351,29 @@ local function buildUI()
         cycleAwakenUnit(1)
     end)
 
-    Aw:Dropdown("Farm difficulty", "Difficulty for awakening farm maps", { "Normal", "Hard" },
-        (CONFIG.awakeningDifficulty == "Hard") and 2 or 1, function(opt)
-            CONFIG.awakeningDifficulty = opt; saveSettings()
+    Aw:Section("Difficulty")
+    local awakenDiffLabel = Aw:Label("Map difficulty: " .. CONFIG.awakeningDifficulty)
+    Aw:Toggle("Hard mode (awakening)",
+        "Off = Normal, On = Hard for awakening material farms", CONFIG.awakeningDifficulty == "Hard", function(on)
+            CONFIG.awakeningDifficulty = on and "Hard" or "Normal"
+            saveSettings()
+            pcall(function() awakenDiffLabel.Set("Map difficulty: " .. CONFIG.awakeningDifficulty) end)
+            pcall(refreshAwakeningLabels)
         end)
+    Aw:Button("Normal", "Set Normal", "Farm awakening maps on Normal difficulty", nil, function()
+        CONFIG.awakeningDifficulty = "Normal"
+        saveSettings()
+        pcall(function() awakenDiffLabel.Set("Map difficulty: Normal") end)
+        pcall(refreshAwakeningLabels)
+    end)
+    Aw:Button("Hard", "Set Hard", "Farm awakening maps on Hard difficulty", nil, function()
+        CONFIG.awakeningDifficulty = "Hard"
+        saveSettings()
+        pcall(function() awakenDiffLabel.Set("Map difficulty: Hard") end)
+        pcall(refreshAwakeningLabels)
+    end)
 
+    Aw:Section("Actions")
     Aw:Button("↺", "Refresh units", "Rescan player data + Characters menu for awakenable units", nil, function()
         AWAKENABLE_NAMES = nil
         local n = refreshAwakenUnitDropdown()
@@ -3385,10 +3459,23 @@ local function buildUI()
     task.defer(refreshPriorityInputs)
 
     Daily:Section("Settings")
-    Daily:Dropdown("Daily difficulty", "Difficulty for daily-trait maps", { "Normal", "Hard" },
-        (CONFIG.dailyDifficulty == "Hard") and 2 or 1, function(opt)
-            CONFIG.dailyDifficulty = opt; saveSettings()
+    local dailyDiffLabel = Daily:Label("Map difficulty: " .. CONFIG.dailyDifficulty)
+    Daily:Toggle("Hard mode (daily traits)",
+        "Off = Normal, On = Hard for daily trait farm maps", CONFIG.dailyDifficulty == "Hard", function(on)
+            CONFIG.dailyDifficulty = on and "Hard" or "Normal"
+            saveSettings()
+            pcall(function() dailyDiffLabel.Set("Map difficulty: " .. CONFIG.dailyDifficulty) end)
         end)
+    Daily:Button("Normal", "Set Normal", "Farm daily trait maps on Normal difficulty", nil, function()
+        CONFIG.dailyDifficulty = "Normal"
+        saveSettings()
+        pcall(function() dailyDiffLabel.Set("Map difficulty: Normal") end)
+    end)
+    Daily:Button("Hard", "Set Hard", "Farm daily trait maps on Hard difficulty", nil, function()
+        CONFIG.dailyDifficulty = "Hard"
+        saveSettings()
+        pcall(function() dailyDiffLabel.Set("Map difficulty: Hard") end)
+    end)
     Daily:Toggle("Auto-stop when all caps full",
         "Stop once every map's daily trait cap is reached", CONFIG.dailyStopWhenDone, function(on)
             CONFIG.dailyStopWhenDone = on; saveSettings()
