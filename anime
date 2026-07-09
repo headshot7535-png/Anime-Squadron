@@ -38,7 +38,7 @@
       data + world rewards), handle special-quest items, then invoke awaken.
 --------------------------------------------------------------------------]]
 
-local VERSION = "2.3.4"   -- bump this each upload so you can confirm the live build
+local VERSION = "2.3.5"   -- bump this each upload so you can confirm the live build
 local NEXUSLIB_URL = "https://raw.githubusercontent.com/headshot7535-png/Nexuslib/main/Nexuslib"
 
 -- ============================================================
@@ -1624,7 +1624,34 @@ end
 -- ============================================================
 -- Auto awakening (farm materials + special quests, then awaken)
 -- Priority: challenges > awakening > daily traits
+-- (IIFE: keeps main chunk under Luau's 200 local register limit)
 -- ============================================================
+local awakeningStep, awakeningTakesPriority
+local getOwnedAwakenableUnits, findOwnedUnitByName
+local getMissingAwakeningReqs, getAwakeningFarmPreview, updateAwakenItemCacheFromData
+local AWAKENABLE_NAMES
+
+local function restoreAwakenItemCache()
+    AS.awakenItemCache = AS.awakenItemCache or {}
+    if Session.awakenItemCache and type(Session.awakenItemCache) == "table" then
+        for item, count in pairs(Session.awakenItemCache) do
+            AS.awakenItemCache[item] = tonumber(count) or 0
+        end
+    end
+end
+
+local function restoreAwakenUnitCache()
+    AS.awakenUnitByName = AS.awakenUnitByName or {}
+    if Session.awakenUnitCache and type(Session.awakenUnitCache.byName) == "table" then
+        for name, u in pairs(Session.awakenUnitCache.byName) do
+            if type(u) == "table" and u.name then
+                AS.awakenUnitByName[name] = u
+            end
+        end
+    end
+end
+
+local _awakenMod = (function()
 local ITEM_LOC_CACHE = {}
 local SPECIAL_QUEST_ITEM = {
     ["Beast Core"] = "Furious Beast",
@@ -1636,15 +1663,6 @@ local function stripHtml(s)
     if type(s) ~= "string" then return "" end
     s = s:gsub("<[^>]+>", ""):gsub("&nbsp;", " "):gsub("%s+", " ")
     return (s:match("^%s*(.-)%s*$") or s)
-end
-
-local function restoreAwakenItemCache()
-    AS.awakenItemCache = AS.awakenItemCache or {}
-    if Session.awakenItemCache and type(Session.awakenItemCache) == "table" then
-        for item, count in pairs(Session.awakenItemCache) do
-            AS.awakenItemCache[item] = tonumber(count) or 0
-        end
-    end
 end
 
 local function readLiveItemCount(itemName, data)
@@ -1716,7 +1734,6 @@ local function getCharacterData(unitName)
     return nil
 end
 
-local AWAKENABLE_NAMES = nil
 local function scanAwakenableCharacterNames()
     if AWAKENABLE_NAMES then return AWAKENABLE_NAMES end
     local map = {}
@@ -1790,17 +1807,6 @@ local function discoverUnitsFromCharactersGui(seen)
         end
     end
     return list
-end
-
-local function restoreAwakenUnitCache()
-    AS.awakenUnitByName = AS.awakenUnitByName or {}
-    if Session.awakenUnitCache and type(Session.awakenUnitCache.byName) == "table" then
-        for name, u in pairs(Session.awakenUnitCache.byName) do
-            if type(u) == "table" and u.name then
-                AS.awakenUnitByName[name] = u
-            end
-        end
-    end
 end
 
 local function countAwakenUnitCache()
@@ -2584,6 +2590,25 @@ local function awakeningStep()
     saveSession()
 end
 
+return {
+    step = awakeningStep,
+    takesPriority = awakeningTakesPriority,
+    getUnits = getOwnedAwakenableUnits,
+    findUnit = findOwnedUnitByName,
+    getMissing = getMissingAwakeningReqs,
+    getPreview = getAwakeningFarmPreview,
+    updateItemCache = updateAwakenItemCacheFromData,
+}
+end)()
+
+awakeningStep = _awakenMod.step
+awakeningTakesPriority = _awakenMod.takesPriority
+getOwnedAwakenableUnits = _awakenMod.getUnits
+findOwnedUnitByName = _awakenMod.findUnit
+getMissingAwakeningReqs = _awakenMod.getMissing
+getAwakeningFarmPreview = _awakenMod.getPreview
+updateAwakenItemCacheFromData = _awakenMod.updateItemCache
+
 -- ============================================================
 -- Core loop logic
 -- ============================================================
@@ -3303,6 +3328,11 @@ do
     if ok then Lib = lib end
 end
 
+local refreshDailyCapLabels, refreshAwakeningLabels, refreshAwakenUnitDropdown, refreshChallengeLabels
+
+local _uiMod = (function()
+local awakenUnitInput = nil
+
 local function refreshDailyCapLabels()
     local df = Session.dailyFarm
     if df then
@@ -3375,15 +3405,13 @@ local function refreshAwakeningLabels()
     else
         setLabel(statusLabels.awakenFarm, "Farm target: ready to awaken")
     end
-    local n = countAwakenUnitCache()
-    if n == 0 then n = #getOwnedAwakenableUnits() end
+    local n = #getOwnedAwakenableUnits()
     if statusLabels.awakenCount then
         setLabel(statusLabels.awakenCount, ("Awakenable units found: %d%s"):format(
             n, (not inLobby() and n > 0) and " (cached)" or ""))
     end
 end
 
-local awakenUnitInput = nil
 local function cycleAwakenUnit(dir)
     local units = getOwnedAwakenableUnits()
     if #units == 0 then return end
@@ -3755,9 +3783,9 @@ local function buildUI()
         notify("Discord", "Invite copied (edit link in script).", "info")
     end)
 end
+
 buildUI()
 
--- live status updater
 addThread(function()
     while alive() do
         if next(statusLabels) then
@@ -3786,6 +3814,19 @@ addThread(function()
         task.wait(1)
     end
 end)
+
+return {
+    refreshDaily = refreshDailyCapLabels,
+    refreshAwaken = refreshAwakeningLabels,
+    refreshAwakenDropdown = refreshAwakenUnitDropdown,
+    refreshChallenge = refreshChallengeLabels,
+}
+end)()
+
+refreshDailyCapLabels = _uiMod.refreshDaily
+refreshAwakeningLabels = _uiMod.refreshAwaken
+refreshAwakenUnitDropdown = _uiMod.refreshAwakenDropdown
+refreshChallengeLabels = _uiMod.refreshChallenge
 
 -- ============================================================
 -- Register cleanup for the next re-execution, then resume if needed
