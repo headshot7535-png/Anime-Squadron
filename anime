@@ -38,7 +38,7 @@
       data + world rewards), handle special-quest items, then invoke awaken.
 --------------------------------------------------------------------------]]
 
-local VERSION = "2.2.3"   -- bump this each upload so you can confirm the live build
+local VERSION = "2.2.4"   -- bump this each upload so you can confirm the live build
 local NEXUSLIB_URL = "https://raw.githubusercontent.com/headshot7535-png/Nexuslib/main/Nexuslib"
 
 -- ============================================================
@@ -2929,7 +2929,7 @@ local function refreshAwakeningLabels()
     if af and af.world and af.mode then
         setLabel(statusLabels.awakenFarm, ("Farming: %s %s Act %d for %s"):format(
             af.mode, af.world, af.act or 0, af.item or "?"))
-    else    if af and af.quest then
+    elseif af and af.quest then
         setLabel(statusLabels.awakenFarm, "Special quest: " .. tostring(af.quest))
     else
         setLabel(statusLabels.awakenFarm, "Farm target: idle in lobby")
