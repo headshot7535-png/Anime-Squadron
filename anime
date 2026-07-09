@@ -38,7 +38,7 @@
       data + world rewards), handle special-quest items, then invoke awaken.
 --------------------------------------------------------------------------]]
 
-local VERSION = "2.3.7"   -- bump this each upload so you can confirm the live build
+local VERSION = "2.3.8"   -- bump this each upload so you can confirm the live build
 local NEXUSLIB_URL = "https://raw.githubusercontent.com/headshot7535-png/Nexuslib/main/Nexuslib"
 
 -- ============================================================
@@ -1723,9 +1723,48 @@ local function bumpAwakenItemCache(itemName, amount)
     end
 end
 
+local function getFarmItemNeed(itemName)
+    local af = Session.awakeningFarm
+    if not af or type(af.reqSnapshot) ~= "table" then return nil end
+    for _, m in ipairs(af.reqSnapshot) do
+        if m.item == itemName then return tonumber(m.need) end
+    end
+    return nil
+end
+
+local function syncReqSnapshotHave(itemName, have)
+    local af = Session.awakeningFarm
+    if not af or type(af.reqSnapshot) ~= "table" then return end
+    have = tonumber(have) or 0
+    for _, m in ipairs(af.reqSnapshot) do
+        if m.item == itemName then
+            m.have = have
+            m.deficit = math.max(0, (tonumber(m.need) or 0) - have)
+        end
+    end
+end
+
+local function maybeBumpFarmItemLive(itemName)
+    if not inPlayArea() or type(itemName) ~= "string" or itemName == "" then return end
+    local af = Session.awakeningFarm
+    if not af or af.item ~= itemName then return end
+    local live = tonumber(readLiveItemCount(itemName))
+    if not live then return end
+    restoreAwakenItemCache()
+    local prev = tonumber(AS.awakenItemCache and AS.awakenItemCache[itemName])
+        or tonumber(Session.awakenItemCache and Session.awakenItemCache[itemName]) or 0
+    if live <= prev then return end
+    local need = getFarmItemNeed(itemName)
+    local maxAccept = need and math.min(need, prev + 5) or (prev + 5)
+    if live > maxAccept then return end
+    bumpAwakenItemCache(itemName, live)
+    syncReqSnapshotHave(itemName, live)
+end
+
 local function getItemCount(itemName)
     restoreAwakenItemCache()
     if inPlayArea() then
+        maybeBumpFarmItemLive(itemName)
         if AS.awakenItemCache and AS.awakenItemCache[itemName] ~= nil then
             return AS.awakenItemCache[itemName]
         end
@@ -1956,8 +1995,40 @@ local function getMissingAwakeningReqs(unitName)
     if inPlayArea() then
         restoreAwakenItemCache()
         local af = Session.awakeningFarm
-        if af and af.unitName == unitName and type(af.reqSnapshot) == "table" then
-            return copyMissingSnapshot(af.reqSnapshot)
+        if af and af.unitName == unitName then
+            if af.item then maybeBumpFarmItemLive(af.item) end
+            local snapByItem = {}
+            if type(af.reqSnapshot) == "table" then
+                for _, m in ipairs(af.reqSnapshot) do snapByItem[m.item] = m end
+            end
+            local missing = {}
+            for item, need in pairs(cost) do
+                need = tonumber(need) or 0
+                if need > 0 then
+                    local have = getItemCount(item)
+                    if have == nil and snapByItem[item] then
+                        have = tonumber(snapByItem[item].have)
+                    end
+                    if have == nil then
+                        have = Session.awakenItemCache and tonumber(Session.awakenItemCache[item])
+                    end
+                    if have == nil then return nil end
+                    if have < need then
+                        missing[#missing + 1] = {
+                            item = item,
+                            need = need,
+                            have = have,
+                            deficit = need - have,
+                        }
+                    end
+                end
+            end
+            af.reqSnapshot = copyMissingSnapshot(missing)
+            table.sort(missing, function(a, b)
+                if a.deficit ~= b.deficit then return a.deficit > b.deficit end
+                return a.item < b.item
+            end)
+            return missing
         end
     end
 
@@ -2480,9 +2551,21 @@ local function waitForAwakeningRun(target)
     setStatus(("%s - farming %s %s Act %d for %s..."):format(
         label, target.mode or "?", target.world or "?", target.act or 0, target.item or "?"))
 
+    local af = Session.awakeningFarm
+    local farmItem = af and af.item
+    local farmNeed = farmItem and getFarmItemNeed(farmItem)
+
     local t2 = tick()
     local idleSince = nil
     while alive() and CONFIG.enabled and not inLobby() and (tick() - t2) < CONFIG.farmTimeout do
+        if farmItem then
+            maybeBumpFarmItemLive(farmItem)
+            local have = getItemCount(farmItem)
+            if farmNeed and have and have >= farmNeed then
+                setStatus(("Enough %s (%d/%d) — leaving stage..."):format(farmItem, have, farmNeed))
+                break
+            end
+        end
         if inBattle() then
             idleSince = nil
         elseif isRewardScreenVisible() then
@@ -3440,7 +3523,7 @@ local function refreshAwakeningLabels()
             setLabel(statusLabels.awakenReqs, "Requirements: ALL MET — ready to awaken")
         end
     else
-        local suffix = inPlayArea() and " (cached)" or ""
+        local suffix = inPlayArea() and " (in-match)" or ""
         local parts = {}
         for _, m in ipairs(missing) do
             parts[#parts + 1] = m.item .. " " .. m.have .. "/" .. m.need
@@ -3449,8 +3532,9 @@ local function refreshAwakeningLabels()
     end
     local af = Session.awakeningFarm
     if af and af.world and af.mode then
-        setLabel(statusLabels.awakenFarm, ("Farming: %s %s Act %d (%s) for %s"):format(
-            af.mode, af.world, af.act or 0, af.difficulty or CONFIG.awakeningDifficulty, af.item or "?"))
+        local leaveHint = inPlayArea() and " · leaves on clear or enough mats" or ""
+        setLabel(statusLabels.awakenFarm, ("Farming: %s %s Act %d (%s) for %s%s"):format(
+            af.mode, af.world, af.act or 0, af.difficulty or CONFIG.awakeningDifficulty, af.item or "?", leaveHint))
     elseif af and af.quest then
         setLabel(statusLabels.awakenFarm, "Special quest: " .. tostring(af.quest))
     elseif not CONFIG.autoAwakening then
