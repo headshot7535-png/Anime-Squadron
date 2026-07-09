@@ -38,7 +38,7 @@
       data + world rewards), handle special-quest items, then invoke awaken.
 --------------------------------------------------------------------------]]
 
-local VERSION = "2.3.2"   -- bump this each upload so you can confirm the live build
+local VERSION = "2.3.4"   -- bump this each upload so you can confirm the live build
 local NEXUSLIB_URL = "https://raw.githubusercontent.com/headshot7535-png/Nexuslib/main/Nexuslib"
 
 -- ============================================================
@@ -717,6 +717,9 @@ local function getPlayerData()
 end
 
 local function refreshPlayerData()
+    if not inLobby() then
+        return AS.playerData or getPlayerData()
+    end
     local ok, data = invokeR("Player", "get")
     if ok and type(data) == "table" then
         AS.playerData = data
@@ -1635,8 +1638,17 @@ local function stripHtml(s)
     return (s:match("^%s*(.-)%s*$") or s)
 end
 
-local function getItemCount(itemName)
-    local data = getPlayerData()
+local function restoreAwakenItemCache()
+    AS.awakenItemCache = AS.awakenItemCache or {}
+    if Session.awakenItemCache and type(Session.awakenItemCache) == "table" then
+        for item, count in pairs(Session.awakenItemCache) do
+            AS.awakenItemCache[item] = tonumber(count) or 0
+        end
+    end
+end
+
+local function readLiveItemCount(itemName, data)
+    data = data or getPlayerData()
     if not data then return 0 end
     if data.stats and data.stats[itemName] ~= nil then
         return tonumber(data.stats[itemName]) or 0
@@ -1645,6 +1657,53 @@ local function getItemCount(itemName)
         return tonumber(data.items[itemName]) or 0
     end
     return 0
+end
+
+local function updateAwakenItemCacheFromData(data, unitName)
+    if type(data) ~= "table" then return end
+    local cost = unitName and getAwakeningCost(unitName)
+    if not cost then return end
+    AS.awakenItemCache = AS.awakenItemCache or {}
+    Session.awakenItemCache = Session.awakenItemCache or {}
+    for item in pairs(cost) do
+        local n = readLiveItemCount(item, data)
+        AS.awakenItemCache[item] = n
+        Session.awakenItemCache[item] = n
+    end
+    saveSession()
+end
+
+local function bumpAwakenItemCache(itemName, amount)
+    if type(itemName) ~= "string" or itemName == "" then return end
+    amount = tonumber(amount) or 0
+    restoreAwakenItemCache()
+    AS.awakenItemCache = AS.awakenItemCache or {}
+    Session.awakenItemCache = Session.awakenItemCache or {}
+    local prev = tonumber(AS.awakenItemCache[itemName]) or 0
+    if amount > prev then
+        AS.awakenItemCache[itemName] = amount
+        Session.awakenItemCache[itemName] = amount
+        saveSession()
+    end
+end
+
+local function getItemCount(itemName)
+    restoreAwakenItemCache()
+    if inPlayArea() then
+        if AS.awakenItemCache and AS.awakenItemCache[itemName] ~= nil then
+            return AS.awakenItemCache[itemName]
+        end
+        return nil
+    end
+    local live = readLiveItemCount(itemName)
+    if inLobby() then
+        AS.awakenItemCache = AS.awakenItemCache or {}
+        Session.awakenItemCache = Session.awakenItemCache or {}
+        AS.awakenItemCache[itemName] = live
+        Session.awakenItemCache[itemName] = live
+        saveSession()
+    end
+    return live
 end
 
 local function getCharacterData(unitName)
@@ -1867,12 +1926,13 @@ end
 
 local function getMissingAwakeningReqs(unitName)
     local cost = getAwakeningCost(unitName)
-    if not cost then return {} end
+    if type(cost) ~= "table" or next(cost) == nil then return nil end
     local missing = {}
     for item, need in pairs(cost) do
         need = tonumber(need) or 0
         if need > 0 then
             local have = getItemCount(item)
+            if have == nil then return nil end
             if have < need then
                 missing[#missing + 1] = {
                     item = item,
@@ -2221,6 +2281,7 @@ end
 
 local function pickNextAwakeningFarmTarget(unitName, focusItem)
     local missing = getMissingAwakeningReqs(unitName)
+    if type(missing) ~= "table" then return nil, "unknown" end
     if #missing == 0 then return nil, "ready" end
 
     local tryOrder = {}
@@ -2282,7 +2343,8 @@ local function awakeningHasWork()
     local unit = findOwnedUnitByName(CONFIG.awakeningUnit)
     if not unit then return false end
     if Session.awakeningFarm then return true end
-    return #getMissingAwakeningReqs(unit.name) > 0
+    local missing = getMissingAwakeningReqs(unit.name)
+    return type(missing) == "table" and #missing > 0
 end
 
 local function getAwakeningFarmPreview(unitName)
@@ -2324,7 +2386,10 @@ local function rememberAwakeningFarm(target, unitName)
     af.targetCount = target.targetCount
     af.runs = af.runs or 0
     af.stall = af.stall or 0
-    af.lastCount = getItemCount(af.item or "")
+    af.lastCount = getItemCount(af.item or "") or 0
+    if unitName and inLobby() then
+        updateAwakenItemCacheFromData(getPlayerData(), unitName)
+    end
     saveSession()
 end
 
@@ -2414,11 +2479,17 @@ local function awakeningStep()
     end
 
     refreshPlayerData()
+    updateAwakenItemCacheFromData(getPlayerData(), unit.name)
     local af = Session.awakeningFarm
     if af and af.quest then pcall(claimReadySpecialTasks, af.quest) end
     claimReadySpecialTasks(SPECIAL_QUEST_ITEM[Session.awakeningFarm and Session.awakeningFarm.item or ""] or "")
 
     local missing = getMissingAwakeningReqs(unit.name)
+    if type(missing) ~= "table" then
+        setStatus("Awakening - refresh material counts in lobby.")
+        task.wait(2)
+        return
+    end
     if #missing == 0 then
         local ok, err = tryAwakenUnit(unit)
         if ok then
@@ -2461,7 +2532,7 @@ local function awakeningStep()
         return
     end
 
-    local before = getItemCount(itemName)
+    local before = getItemCount(itemName) or 0
     rememberAwakeningFarm(target, unit.name)
     local af = Session.awakeningFarm
     af.runs = (af.runs or 0) + 1
@@ -2491,10 +2562,13 @@ local function awakeningStep()
     end
 
     waitForAwakeningRun(target)
-    refreshPlayerData()
+    if inLobby() then
+        refreshPlayerData()
+        updateAwakenItemCacheFromData(getPlayerData(), unit.name)
+    end
     if target.quest then claimReadySpecialTasks(target.quest) end
 
-    local after = getItemCount(itemName)
+    local after = getItemCount(itemName) or before
     if after > before then
         af.stall = 0
         af.lastCount = after
@@ -2832,10 +2906,14 @@ local function loadSession()
         if type(data.awakenUnitCache) == "table" then
             Session.awakenUnitCache = data.awakenUnitCache
         end
+        if type(data.awakenItemCache) == "table" then
+            Session.awakenItemCache = data.awakenItemCache
+        end
     end
 end
 loadSession()
 restoreAwakenUnitCache()
+restoreAwakenItemCache()
 syncChallengeDoneFlags()
 if not CONFIG.autoDailyChallenge and not CONFIG.autoRegularChallenge then
     Session.challengeFarm = nil
@@ -3264,14 +3342,21 @@ local function refreshAwakeningLabels()
     end
     setLabel(statusLabels.awakenUnit, "Unit: " .. unit.name .. " (id " .. tostring(unit.id) .. ")")
     local missing = getMissingAwakeningReqs(unit.name)
-    if #missing == 0 then
-        setLabel(statusLabels.awakenReqs, "Requirements: ALL MET — ready to awaken")
+    if missing == nil then
+        setLabel(statusLabels.awakenReqs, "Requirements: unknown — refresh in lobby")
+    elseif #missing == 0 then
+        if inPlayArea() then
+            setLabel(statusLabels.awakenReqs, "Requirements: ALL MET (verify in lobby)")
+        else
+            setLabel(statusLabels.awakenReqs, "Requirements: ALL MET — ready to awaken")
+        end
     else
+        local suffix = inPlayArea() and " (cached)" or ""
         local parts = {}
         for _, m in ipairs(missing) do
             parts[#parts + 1] = m.item .. " " .. m.have .. "/" .. m.need
         end
-        setLabel(statusLabels.awakenReqs, "Missing: " .. table.concat(parts, " | "))
+        setLabel(statusLabels.awakenReqs, "Missing" .. suffix .. ": " .. table.concat(parts, " | "))
     end
     local af = Session.awakeningFarm
     if af and af.world and af.mode then
@@ -3285,7 +3370,7 @@ local function refreshAwakeningLabels()
         setLabel(statusLabels.awakenFarm, ("Waiting: %d challenge(s) first"):format(countPendingChallenges()))
     elseif challengesTakePriority() and Session.challengeFarm then
         setLabel(statusLabels.awakenFarm, "Waiting: stale challenge session clearing...")
-    elseif #missing > 0 then
+    elseif type(missing) == "table" and #missing > 0 then
         setLabel(statusLabels.awakenFarm, getAwakeningFarmPreview(unit.name))
     else
         setLabel(statusLabels.awakenFarm, "Farm target: ready to awaken")
@@ -3461,8 +3546,11 @@ local function buildUI()
     Aw:Section("Actions")
     Aw:Button("↺", "Refresh units", "Rescan player data + Characters menu for awakenable units", nil, function()
         AWAKENABLE_NAMES = nil
-        if inLobby() then refreshPlayerData() end
-        local n = refreshAwakenUnitDropdown()
+    if inLobby() then
+        refreshPlayerData()
+        updateAwakenItemCacheFromData(getPlayerData(), CONFIG.awakeningUnit)
+    end
+    local n = refreshAwakenUnitDropdown()
         notify("Awakening", n > 0 and ("Found " .. n .. " awakenable unit(s).") or "No awakenable units — open Characters menu in lobby, then refresh.", n > 0 and "success" or "error")
     end)
 
