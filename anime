@@ -33,9 +33,13 @@
     DAILY TRAIT LEAVE (v1.9.8):
       Leaves the stage as soon as a map's daily Trait Shard cap is full. Tries
       Play/leave, game Play.leave(), Matchmaking/leave, and GUI Leave buttons.
+
+    DAILY TRAIT PRIORITY (v1.11.0):
+      Reorder and enable/disable which trait maps to farm. Top of the list is
+      farmed first; capped maps are skipped to the next enabled priority map.
 --------------------------------------------------------------------------]]
 
-local VERSION = "1.10.6"   -- bump this each upload so you can confirm the live build
+local VERSION = "1.11.0"   -- bump this each upload so you can confirm the live build
 local NEXUSLIB_URL = "https://raw.githubusercontent.com/headshot7535-png/Nexuslib/main/Nexuslib"
 
 -- ============================================================
@@ -132,6 +136,9 @@ local CONFIG = {
     dailyDifficulty  = g.AutoBountyDailyDifficulty or "Normal", -- "Normal" | "Hard" for daily maps
     dailyStopWhenDone = (g.AutoBountyDailyStopWhenDone ~= false),
     dailyStallRuns   = tonumber(g.AutoBountyDailyStallRuns) or 3, -- no cap gain after N clears => treat as maxed
+    -- priority order for daily trait maps (top = farmed first); enabled[key] toggles each map
+    dailyPriorityOrder   = type(g.AutoBountyDailyPriority) == "table" and g.AutoBountyDailyPriority or {},
+    dailyPriorityEnabled = type(g.AutoBountyDailyPriorityEnabled) == "table" and g.AutoBountyDailyPriorityEnabled or {},
     dpsMeter         = (g.AutoBountyDpsMeter ~= false),           -- live team DPS + theoretical per-unit panel
 }
 CONFIG.enabled = false                                 -- set from the saved session below
@@ -146,6 +153,7 @@ CONFIG.enabled = false                                 -- set from the saved ses
 local Session = { running = false, bounty = nil, dailyFarm = nil }
 -- forward declarations (these are referenced earlier than they are defined)
 local saveSession
+local saveSettings
 local setEnabled, mainLoop, rememberBounty, forgetBounty
 local armReexec
 
@@ -785,6 +793,73 @@ local function discoverTraitMaps()
 end
 TRAIT_DAILY_MAPS = discoverTraitMaps()
 
+-- Default farm order (top = highest priority). Keys: mode|world|act
+local DEFAULT_DAILY_PRIORITY = {
+    "Raid|Eclipse (Before)|4",
+    "Raid|GT City|4",
+    "Challenge|Katakara Bridge|1",
+    "Challenge|The Hero Hunter|1",
+    "Invasion|The Lava Continent|4",
+}
+
+local function mapTraitKey(m)
+    return ("%s|%s|%s"):format(tostring(m.mode), tostring(m.world), tostring(m.act))
+end
+
+local function findTraitMapByKey(key)
+    for _, m in ipairs(TRAIT_DAILY_MAPS) do
+        if mapTraitKey(m) == key then return m end
+    end
+    return nil
+end
+
+local function ensureDailyPriorityConfig()
+    if type(CONFIG.dailyPriorityOrder) ~= "table" then CONFIG.dailyPriorityOrder = {} end
+    if type(CONFIG.dailyPriorityEnabled) ~= "table" then CONFIG.dailyPriorityEnabled = {} end
+    if #CONFIG.dailyPriorityOrder == 0 then
+        for _, key in ipairs(DEFAULT_DAILY_PRIORITY) do
+            CONFIG.dailyPriorityOrder[#CONFIG.dailyPriorityOrder + 1] = key
+        end
+    end
+    for _, m in ipairs(TRAIT_DAILY_MAPS) do
+        local k = mapTraitKey(m)
+        if not table.find(CONFIG.dailyPriorityOrder, k) then
+            CONFIG.dailyPriorityOrder[#CONFIG.dailyPriorityOrder + 1] = k
+        end
+        if CONFIG.dailyPriorityEnabled[k] == nil then
+            CONFIG.dailyPriorityEnabled[k] = true
+        end
+    end
+end
+
+-- enabled maps only, in user priority order
+local function getDailyMapQueue()
+    ensureDailyPriorityConfig()
+    local byKey = {}
+    for _, m in ipairs(TRAIT_DAILY_MAPS) do
+        byKey[mapTraitKey(m)] = m
+    end
+    local queue = {}
+    for _, key in ipairs(CONFIG.dailyPriorityOrder) do
+        if CONFIG.dailyPriorityEnabled[key] ~= false then
+            local m = byKey[key]
+            if m then queue[#queue + 1] = m end
+        end
+    end
+    return queue
+end
+
+local function moveDailyPriorityKey(key, delta)
+    ensureDailyPriorityConfig()
+    local order = CONFIG.dailyPriorityOrder
+    local idx = table.find(order, key)
+    if not idx then return end
+    local ni = idx + delta
+    if ni < 1 or ni > #order then return end
+    order[idx], order[ni] = order[ni], order[idx]
+    saveSettings()
+end
+
 local function capKey(mode, world, act)
     local s = ("%s %s %s Trait Shards"):format(tostring(mode), tostring(world), tostring(act))
     return string.lower(s):gsub(" ", "_")
@@ -837,7 +912,8 @@ local function isTraitCapMaxed(map)
 end
 
 local function advanceDailyMapIdx(fromIdx, cappedMap)
-    local n = #TRAIT_DAILY_MAPS
+    local queue = getDailyMapQueue()
+    local n = #queue
     if n == 0 then return 1 end
     local cur = tonumber(fromIdx) or 1
     local df = Session.dailyFarm or {}
@@ -863,7 +939,7 @@ end
 local function countOpenTraitMaps()
     refreshPlayerData()
     local open = 0
-    for _, m in ipairs(TRAIT_DAILY_MAPS) do
+    for _, m in ipairs(getDailyMapQueue()) do
         if not isTraitCapMaxed(m) and not shouldSkipMapAfterCapLeave(m) then open = open + 1 end
     end
     return open
@@ -1117,12 +1193,13 @@ end
 
 local function nextTraitMap(startIdx)
     refreshPlayerData()
-    local n = #TRAIT_DAILY_MAPS
+    local queue = getDailyMapQueue()
+    local n = #queue
     if n == 0 then return nil end
     local idx = startIdx or 1
     for _ = 1, n do
         if idx > n then idx = 1 end
-        local m = TRAIT_DAILY_MAPS[idx]
+        local m = queue[idx]
         if m and not isTraitCapMaxed(m) and not shouldSkipMapAfterCapLeave(m) then
             return m, idx
         end
@@ -1360,7 +1437,8 @@ local function dailyTraitStep()
         advanceDailyMapIdx(idx, nil)
         df.stall = (df.stall or 0) + 1
         saveSession()
-        if df.stall >= #TRAIT_DAILY_MAPS then
+        local qn = #getDailyMapQueue()
+        if qn > 0 and df.stall >= qn then
             notify("Daily Traits", "Couldn't enter any daily-trait map. Stopped.", "error")
             return "done"
         end
@@ -1688,6 +1766,8 @@ local function saveSettings()
             bountyFarm       = CONFIG.bountyFarm,
             dailyDifficulty  = CONFIG.dailyDifficulty,
             dailyStopWhenDone = CONFIG.dailyStopWhenDone,
+            dailyPriorityOrder   = CONFIG.dailyPriorityOrder,
+            dailyPriorityEnabled = CONFIG.dailyPriorityEnabled,
             dpsMeter          = CONFIG.dpsMeter,
         }
         pcall(function() writefile(SETTINGS_FILE, HttpService:JSONEncode(data)) end)
@@ -1719,10 +1799,17 @@ local function loadSettings()
         CONFIG.dailyDifficulty = data.dailyDifficulty
     end
     if data.dailyStopWhenDone ~= nil then CONFIG.dailyStopWhenDone = data.dailyStopWhenDone == true end
+    if type(data.dailyPriorityOrder) == "table" then CONFIG.dailyPriorityOrder = data.dailyPriorityOrder end
+    if type(data.dailyPriorityEnabled) == "table" then
+        for k, v in pairs(data.dailyPriorityEnabled) do
+            CONFIG.dailyPriorityEnabled[k] = v == true
+        end
+    end
     if data.dpsMeter ~= nil then CONFIG.dpsMeter = data.dpsMeter == true end
     if type(data.scriptUrl) == "string" and data.scriptUrl ~= "" then CONFIG.scriptUrl = data.scriptUrl end
 end
 loadSettings()
+ensureDailyPriorityConfig()
 
 -- ----- session memory (survives teleports) -----
 local SESSION_FILE = "AutoBounty_session.json"
@@ -2221,12 +2308,17 @@ local function refreshDailyCapLabels()
         setLabel(statusLabels.dailyMap, "Current map: none")
     end
     local parts = {}
-    for _, m in ipairs(TRAIT_DAILY_MAPS) do
+    local queue = getDailyMapQueue()
+    for i, m in ipairs(queue) do
         local cur = getTraitCapCount(m)
         local mark = cur >= m.cap and " OK" or ""
-        parts[#parts + 1] = ("%s %s %d/%d%s"):format(m.mode, m.world, cur, m.cap, mark)
+        parts[#parts + 1] = ("#%d %s %d/%d%s"):format(i, m.world, cur, m.cap, mark)
     end
-    setLabel(statusLabels.dailyCaps, "Caps: " .. table.concat(parts, " | "))
+    if #parts == 0 then
+        setLabel(statusLabels.dailyCaps, "Caps: no priority maps enabled")
+    else
+        setLabel(statusLabels.dailyCaps, "Priority caps: " .. table.concat(parts, " | "))
+    end
 end
 local function buildUI()
     if not Lib then return end
@@ -2283,10 +2375,70 @@ local function buildUI()
 
     -- ----- Daily Traits tab -----
     local Daily = Win:Tab("🌀", "Daily Traits")
-    Daily:Section("Eligible maps (auto-detected)")
+    Daily:Section("All trait maps (auto-detected)")
     for _, m in ipairs(TRAIT_DAILY_MAPS) do
         Daily:Label(("%s %s Act %d  (cap %d)"):format(m.mode, m.world, m.act, m.cap))
     end
+
+    Daily:Section("Priority farm order (top = farmed first)")
+    local priLabels = {}
+    local function refreshPriorityLabels()
+        ensureDailyPriorityConfig()
+        for i, key in ipairs(CONFIG.dailyPriorityOrder) do
+            local m = findTraitMapByKey(key)
+            local lbl = priLabels[key]
+            if m and lbl then
+                local on = CONFIG.dailyPriorityEnabled[key] ~= false
+                pcall(function()
+                    lbl.Set(("#%d  %s %s Act %d  cap %d  %s"):format(
+                        i, m.mode, m.world, m.act, m.cap, on and "ON" or "OFF"))
+                end)
+            end
+        end
+    end
+    ensureDailyPriorityConfig()
+    for _, key in ipairs(CONFIG.dailyPriorityOrder) do
+        local m = findTraitMapByKey(key)
+        if m then
+            priLabels[key] = Daily:Label(("#  %s %s Act %d"):format(m.mode, m.world, m.act))
+            Daily:Toggle(("Farm: %s"):format(m.world),
+                "Include this map in the daily trait rotation",
+                CONFIG.dailyPriorityEnabled[key] ~= false, function(on)
+                    CONFIG.dailyPriorityEnabled[key] = on
+                    saveSettings()
+                    refreshPriorityLabels()
+                    pcall(refreshDailyCapLabels)
+                end)
+            Daily:Button("↑", ("Move %s up"):format(m.world), "Higher priority", nil, function()
+                moveDailyPriorityKey(key, -1)
+                refreshPriorityLabels()
+                pcall(refreshDailyCapLabels)
+            end)
+            Daily:Button("↓", ("Move %s down"):format(m.world), "Lower priority", nil, function()
+                moveDailyPriorityKey(key, 1)
+                refreshPriorityLabels()
+                pcall(refreshDailyCapLabels)
+            end)
+        end
+    end
+    Daily:Button("↺", "Reset priority order", "Restore default farm order", nil, function()
+        CONFIG.dailyPriorityOrder = {}
+        for _, k in ipairs(DEFAULT_DAILY_PRIORITY) do
+            CONFIG.dailyPriorityOrder[#CONFIG.dailyPriorityOrder + 1] = k
+        end
+        for _, m in ipairs(TRAIT_DAILY_MAPS) do
+            local k = mapTraitKey(m)
+            if not table.find(CONFIG.dailyPriorityOrder, k) then
+                CONFIG.dailyPriorityOrder[#CONFIG.dailyPriorityOrder + 1] = k
+            end
+        end
+        saveSettings()
+        refreshPriorityLabels()
+        pcall(refreshDailyCapLabels)
+        notify("Daily Traits", "Priority order reset.", "info")
+    end)
+    task.defer(refreshPriorityLabels)
+
     Daily:Section("Settings")
     Daily:Dropdown("Daily difficulty", "Difficulty for daily-trait maps", { "Normal", "Hard" },
         (CONFIG.dailyDifficulty == "Hard") and 2 or 1, function(opt)
