@@ -38,7 +38,7 @@
       data + world rewards), handle special-quest items, then invoke awaken.
 --------------------------------------------------------------------------]]
 
-local VERSION = "2.3.8"   -- bump this each upload so you can confirm the live build
+local VERSION = "2.3.9"   -- bump this each upload so you can confirm the live build
 local NEXUSLIB_URL = "https://raw.githubusercontent.com/headshot7535-png/Nexuslib/main/Nexuslib"
 
 -- ============================================================
@@ -1668,13 +1668,26 @@ end
 local function readLiveItemCount(itemName, data)
     data = data or getPlayerData()
     if not data then return 0 end
-    if data.stats and data.stats[itemName] ~= nil then
-        return tonumber(data.stats[itemName]) or 0
-    end
     if data.items and data.items[itemName] ~= nil then
         return tonumber(data.items[itemName]) or 0
     end
+    if data.stats and data.stats[itemName] ~= nil then
+        return tonumber(data.stats[itemName]) or 0
+    end
     return 0
+end
+
+local function readMatchItemCount(itemName)
+    local ok, util = pcall(function() return require(LP.PlayerScripts.Client.Utility) end)
+    if not ok or type(util) ~= "table" or type(util.data) ~= "table" then return nil end
+    local data = util.data
+    if type(data.items) == "table" and data.items[itemName] ~= nil then
+        return tonumber(data.items[itemName]) or 0
+    end
+    if type(data.stats) == "table" and data.stats[itemName] ~= nil then
+        return tonumber(data.stats[itemName]) or 0
+    end
+    return nil
 end
 
 local function getCharacterData(unitName)
@@ -1693,6 +1706,21 @@ local function getAwakeningCost(unitName)
         return data.awakening.cost, data.awakening.object
     end
     return nil
+end
+
+local function getAwakenCountUnitName()
+    local af = Session.awakeningFarm
+    if af and type(af.unitName) == "string" and af.unitName ~= "" then
+        return af.unitName
+    end
+    return CONFIG.awakeningUnit
+end
+
+local function isAwakeningCostItem(itemName, unitName)
+    unitName = unitName or getAwakenCountUnitName()
+    if type(unitName) ~= "string" or unitName == "" then return false end
+    local cost = getAwakeningCost(unitName)
+    return type(cost) == "table" and (tonumber(cost[itemName]) or 0) > 0
 end
 
 local function updateAwakenItemCacheFromData(data, unitName)
@@ -1745,26 +1773,37 @@ local function syncReqSnapshotHave(itemName, have)
 end
 
 local function maybeBumpFarmItemLive(itemName)
-    if not inPlayArea() or type(itemName) ~= "string" or itemName == "" then return end
-    local af = Session.awakeningFarm
-    if not af or af.item ~= itemName then return end
-    local live = tonumber(readLiveItemCount(itemName))
+    if not inPlayArea() or not isAwakeningCostItem(itemName) then return end
+    local live = readMatchItemCount(itemName)
+    if live == nil then live = readLiveItemCount(itemName) end
+    live = tonumber(live)
     if not live then return end
     restoreAwakenItemCache()
     local prev = tonumber(AS.awakenItemCache and AS.awakenItemCache[itemName])
-        or tonumber(Session.awakenItemCache and Session.awakenItemCache[itemName]) or 0
-    if live <= prev then return end
-    local need = getFarmItemNeed(itemName)
-    local maxAccept = need and math.min(need, prev + 5) or (prev + 5)
-    if live > maxAccept then return end
-    bumpAwakenItemCache(itemName, live)
-    syncReqSnapshotHave(itemName, live)
+        or tonumber(Session.awakenItemCache and Session.awakenItemCache[itemName])
+    if prev and live < prev then return end
+    if prev and (live - prev) > 25 then return end
+    if not prev or live > prev then
+        bumpAwakenItemCache(itemName, live)
+        syncReqSnapshotHave(itemName, live)
+    end
 end
 
 local function getItemCount(itemName)
     restoreAwakenItemCache()
     if inPlayArea() then
-        maybeBumpFarmItemLive(itemName)
+        if isAwakeningCostItem(itemName) then
+            maybeBumpFarmItemLive(itemName)
+            local live = readMatchItemCount(itemName)
+            if live == nil then live = readLiveItemCount(itemName) end
+            live = tonumber(live)
+            if live ~= nil then
+                local prev = tonumber(AS.awakenItemCache and AS.awakenItemCache[itemName])
+                    or tonumber(Session.awakenItemCache and Session.awakenItemCache[itemName])
+                if prev and live < prev then return prev end
+                return live
+            end
+        end
         if AS.awakenItemCache and AS.awakenItemCache[itemName] ~= nil then
             return AS.awakenItemCache[itemName]
         end
@@ -1996,7 +2035,12 @@ local function getMissingAwakeningReqs(unitName)
         restoreAwakenItemCache()
         local af = Session.awakeningFarm
         if af and af.unitName == unitName then
-            if af.item then maybeBumpFarmItemLive(af.item) end
+            local cost = getAwakeningCost(unitName)
+            if type(cost) == "table" then
+                for item in pairs(cost) do
+                    maybeBumpFarmItemLive(item)
+                end
+            end
             local snapByItem = {}
             if type(af.reqSnapshot) == "table" then
                 for _, m in ipairs(af.reqSnapshot) do snapByItem[m.item] = m end
@@ -2558,8 +2602,18 @@ local function waitForAwakeningRun(target)
     local t2 = tick()
     local idleSince = nil
     while alive() and CONFIG.enabled and not inLobby() and (tick() - t2) < CONFIG.farmTimeout do
+        local unitName = af and af.unitName
+        if unitName and unitName ~= "" then
+            local cost = getAwakeningCost(unitName)
+            if type(cost) == "table" then
+                for item, need in pairs(cost) do
+                    if (tonumber(need) or 0) > 0 then
+                        maybeBumpFarmItemLive(item)
+                    end
+                end
+            end
+        end
         if farmItem then
-            maybeBumpFarmItemLive(farmItem)
             local have = getItemCount(farmItem)
             if farmNeed and have and have >= farmNeed then
                 setStatus(("Enough %s (%d/%d) — leaving stage..."):format(farmItem, have, farmNeed))
