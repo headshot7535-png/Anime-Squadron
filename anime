@@ -38,7 +38,7 @@
       data + world rewards), handle special-quest items, then invoke awaken.
 --------------------------------------------------------------------------]]
 
-local VERSION = "2.3.6"   -- bump this each upload so you can confirm the live build
+local VERSION = "2.3.7"   -- bump this each upload so you can confirm the live build
 local NEXUSLIB_URL = "https://raw.githubusercontent.com/headshot7535-png/Nexuslib/main/Nexuslib"
 
 -- ============================================================
@@ -142,7 +142,7 @@ CONFIG.enabled = false                                 -- set from the saved ses
 -- ============================================================
 local Session = { running = false, dailyFarm = nil, challengeFarm = nil, awakeningFarm = nil }
 -- forward declarations (these are referenced earlier than they are defined)
-local saveSession
+local saveSession, flushSession
 local saveSettings
 local SESSION_FILE
 local setEnabled, mainLoop
@@ -1729,6 +1729,9 @@ local function getItemCount(itemName)
         if AS.awakenItemCache and AS.awakenItemCache[itemName] ~= nil then
             return AS.awakenItemCache[itemName]
         end
+        if Session.awakenItemCache and Session.awakenItemCache[itemName] ~= nil then
+            return tonumber(Session.awakenItemCache[itemName]) or 0
+        end
         return nil
     end
     local live = readLiveItemCount(itemName)
@@ -1930,14 +1933,42 @@ local function findOwnedUnitByName(unitName)
     return nil
 end
 
+local function copyMissingSnapshot(list)
+    if type(list) ~= "table" then return nil end
+    local out = {}
+    for i, m in ipairs(list) do
+        if type(m) == "table" and m.item then
+            out[i] = {
+                item = m.item,
+                need = tonumber(m.need) or 0,
+                have = tonumber(m.have) or 0,
+                deficit = tonumber(m.deficit) or 0,
+            }
+        end
+    end
+    return out
+end
+
 local function getMissingAwakeningReqs(unitName)
     local cost = getAwakeningCost(unitName)
     if type(cost) ~= "table" or next(cost) == nil then return nil end
+
+    if inPlayArea() then
+        restoreAwakenItemCache()
+        local af = Session.awakeningFarm
+        if af and af.unitName == unitName and type(af.reqSnapshot) == "table" then
+            return copyMissingSnapshot(af.reqSnapshot)
+        end
+    end
+
     local missing = {}
     for item, need in pairs(cost) do
         need = tonumber(need) or 0
         if need > 0 then
             local have = getItemCount(item)
+            if have == nil then
+                have = Session.awakenItemCache and tonumber(Session.awakenItemCache[item])
+            end
             if have == nil then return nil end
             if have < need then
                 missing[#missing + 1] = {
@@ -2393,8 +2424,14 @@ local function rememberAwakeningFarm(target, unitName)
     af.runs = af.runs or 0
     af.stall = af.stall or 0
     af.lastCount = getItemCount(af.item or "") or 0
+    af.unitName = unitName
     if unitName and inLobby() then
         updateAwakenItemCacheFromData(getPlayerData(), unitName)
+        local snap = getMissingAwakeningReqs(unitName)
+        if type(snap) == "table" then
+            af.reqSnapshot = copyMissingSnapshot(snap)
+        end
+        if flushSession then pcall(flushSession) end
     end
     saveSession()
 end
@@ -2542,10 +2579,16 @@ local function awakeningStep()
     rememberAwakeningFarm(target, unit.name)
     local af = Session.awakeningFarm
     af.runs = (af.runs or 0) + 1
+    local snap = getMissingAwakeningReqs(unit.name)
+    if type(snap) == "table" then
+        af.reqSnapshot = copyMissingSnapshot(snap)
+        af.unitName = unit.name
+    end
+    if flushSession then pcall(flushSession) end
 
     local soloNote = (target.solo and CONFIG.soloOnly) and " solo" or ""
     local needAmt = before
-    for _, m in ipairs(getMissingAwakeningReqs(unit.name)) do
+    for _, m in ipairs(snap or {}) do
         if m.item == itemName then needAmt = m.need break end
     end
     setStatus(("Awakening: need %s (%d/%d) — %s %s Act %d%s run #%d"):format(
@@ -2571,6 +2614,11 @@ local function awakeningStep()
     if inLobby() then
         refreshPlayerData()
         updateAwakenItemCacheFromData(getPlayerData(), unit.name)
+        local snap = getMissingAwakeningReqs(unit.name)
+        if type(snap) == "table" then
+            af.reqSnapshot = copyMissingSnapshot(snap)
+            af.unitName = unit.name
+        end
     end
     if target.quest then claimReadySpecialTasks(target.quest) end
 
@@ -2898,6 +2946,11 @@ ensureDailyPriorityConfig()
 
 -- ----- session memory (survives teleports) -----
 local _sessionSaveQueued = false
+flushSession = function()
+    if not canFile() then return end
+    _sessionSaveQueued = false
+    pcall(function() writefile(SESSION_FILE, HttpService:JSONEncode(Session)) end)
+end
 saveSession = function()
     if not canFile() then return end
     if _sessionSaveQueued then return end
@@ -3372,6 +3425,12 @@ local function refreshAwakeningLabels()
     end
     setLabel(statusLabels.awakenUnit, "Unit: " .. unit.name .. " (id " .. tostring(unit.id) .. ")")
     local missing = getMissingAwakeningReqs(unit.name)
+    if missing == nil then
+        local af = Session.awakeningFarm
+        if inPlayArea() and af and af.unitName == unit.name and type(af.reqSnapshot) == "table" then
+            missing = af.reqSnapshot
+        end
+    end
     if missing == nil then
         setLabel(statusLabels.awakenReqs, "Requirements: unknown — refresh in lobby")
     elseif #missing == 0 then
