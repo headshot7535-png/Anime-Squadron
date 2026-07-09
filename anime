@@ -38,7 +38,7 @@
       data + world rewards), handle special-quest items, then invoke awaken.
 --------------------------------------------------------------------------]]
 
-local VERSION = "2.2.4"   -- bump this each upload so you can confirm the live build
+local VERSION = "2.2.6"   -- bump this each upload so you can confirm the live build
 local NEXUSLIB_URL = "https://raw.githubusercontent.com/headshot7535-png/Nexuslib/main/Nexuslib"
 
 -- ============================================================
@@ -46,14 +46,16 @@ local NEXUSLIB_URL = "https://raw.githubusercontent.com/headshot7535-png/Nexusli
 -- so a rejected duplicate boot does not kill the live instance's status thread.
 -- ============================================================
 local BOOT_LOCK_FILE = "AnimeSquadron_boot_lock.json"
-local function canFileEarly()
+local SETTINGS_FILE = "AnimeSquadron_settings.json"
+local LEGACY_SETTINGS_FILE = "AutoBounty_settings.json"
+local function canFile()
     return (writefile and readfile and isfile) and true or false
 end
 local function claimScriptBoot()
     local now = tick()
     if _G.AS_BootAt and (now - _G.AS_BootAt) < 4 then return false end
     _G.AS_BootAt = now
-    if not canFileEarly() then return true end
+    if not canFile() then return true end
     local job = game.JobId
     if isfile(BOOT_LOCK_FILE) then
         local ok, raw = pcall(readfile, BOOT_LOCK_FILE)
@@ -144,6 +146,27 @@ local SESSION_FILE
 local setEnabled, mainLoop
 local armReexec
 local persistMasterToggleImmediate
+
+SESSION_FILE = "AnimeSquadron_session.json"
+local LEGACY_SESSION_FILE = "AutoBounty_session.json"
+
+persistMasterToggleImmediate = function()
+    if not canFile() then return end
+    local data = {}
+    local path = SETTINGS_FILE
+    if not isfile(path) and isfile(LEGACY_SETTINGS_FILE) then
+        path = LEGACY_SETTINGS_FILE
+    end
+    if isfile(path) then
+        local ok, raw = pcall(readfile, path)
+        if ok and raw then
+            local ok2, d = pcall(function() return HttpService:JSONDecode(raw) end)
+            if ok2 and type(d) == "table" then data = d end
+        end
+    end
+    data.enabled = CONFIG.enabled == true
+    pcall(function() writefile(SETTINGS_FILE, HttpService:JSONEncode(data)) end)
+end
 
 -- ============================================================
 -- Cleanup system
@@ -2278,7 +2301,7 @@ end
 
 local _looping = false
 local _inSetEnabled = false
-function mainLoop()
+mainLoop = function()
     if _looping then return end
     _looping = true
     setStatus("Anime Squadron started.")
@@ -2321,7 +2344,7 @@ function mainLoop()
     setStatus("Stopped.")
 end
 
-function setEnabled(on)
+setEnabled = function(on)
     on = on and true or false
     if _inSetEnabled then return end
     if CONFIG.enabled == on then
@@ -2345,29 +2368,6 @@ end
 -- ============================================================
 -- Settings persistence (JSON, debounced)
 -- ============================================================
-local SETTINGS_FILE = "AnimeSquadron_settings.json"
-local LEGACY_SETTINGS_FILE = "AutoBounty_settings.json"
-local function canFile()
-    return (writefile and readfile and isfile) and true or false
-end
-persistMasterToggleImmediate = function()
-    if not canFile() then return end
-    local data = {}
-    local path = SETTINGS_FILE
-    if not isfile(path) and isfile(LEGACY_SETTINGS_FILE) then
-        path = LEGACY_SETTINGS_FILE
-    end
-    if isfile(path) then
-        local ok, raw = pcall(readfile, path)
-        if ok and raw then
-            local ok2, d = pcall(function() return HttpService:JSONDecode(raw) end)
-            if ok2 and type(d) == "table" then data = d end
-        end
-    end
-    data.enabled = CONFIG.enabled == true
-    pcall(function() writefile(SETTINGS_FILE, HttpService:JSONEncode(data)) end)
-end
-
 local _saveQueued = false
 local function saveSettings()
     if not canFile() then return end
@@ -2450,8 +2450,6 @@ loadSettings()
 ensureDailyPriorityConfig()
 
 -- ----- session memory (survives teleports) -----
-SESSION_FILE = "AnimeSquadron_session.json"
-local LEGACY_SESSION_FILE = "AutoBounty_session.json"
 local _sessionSaveQueued = false
 saveSession = function()
     if not canFile() then return end
@@ -2940,7 +2938,22 @@ local function refreshAwakeningLabels()
     end
 end
 
-local awakenUnitDropdown = nil
+local awakenUnitInput = nil
+local function cycleAwakenUnit(dir)
+    local units = getOwnedAwakenableUnits()
+    if #units == 0 then return end
+    local names = {}
+    for _, u in ipairs(units) do names[#names + 1] = u.name end
+    local cur = table.find(names, CONFIG.awakeningUnit) or 1
+    cur = cur + (dir or 1)
+    if cur < 1 then cur = #names end
+    if cur > #names then cur = 1 end
+    CONFIG.awakeningUnit = names[cur]
+    saveSettings()
+    if awakenUnitInput then pcall(function() awakenUnitInput.Set(CONFIG.awakeningUnit) end) end
+    pcall(refreshAwakeningLabels)
+end
+
 local function refreshAwakenUnitDropdown()
     refreshPlayerData()
     local units = getOwnedAwakenableUnits()
@@ -2948,20 +2961,16 @@ local function refreshAwakenUnitDropdown()
     for _, u in ipairs(units) do names[#names + 1] = u.name end
 
     if #names == 0 then
-        names[1] = "(no awakenable units)"
-    elseif CONFIG.awakeningUnit == "" or not table.find(names, CONFIG.awakeningUnit) then
-        CONFIG.awakeningUnit = names[1]
-        saveSettings()
-    end
-
-    if awakenUnitDropdown then
-        pcall(function()
-            if awakenUnitDropdown.Refresh then
-                local pick = CONFIG.awakeningUnit
-                if pick == "(no awakenable units)" then pick = nil end
-                awakenUnitDropdown:Refresh(names, pick)
-            end
-        end)
+        setLabel(statusLabels.awakenList, "Available: none (open Characters menu, then Refresh)")
+    else
+        if CONFIG.awakeningUnit == "" or not table.find(names, CONFIG.awakeningUnit) then
+            CONFIG.awakeningUnit = names[1]
+            saveSettings()
+        end
+        setLabel(statusLabels.awakenList, "Available: " .. table.concat(names, ", "))
+        if awakenUnitInput then
+            pcall(function() awakenUnitInput.Set(CONFIG.awakeningUnit) end)
+        end
     end
     pcall(refreshAwakeningLabels)
     return #units
@@ -3046,20 +3055,21 @@ local function buildUI()
         end)
     Aw:Label("Priority: challenges → awakening → daily traits.")
 
-    local unitNames = {}
-    local units = getOwnedAwakenableUnits()
-    for _, u in ipairs(units) do unitNames[#unitNames + 1] = u.name end
-    if #unitNames == 0 then unitNames[1] = "(no awakenable units)" end
-    local unitIdx = 1
-    for i, n in ipairs(unitNames) do
-        if n == CONFIG.awakeningUnit then unitIdx = i break end
-    end
-    awakenUnitDropdown = Aw:Dropdown("Target unit", "Owned base-form units that can awaken", unitNames, unitIdx, function(opt)
-        if opt and opt ~= "(no awakenable units)" then
-            CONFIG.awakeningUnit = opt
+    local startUnit = CONFIG.awakeningUnit
+    if startUnit == "" then startUnit = "Beby" end
+    awakenUnitInput = Aw:Input("Target unit", "Unit to awaken — use ◀ ▶ to cycle", startUnit, startUnit, function(txt)
+        if type(txt) == "string" and txt ~= "" then
+            CONFIG.awakeningUnit = txt
             saveSettings()
             pcall(refreshAwakeningLabels)
         end
+    end)
+
+    Aw:Button("◀", "Previous unit", "Select previous awakenable unit", nil, function()
+        cycleAwakenUnit(-1)
+    end)
+    Aw:Button("▶", "Next unit", "Select next awakenable unit", nil, function()
+        cycleAwakenUnit(1)
     end)
 
     Aw:Dropdown("Farm difficulty", "Difficulty for awakening farm maps", { "Normal", "Hard" },
@@ -3074,6 +3084,7 @@ local function buildUI()
     end)
 
     Aw:Section("Live status")
+    statusLabels.awakenList  = Aw:Label("Available: scanning...")
     statusLabels.awakenCount = Aw:Label("Awakenable units found: -")
     statusLabels.awakenUnit = Aw:Label("Unit: -")
     statusLabels.awakenReqs = Aw:Label("Requirements: -")
