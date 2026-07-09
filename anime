@@ -38,7 +38,7 @@
       data + world rewards), handle special-quest items, then invoke awaken.
 --------------------------------------------------------------------------]]
 
-local VERSION = "2.2.6"   -- bump this each upload so you can confirm the live build
+local VERSION = "2.2.9"   -- bump this each upload so you can confirm the live build
 local NEXUSLIB_URL = "https://raw.githubusercontent.com/headshot7535-png/Nexuslib/main/Nexuslib"
 
 -- ============================================================
@@ -126,6 +126,8 @@ local CONFIG = {
     autoRegularChallenge = (g.AnimeSquadronRegularChallenge ~= false) and (g.AutoBountyRegularChallenge ~= false),
     challengeDone        = type(g.AnimeSquadronChallengeDone) == "table" and g.AnimeSquadronChallengeDone
         or (type(g.AutoBountyChallengeDone) == "table" and g.AutoBountyChallengeDone or {}),
+    challengeDoneMeta    = type(g.AnimeSquadronChallengeDoneMeta) == "table" and g.AnimeSquadronChallengeDoneMeta
+        or (type(g.AutoBountyChallengeDoneMeta) == "table" and g.AutoBountyChallengeDoneMeta or {}),
     autoAwakening        = g.AnimeSquadronAutoAwakening == true,
     awakeningUnit      = type(g.AnimeSquadronAwakeningUnit) == "string" and g.AnimeSquadronAwakeningUnit or "",
     awakeningDifficulty = g.AnimeSquadronAwakeningDifficulty or g.AutoBountyAwakeningDifficulty or "Normal",
@@ -252,10 +254,78 @@ local function inBattle()
     return false
 end
 
--- We're "in the lobby" when Menus exist and we're not mid-fight
+local function cameraInPlayArea()
+    local cam = workspace.CurrentCamera
+    if not cam or cam.CameraType ~= Enum.CameraType.Scriptable then return false end
+    local pa = workspace:FindFirstChild("play_area")
+    return pa ~= nil and pa:FindFirstChild("camera") ~= nil
+end
+
+local function hotbarInLobbyPos()
+    local menus = getMenus()
+    if not menus or not menus.Parent then return false end
+    local hotbar = menus.Parent:FindFirstChild("Hotbar")
+    local bottom = hotbar and hotbar:FindFirstChild("BottomUI")
+    if bottom and bottom:IsA("GuiObject") then
+        return bottom.Position.Y.Scale < 1.05
+    end
+    return true
+end
+
+local function playAreaHasUnits()
+    local pa = workspace:FindFirstChild("play_area")
+    local models = pa and pa:FindFirstChild("models")
+    if not models then return false end
+    for _, c in ipairs(models:GetChildren()) do
+        if c:IsA("Model") then return true end
+    end
+    return false
+end
+
+local function isRewardScreenVisible()
+    local menus = getMenus()
+    local root = menus and menus.Parent
+    if not root then return false end
+    local priority = root:FindFirstChild("Priority")
+    local rs = priority and priority:FindFirstChild("RewardScreen")
+    return rs and rs:IsA("GuiObject") and rs.Visible or false
+end
+
+local function isLoadingScreenVisible()
+    local menus = getMenus()
+    local root = menus and menus.Parent
+    if not root then return false end
+    local loading = root:FindFirstChild("Loading")
+    local ls = loading and loading:FindFirstChild("Loading_Screen")
+    return ls and ls:IsA("GuiObject") and ls.Visible or false
+end
+
+local function isStageMenuVisible()
+    local menus = getMenus()
+    if not menus then return false end
+    for _, name in ipairs({ "Play_Start", "StageInfo" }) do
+        local f = menus:FindFirstChild(name)
+        if f and f:IsA("GuiObject") and f.Visible then return true end
+    end
+    return false
+end
+
+-- Still inside the play-area / stage flow (not the real hub lobby)
+local function inPlayArea()
+    if inBattle() then return true end
+    if playAreaHasUnits() then return true end
+    if cameraInPlayArea() then return true end
+    if isStageMenuVisible() then return true end
+    if isLoadingScreenVisible() then return true end
+    if isRewardScreenVisible() then return true end
+    if not hotbarInLobbyPos() then return true end
+    return false
+end
+
+-- Real hub lobby — safe to start the next map/challenge
 local function inLobby()
-    if inBattle() then return false end
-    return getMenus() ~= nil
+    if not getMenus() then return false end
+    return not inPlayArea()
 end
 
 -- UI handle (set later) + status helpers — must be before leaveStage / daily helpers
@@ -412,12 +482,7 @@ end
 
 local function clientForceLeave()
     pcall(function()
-        local gui = require(LP.PlayerScripts.Client.Gui)
         local play = require(LP.PlayerScripts.Client.Play)
-        if gui and type(gui.transition) == "function" then
-            task.spawn(gui.transition)
-        end
-        task.wait(0.45)
         if play and type(play.leave) == "function" then
             play.leave(nil, true)
         end
@@ -433,23 +498,28 @@ local function clickBackToLobby()
     if not btn then return false end
     if not invokeGui(btn) then return false end
     task.wait(1.2)
-    return not inBattle()
+    return inLobby()
 end
 
 local _lastLeaveAt = 0
 local function leaveStage(force)
     local now = tick()
-    if not force and now - _lastLeaveAt < 0.8 then return false end
+    if not force and now - _lastLeaveAt < 0.8 then return inLobby() end
     _lastLeaveAt = now
+
+    if inLobby() then return true end
 
     if armReexec then pcall(armReexec) end
 
-    setStatus("Leaving stage (Settings Teleport + client leave)...")
+    setStatus("Leaving stage (Play.leave + remotes)...")
 
-    local clicked = clickBackToLobby()
     clientForceLeave()
+    task.wait(0.8)
+    if inLobby() then return true end
 
-    if clicked or (not inBattle()) then return true end
+    clickBackToLobby()
+    task.wait(0.8)
+    if inLobby() then return true end
 
     fireR("Play", "leave")
     fireR("Matchmaking", "leave")
@@ -463,7 +533,8 @@ local function leaveStage(force)
         if leaveBtn and leaveBtn.Visible then invokeGui(leaveBtn) end
     end)
 
-    return true
+    task.wait(0.6)
+    return inLobby()
 end
 
 -- ============================================================
@@ -1051,12 +1122,12 @@ end
 
 local function waitForLobbyReturn(timeout)
     local t0 = tick()
-    while alive() and (not inLobby() or inBattle()) and (tick() - t0) < (timeout or 60) do
-        leaveStage()
+    while alive() and not inLobby() and (tick() - t0) < (timeout or 60) do
+        leaveStage(true)
         task.wait(2)
     end
     if inLobby() then
-        task.wait(2)
+        task.wait(1)
         setStatus("Returned to lobby.")
         return true
     end
@@ -1118,6 +1189,35 @@ local function fmtChallengeTimer(sec)
     return string.format("%02d:%02d", m, s)
 end
 
+-- Countdown timers jump back up after a reset; only then should "done" clear.
+local function challengeTimerReset(key)
+    if type(CONFIG.challengeDoneMeta) ~= "table" then
+        local ts = type(CONFIG.challengeDone) == "table" and tonumber(CONFIG.challengeDone[key])
+        if not ts then return false end
+        if key == "1d" then return os.time() - ts > 90000 end
+        return os.time() - ts > 2400
+    end
+    local meta = CONFIG.challengeDoneMeta[key]
+    if type(meta) ~= "table" then
+        local ts = type(CONFIG.challengeDone) == "table" and tonumber(CONFIG.challengeDone[key])
+        if not ts then return false end
+        if key == "1d" then return os.time() - ts > 90000 end
+        return os.time() - ts > 2400
+    end
+    local dayT, halfT = getChallengeTimers()
+    if key == "1d" then
+        local saved = tonumber(meta.dayTimer)
+        if not saved then return false end
+        return dayT > saved + 30
+    end
+    if key == "30m" then
+        local saved = tonumber(meta.halfTimer)
+        if not saved then return false end
+        return halfT > saved + 10
+    end
+    return false
+end
+
 local function getRotatingChallenges()
     local ok, data = invokeR("Play", "get_challenges")
     if ok and type(data) == "table" then
@@ -1129,17 +1229,34 @@ end
 
 local function syncChallengeDoneFlags(chs)
     if type(CONFIG.challengeDone) ~= "table" then CONFIG.challengeDone = {} end
+    if type(CONFIG.challengeDoneMeta) ~= "table" then CONFIG.challengeDoneMeta = {} end
     AS.challengeDoneSession = AS.challengeDoneSession or {}
-    AS._challengeAvail = AS._challengeAvail or {}
+
     for _, key in ipairs(CHALLENGE_ORDER) do
-        local nowAvail = chs[key] ~= nil
-        -- Only clear "done" when a challenge reappears after being unavailable (new reset)
-        if nowAvail and AS._challengeAvail[key] == false then
+        if CONFIG.challengeDone[key] and challengeTimerReset(key) then
             CONFIG.challengeDone[key] = nil
+            CONFIG.challengeDoneMeta[key] = nil
             AS.challengeDoneSession[key] = nil
+            if AS.challengeProbeCache then
+                for ck in pairs(AS.challengeProbeCache) do
+                    if ck:sub(1, #key + 1) == (key .. "|") then
+                        AS.challengeProbeCache[ck] = nil
+                    end
+                end
+            end
+        elseif CONFIG.challengeDone[key] then
+            AS.challengeDoneSession[key] = true
         end
-        AS._challengeAvail[key] = nowAvail
     end
+end
+
+local function isChallengeMarkedDone(key)
+    if AS.challengeDoneSession and AS.challengeDoneSession[key] then return true end
+    if type(CONFIG.challengeDone) ~= "table" or not CONFIG.challengeDone[key] then return false end
+    if challengeTimerReset(key) then return false end
+    AS.challengeDoneSession = AS.challengeDoneSession or {}
+    AS.challengeDoneSession[key] = true
+    return true
 end
 
 local function isChallengeEnabled(key)
@@ -1239,6 +1356,7 @@ local function leaveChallengeRoomQuiet()
 end
 
 local function probeChallengeBlocked(key, ch)
+    if isChallengeMarkedDone(key) then return true end
     if type(ch) ~= "table" or not ch.world or not ch.act then return false end
     AS.challengeProbeCache = AS.challengeProbeCache or {}
     local cacheKey = ("%s|%s|%s"):format(key, ch.world, ch.act)
@@ -1271,7 +1389,7 @@ local function probeChallengeBlocked(key, ch)
 end
 
 local function isChallengeAlreadyCompleted(key, ch)
-    if AS.challengeDoneSession and AS.challengeDoneSession[key] then return true, "session" end
+    if isChallengeMarkedDone(key) then return true, "saved" end
     refreshPlayerData()
     if areChallengeRewardsCapped(ch) then return true, "caps" end
     if scanChallengeGuiCompleted(key) then return true, "gui" end
@@ -1282,7 +1400,7 @@ end
 local function shouldRunChallenge(key, ch)
     if not isChallengeEnabled(key) then return false end
     if type(ch) ~= "table" or not ch.world or not ch.act then return false end
-    if AS.challengeDoneSession and AS.challengeDoneSession[key] then return false end
+    if isChallengeMarkedDone(key) then return false end
     return true
 end
 
@@ -1325,7 +1443,14 @@ local function markChallengeDone(key)
     AS.challengeDoneSession = AS.challengeDoneSession or {}
     AS.challengeDoneSession[key] = true
     if type(CONFIG.challengeDone) ~= "table" then CONFIG.challengeDone = {} end
+    if type(CONFIG.challengeDoneMeta) ~= "table" then CONFIG.challengeDoneMeta = {} end
     CONFIG.challengeDone[key] = os.time()
+    local dayT, halfT = getChallengeTimers()
+    CONFIG.challengeDoneMeta[key] = {
+        dayTimer  = dayT,
+        halfTimer = halfT,
+        ts        = os.time(),
+    }
     if AS.challengeProbeCache then
         for ck in pairs(AS.challengeProbeCache) do
             if ck:sub(1, #key + 1) == (key .. "|") then
@@ -1333,7 +1458,23 @@ local function markChallengeDone(key)
             end
         end
     end
-    saveSettings()
+    pcall(saveSettings)
+    if canFile() then
+        pcall(function()
+            local data = {}
+            local path = SETTINGS_FILE
+            if isfile(path) then
+                local ok, raw = pcall(readfile, path)
+                if ok and raw then
+                    local ok2, d = pcall(function() return HttpService:JSONDecode(raw) end)
+                    if ok2 and type(d) == "table" then data = d end
+                end
+            end
+            data.challengeDone = CONFIG.challengeDone
+            data.challengeDoneMeta = CONFIG.challengeDoneMeta
+            writefile(SETTINGS_FILE, HttpService:JSONEncode(data))
+        end)
+    end
     saveSession()
 end
 
@@ -1357,23 +1498,21 @@ local function waitForChallengeRun(key, ch)
     setStatus(("%s - fighting %s Act %d..."):format(label, ch.world, ch.act))
     local t2 = tick()
     local idleSince = nil
-    while alive() and CONFIG.enabled and (tick() - t2) < CONFIG.farmTimeout do
-        if inLobby() and not inBattle() then break end
-        if not inBattle() then
-            idleSince = idleSince or tick()
-            if tick() - idleSince >= 3 then
-                setStatus(label .. " - challenge done, leaving stage...")
-                leaveStage(true)
-                waitForLobbyReturn(45)
-                return true
-            end
-        else
+    while alive() and CONFIG.enabled and not inLobby() and (tick() - t2) < CONFIG.farmTimeout do
+        if inBattle() then
             idleSince = nil
+        elseif isRewardScreenVisible() then
+            break
+        else
+            idleSince = idleSince or tick()
+            if tick() - idleSince >= 2 then
+                break
+            end
         end
-        task.wait(1)
+        task.wait(0.5)
     end
 
-    if inLobby() and not inBattle() then return true end
+    setStatus(label .. " - challenge done, leaving stage...")
     leaveStage(true)
     waitForLobbyReturn(45)
     return true
@@ -1385,15 +1524,15 @@ local function challengeStep()
     if not inLobby() then
         local cf = Session.challengeFarm
         if cf then
+            if not inBattle() and (isRewardScreenVisible() or (AS._challengeIdleAt and tick() - AS._challengeIdleAt >= 2)) then
+                setStatus("Challenge complete — leaving stage...")
+                leaveStage(true)
+                waitForLobbyReturn(45)
+                AS._challengeIdleAt = nil
+                return
+            end
             if not inBattle() then
                 AS._challengeIdleAt = AS._challengeIdleAt or tick()
-                if tick() - AS._challengeIdleAt >= 3 then
-                    setStatus("Challenge complete — leaving stage...")
-                    leaveStage(true)
-                    waitForLobbyReturn(45)
-                    AS._challengeIdleAt = nil
-                    return
-                end
             else
                 AS._challengeIdleAt = nil
             end
@@ -1403,12 +1542,14 @@ local function challengeStep()
         else
             if not inBattle() then
                 AS._challengeIdleAt = AS._challengeIdleAt or tick()
-                if tick() - AS._challengeIdleAt >= 4 then
+                if tick() - AS._challengeIdleAt >= 3 then
                     setStatus("Challenge - leaving finished stage...")
                     leaveStage(true)
                     waitForLobbyReturn(45)
                     AS._challengeIdleAt = nil
                 end
+            else
+                AS._challengeIdleAt = nil
             end
             setStatus("Challenge - in stage, waiting to return...")
         end
@@ -1427,7 +1568,7 @@ local function challengeStep()
 
         local already, reason = isChallengeAlreadyCompleted(key, ch)
         if already then
-            if not (AS.challengeDoneSession and AS.challengeDoneSession[key]) then
+            if not isChallengeMarkedDone(key) then
                 markChallengeDone(key)
                 notify("Challenges", (CHALLENGE_NAMES[key] or key) .. " already completed — skipping.", "info")
             end
@@ -1448,10 +1589,12 @@ local function challengeStep()
                     return
                 end
             else
-                waitForChallengeRun(key, ch)
+                local cleared = waitForChallengeRun(key, ch)
                 forgetChallenge()
-                markChallengeDone(key)
-                notify("Challenges", label .. " cleared — " .. ch.world, "success")
+                if cleared then
+                    markChallengeDone(key)
+                    notify("Challenges", label .. " cleared — " .. ch.world, "success")
+                end
                 return
             end
         end
@@ -1665,8 +1808,8 @@ local function parseItemDescriptionLocation(itemName)
     local desc = stripHtml(tostring(data.description or ""))
     local loc = desc:match("Obtainable in%s*→%s*(.+)$")
         or desc:match("Obtainable in%s+(.+)$")
+    loc = loc and loc:gsub("%.$", ""):gsub("%s+", " ") or nil
     if not loc or loc == "" then return nil end
-    loc = loc:gsub("%.$", "")
 
     if loc:find("Special Quest", 1, true) then
         local quest = loc:match("Special Quest%s+(.+)")
@@ -1680,11 +1823,31 @@ local function parseItemDescriptionLocation(itemName)
         return parsed
     end
 
-    local world, mode, act1, act2, difficulty = loc:match("^(.-) Story Act (%d+)%s*,%s*(%d+)")
+    local world, act1, act2 = loc:match("^(.-) Story Act (%d+)%s*,%s*(%d+)")
     if world then
         local parsed = {
-            type = "map", world = world, mode = "Story",
+            type = "map", world = world:match("^%s*(.-)%s*$"), mode = "Story",
             acts = { tonumber(act1), tonumber(act2) }, difficulty = "Normal",
+        }
+        ITEM_LOC_CACHE[itemName] = parsed
+        return parsed
+    end
+
+    world, act1 = loc:match("^(.-) Story Act (%d+)")
+    if world then
+        local parsed = {
+            type = "map", world = world:match("^%s*(.-)%s*$"), mode = "Story",
+            acts = { tonumber(act1) }, difficulty = "Normal",
+        }
+        ITEM_LOC_CACHE[itemName] = parsed
+        return parsed
+    end
+
+    world, act1 = loc:match("^(.-) Act (%d+)%s+Squadron")
+    if world then
+        local parsed = {
+            type = "map", world = world:match("^%s*(.-)%s*$"), mode = "Squadron",
+            acts = { tonumber(act1) }, difficulty = "Normal",
         }
         ITEM_LOC_CACHE[itemName] = parsed
         return parsed
@@ -1710,11 +1873,11 @@ local function parseItemDescriptionLocation(itemName)
         return parsed
     end
 
-    world, act1, difficulty = loc:match("^(.-) Squadron Act (%d+)%s+(Hard)")
+    world, act1, difficulty = loc:match("^(.-) Squadron Act (%d+)%s*(Hard)")
     if world then
         local parsed = {
-            type = "map", world = world, mode = "Squadron",
-            acts = { tonumber(act1) }, difficulty = difficulty,
+            type = "map", world = world:match("^%s*(.-)%s*$"), mode = "Squadron",
+            acts = { tonumber(act1) }, difficulty = "Hard",
         }
         ITEM_LOC_CACHE[itemName] = parsed
         return parsed
@@ -1723,7 +1886,7 @@ local function parseItemDescriptionLocation(itemName)
     world, act1 = loc:match("^(.-) Act (%d+) Raid")
     if world then
         local parsed = {
-            type = "map", world = world, mode = "Raid",
+            type = "map", world = world:match("^%s*(.-)%s*$"), mode = "Raid",
             acts = { tonumber(act1) }, difficulty = "Normal",
         }
         ITEM_LOC_CACHE[itemName] = parsed
@@ -1937,56 +2100,85 @@ local function pickNextAwakeningFarmTarget(unitName, focusItem)
     local missing = getMissingAwakeningReqs(unitName)
     if #missing == 0 then return nil, "ready" end
 
-    local itemEntry = missing[1]
+    local tryOrder = {}
     if focusItem then
         for _, m in ipairs(missing) do
-            if m.item == focusItem then itemEntry = m break end
+            if m.item == focusItem then tryOrder[#tryOrder + 1] = m end
         end
     end
-
-    local itemName = itemEntry.item
-    local targets = buildFarmTargetsForItem(itemName)
-    if type(targets) == "table" and targets.special then
-        local sq = pickSpecialQuestFarmTarget(targets.special, itemName)
-        if sq then return sq, itemName end
-        return {
-            type = "special_wait",
-            quest = targets.special,
-            item = itemName,
-        }, itemName
-    end
-    if type(targets) == "table" and targets.crafting then
-        return { type = "crafting", item = itemName }, itemName
+    for _, m in ipairs(missing) do
+        if m.item ~= focusItem then tryOrder[#tryOrder + 1] = m end
     end
 
-    local af = Session.awakeningFarm
-    local startIdx = 1
-    if af and af.item == itemName and af.targetIdx then
-        startIdx = af.targetIdx
-    end
-
-    if type(targets) == "table" and #targets > 0 then
-        for i = 0, #targets - 1 do
-            local idx = ((startIdx - 1 + i) % #targets) + 1
-            local t = targets[idx]
-            return {
-                world = t.world,
-                mode = t.mode,
-                act = t.act,
-                difficulty = t.difficulty or CONFIG.awakeningDifficulty,
+    local lastUnknown, lastCrafting, lastSpecial
+    for _, itemEntry in ipairs(tryOrder) do
+        local itemName = itemEntry.item
+        local targets = buildFarmTargetsForItem(itemName)
+        if type(targets) == "table" and targets.special then
+            local sq = pickSpecialQuestFarmTarget(targets.special, itemName)
+            if sq then return sq, itemName end
+            lastSpecial = {
+                type = "special_wait",
+                quest = targets.special,
                 item = itemName,
-                targetIdx = idx,
-                targetCount = #targets,
-            }, itemName
+            }
+        elseif type(targets) == "table" and targets.crafting then
+            lastCrafting = { type = "crafting", item = itemName }
+        elseif type(targets) == "table" and #targets > 0 then
+            local af = Session.awakeningFarm
+            local startIdx = 1
+            if af and af.item == itemName and af.targetIdx then
+                startIdx = af.targetIdx
+            end
+            for i = 0, #targets - 1 do
+                local idx = ((startIdx - 1 + i) % #targets) + 1
+                local t = targets[idx]
+                return {
+                    world = t.world,
+                    mode = t.mode,
+                    act = t.act,
+                    difficulty = t.difficulty or CONFIG.awakeningDifficulty,
+                    item = itemName,
+                    targetIdx = idx,
+                    targetCount = #targets,
+                }, itemName
+            end
+        else
+            lastUnknown = { type = "unknown", item = itemName }
         end
     end
 
-    return { type = "unknown", item = itemName }, itemName
+    if lastSpecial then return lastSpecial, lastSpecial.item end
+    if lastCrafting then return lastCrafting, lastCrafting.item end
+    if lastUnknown then return lastUnknown, lastUnknown.item end
+    return nil, "ready"
 end
 
 local function awakeningHasWork()
     if not CONFIG.autoAwakening then return false end
-    return findOwnedUnitByName(CONFIG.awakeningUnit) ~= nil
+    local unit = findOwnedUnitByName(CONFIG.awakeningUnit)
+    if not unit then return false end
+    if Session.awakeningFarm then return true end
+    return #getMissingAwakeningReqs(unit.name) > 0
+end
+
+local function getAwakeningFarmPreview(unitName)
+    local target = pickNextAwakeningFarmTarget(unitName, Session.awakeningFarm and Session.awakeningFarm.item)
+    if not target then return "ready to awaken" end
+    if target.type == "crafting" then
+        return "need " .. target.item .. " (Crafting — manual)"
+    end
+    if target.type == "unknown" then
+        return "no route for " .. target.item
+    end
+    if target.type == "special_wait" then
+        return "special quest: " .. tostring(target.quest)
+    end
+    if target.world and target.mode then
+        return ("next: %s %s Act %d for %s"):format(
+            target.mode, target.world, target.act or 0, target.item or "?")
+    end
+    return "planning route..."
 end
 
 local function awakeningTakesPriority()
@@ -2058,12 +2250,23 @@ local function waitForAwakeningRun(target)
         label, target.mode or "?", target.world or "?", target.act or 0, target.item or "?"))
 
     local t2 = tick()
-    while alive() and CONFIG.enabled and (not inLobby() or inBattle()) and (tick() - t2) < CONFIG.farmTimeout do
-        task.wait(1)
+    local idleSince = nil
+    while alive() and CONFIG.enabled and not inLobby() and (tick() - t2) < CONFIG.farmTimeout do
+        if inBattle() then
+            idleSince = nil
+        elseif isRewardScreenVisible() then
+            break
+        else
+            idleSince = idleSince or tick()
+            if tick() - idleSince >= 2 then
+                break
+            end
+        end
+        task.wait(0.5)
     end
 
-    if inLobby() and not inBattle() then return true end
-    waitForLobbyReturn(30)
+    leaveStage(true)
+    waitForLobbyReturn(45)
     return true
 end
 
@@ -2313,12 +2516,19 @@ mainLoop = function()
             end
         end
 
-        if CONFIG.autoAwakening and not challengesTakePriority() then
-            local okA, resA = pcall(awakeningStep)
-            if not okA then
-                setStatus("Awakening error: " .. tostring(resA))
-            elseif resA == "done" then
-                setStatus("Awakening complete.")
+        if CONFIG.autoAwakening then
+            if challengesTakePriority() then
+                local pending = countPendingChallenges()
+                if pending > 0 then
+                    setStatus(("Challenges first (%d pending) — awakening queued"):format(pending))
+                end
+            else
+                local okA, resA = pcall(awakeningStep)
+                if not okA then
+                    setStatus("Awakening error: " .. tostring(resA))
+                elseif resA == "done" then
+                    setStatus("Awakening complete.")
+                end
             end
         end
 
@@ -2392,6 +2602,7 @@ local function saveSettings()
             autoDailyChallenge   = CONFIG.autoDailyChallenge,
             autoRegularChallenge = CONFIG.autoRegularChallenge,
             challengeDone        = CONFIG.challengeDone,
+            challengeDoneMeta    = CONFIG.challengeDoneMeta,
             autoAwakening        = CONFIG.autoAwakening,
             awakeningUnit        = CONFIG.awakeningUnit,
             awakeningDifficulty  = CONFIG.awakeningDifficulty,
@@ -2434,6 +2645,18 @@ local function loadSettings()
         CONFIG.challengeDone = {}
         for k, v in pairs(data.challengeDone) do
             CONFIG.challengeDone[k] = tonumber(v)
+        end
+    end
+    if type(data.challengeDoneMeta) == "table" then
+        CONFIG.challengeDoneMeta = {}
+        for k, v in pairs(data.challengeDoneMeta) do
+            if type(v) == "table" then
+                CONFIG.challengeDoneMeta[k] = {
+                    dayTimer  = tonumber(v.dayTimer),
+                    halfTimer = tonumber(v.halfTimer),
+                    ts        = tonumber(v.ts),
+                }
+            end
         end
     end
     if data.autoAwakening ~= nil then CONFIG.autoAwakening = data.autoAwakening == true end
@@ -2484,12 +2707,7 @@ local function loadSession()
     end
 end
 loadSession()
-AS.challengeDoneSession = AS.challengeDoneSession or {}
-for _, key in ipairs({ "1d", "30m" }) do
-    if CONFIG.challengeDone and CONFIG.challengeDone[key] then
-        AS.challengeDoneSession[key] = true
-    end
-end
+syncChallengeDoneFlags()
 -- Master toggle comes ONLY from settings (not session.running / AS.enabled OR chain)
 Session.running = CONFIG.enabled == true
 AS.enabled = CONFIG.enabled == true
@@ -2929,8 +3147,14 @@ local function refreshAwakeningLabels()
             af.mode, af.world, af.act or 0, af.item or "?"))
     elseif af and af.quest then
         setLabel(statusLabels.awakenFarm, "Special quest: " .. tostring(af.quest))
+    elseif not CONFIG.autoAwakening then
+        setLabel(statusLabels.awakenFarm, "Farm target: auto awakening OFF")
+    elseif challengesTakePriority() and countPendingChallenges() > 0 then
+        setLabel(statusLabels.awakenFarm, ("Waiting: %d challenge(s) first"):format(countPendingChallenges()))
+    elseif #missing > 0 then
+        setLabel(statusLabels.awakenFarm, getAwakeningFarmPreview(unit.name))
     else
-        setLabel(statusLabels.awakenFarm, "Farm target: idle in lobby")
+        setLabel(statusLabels.awakenFarm, "Farm target: ready to awaken")
     end
     local n = #getOwnedAwakenableUnits()
     if statusLabels.awakenCount then
@@ -2993,8 +3217,7 @@ local function refreshChallengeLabels()
         if not enabled then
             setLabel(lbl, name .. ": disabled")
         elseif type(ch) == "table" and ch.world then
-            local done = (AS.challengeDoneSession and AS.challengeDoneSession[key])
-                or scanChallengeGuiCompleted(key)
+            local done = isChallengeMarkedDone(key) or scanChallengeGuiCompleted(key)
             setLabel(lbl, name .. ": " .. ch.world .. " Act " .. tostring(ch.act)
                 .. (done and " (already completed)" or " (ready)"))
         else
