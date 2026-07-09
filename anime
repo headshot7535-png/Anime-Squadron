@@ -39,7 +39,7 @@
       farmed first; capped maps are skipped to the next enabled priority map.
 --------------------------------------------------------------------------]]
 
-local VERSION = "1.11.0"   -- bump this each upload so you can confirm the live build
+local VERSION = "1.11.1"   -- bump this each upload so you can confirm the live build
 local NEXUSLIB_URL = "https://raw.githubusercontent.com/headshot7535-png/Nexuslib/main/Nexuslib"
 
 -- ============================================================
@@ -849,14 +849,16 @@ local function getDailyMapQueue()
     return queue
 end
 
-local function moveDailyPriorityKey(key, delta)
+local function setDailyPriorityNumber(key, wantPri)
     ensureDailyPriorityConfig()
     local order = CONFIG.dailyPriorityOrder
     local idx = table.find(order, key)
     if not idx then return end
-    local ni = idx + delta
-    if ni < 1 or ni > #order then return end
-    order[idx], order[ni] = order[ni], order[idx]
+    local n = #order
+    local pri = math.clamp(math.floor(tonumber(wantPri) or idx), 1, n)
+    if pri == idx then return end
+    table.remove(order, idx)
+    table.insert(order, pri, key)
     saveSettings()
 end
 
@@ -2380,45 +2382,42 @@ local function buildUI()
         Daily:Label(("%s %s Act %d  (cap %d)"):format(m.mode, m.world, m.act, m.cap))
     end
 
-    Daily:Section("Priority farm order (top = farmed first)")
-    local priLabels = {}
-    local function refreshPriorityLabels()
+    Daily:Section("Priority farm order (1 = farmed first)")
+    local priInputs = {}
+    local priRefreshing = false
+    local function refreshPriorityInputs()
         ensureDailyPriorityConfig()
+        priRefreshing = true
         for i, key in ipairs(CONFIG.dailyPriorityOrder) do
-            local m = findTraitMapByKey(key)
-            local lbl = priLabels[key]
-            if m and lbl then
-                local on = CONFIG.dailyPriorityEnabled[key] ~= false
-                pcall(function()
-                    lbl.Set(("#%d  %s %s Act %d  cap %d  %s"):format(
-                        i, m.mode, m.world, m.act, m.cap, on and "ON" or "OFF"))
-                end)
+            local inp = priInputs[key]
+            if inp then
+                pcall(function() inp.Set(tostring(i)) end)
             end
         end
+        priRefreshing = false
     end
     ensureDailyPriorityConfig()
     for _, key in ipairs(CONFIG.dailyPriorityOrder) do
         local m = findTraitMapByKey(key)
         if m then
-            priLabels[key] = Daily:Label(("#  %s %s Act %d"):format(m.mode, m.world, m.act))
+            local startPri = table.find(CONFIG.dailyPriorityOrder, key) or 1
+            priInputs[key] = Daily:Input(
+                ("%s %s Act %d"):format(m.mode, m.world, m.act),
+                ("Cap %d — set priority number (1 = farm first)"):format(m.cap),
+                "1", tostring(startPri),
+                function(txt)
+                    if priRefreshing then return end
+                    setDailyPriorityNumber(key, txt)
+                    refreshPriorityInputs()
+                    pcall(refreshDailyCapLabels)
+                end)
             Daily:Toggle(("Farm: %s"):format(m.world),
                 "Include this map in the daily trait rotation",
                 CONFIG.dailyPriorityEnabled[key] ~= false, function(on)
                     CONFIG.dailyPriorityEnabled[key] = on
                     saveSettings()
-                    refreshPriorityLabels()
                     pcall(refreshDailyCapLabels)
                 end)
-            Daily:Button("↑", ("Move %s up"):format(m.world), "Higher priority", nil, function()
-                moveDailyPriorityKey(key, -1)
-                refreshPriorityLabels()
-                pcall(refreshDailyCapLabels)
-            end)
-            Daily:Button("↓", ("Move %s down"):format(m.world), "Lower priority", nil, function()
-                moveDailyPriorityKey(key, 1)
-                refreshPriorityLabels()
-                pcall(refreshDailyCapLabels)
-            end)
         end
     end
     Daily:Button("↺", "Reset priority order", "Restore default farm order", nil, function()
@@ -2433,11 +2432,11 @@ local function buildUI()
             end
         end
         saveSettings()
-        refreshPriorityLabels()
+        refreshPriorityInputs()
         pcall(refreshDailyCapLabels)
         notify("Daily Traits", "Priority order reset.", "info")
     end)
-    task.defer(refreshPriorityLabels)
+    task.defer(refreshPriorityInputs)
 
     Daily:Section("Settings")
     Daily:Dropdown("Daily difficulty", "Difficulty for daily-trait maps", { "Normal", "Hard" },
