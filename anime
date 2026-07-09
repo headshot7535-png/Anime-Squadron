@@ -38,7 +38,7 @@
       data + world rewards), handle special-quest items, then invoke awaken.
 --------------------------------------------------------------------------]]
 
-local VERSION = "2.3.1"   -- bump this each upload so you can confirm the live build
+local VERSION = "2.3.2"   -- bump this each upload so you can confirm the live build
 local NEXUSLIB_URL = "https://raw.githubusercontent.com/headshot7535-png/Nexuslib/main/Nexuslib"
 
 -- ============================================================
@@ -1733,41 +1733,113 @@ local function discoverUnitsFromCharactersGui(seen)
     return list
 end
 
-local function getOwnedAwakenableUnits()
-    refreshPlayerData()
-    local data = getPlayerData()
-    local list = {}
-    local seen = {}
+local function restoreAwakenUnitCache()
+    AS.awakenUnitByName = AS.awakenUnitByName or {}
+    if Session.awakenUnitCache and type(Session.awakenUnitCache.byName) == "table" then
+        for name, u in pairs(Session.awakenUnitCache.byName) do
+            if type(u) == "table" and u.name then
+                AS.awakenUnitByName[name] = u
+            end
+        end
+    end
+end
 
+local function countAwakenUnitCache()
+    local n = 0
+    if AS.awakenUnitByName then
+        for _ in pairs(AS.awakenUnitByName) do n = n + 1 end
+    end
+    return n
+end
+
+local function mergeAwakenUnitEntry(list, seen, entry)
+    if type(entry) ~= "table" or type(entry.name) ~= "string" or entry.name == "" then return end
+    if seen[entry.name] then return end
+    seen[entry.name] = true
+    list[#list + 1] = entry
+end
+
+local function updateAwakenUnitsCache(units)
+    if type(units) ~= "table" or #units == 0 then return end
+    AS.awakenUnitByName = AS.awakenUnitByName or {}
+    Session.awakenUnitCache = Session.awakenUnitCache or { byName = {} }
+    local byName = Session.awakenUnitCache.byName or {}
+    local before = countAwakenUnitCache()
+    for _, u in ipairs(units) do
+        if u.name then
+            local prev = byName[u.name] or AS.awakenUnitByName[u.name]
+            local merged = {
+                id    = u.id or (prev and prev.id),
+                name  = u.name,
+                index = u.index or (prev and prev.index),
+                level = u.level or (prev and prev.level),
+            }
+            byName[u.name] = merged
+            AS.awakenUnitByName[u.name] = merged
+        end
+    end
+    local after = countAwakenUnitCache()
+    if after > before or (inLobby() and after > 0) then
+        Session.awakenUnitCache.byName = byName
+        saveSession()
+    end
+end
+
+local function getOwnedAwakenableUnits()
+    restoreAwakenUnitCache()
+    local list, seen = {}, {}
+
+    if AS.awakenUnitByName then
+        local cached = {}
+        for _, u in pairs(AS.awakenUnitByName) do cached[#cached + 1] = u end
+        table.sort(cached, function(a, b) return tostring(a.name) < tostring(b.name) end)
+        for _, u in ipairs(cached) do
+            mergeAwakenUnitEntry(list, seen, u)
+        end
+    end
+
+    if inLobby() then
+        refreshPlayerData()
+    end
+    local data = getPlayerData()
     if data and type(data.characters) == "table" then
         for id, ch in pairs(data.characters) do
             if type(ch) == "table" and type(ch.name) == "string" and ch.name ~= "" then
                 local ok, folderName = isAwakenableUnitName(ch.name)
-                if ok and folderName and not seen[folderName] then
-                    seen[folderName] = true
-                    list[#list + 1] = {
+                if ok and folderName then
+                    mergeAwakenUnitEntry(list, seen, {
                         id = ch.id or id,
                         name = folderName,
                         index = ch.index,
                         level = ch.level,
-                    }
+                    })
                 end
             end
         end
     end
 
-    if #list == 0 then
+    if inLobby() then
         for _, u in ipairs(discoverUnitsFromCharactersGui(seen)) do
-            list[#list + 1] = u
+            mergeAwakenUnitEntry(list, seen, u)
         end
     end
 
     table.sort(list, function(a, b) return tostring(a.name) < tostring(b.name) end)
+    if #list > 0 then
+        updateAwakenUnitsCache(list)
+    end
     return list
 end
 
 local function findOwnedUnitByName(unitName)
     if type(unitName) ~= "string" or unitName == "" then return nil end
+    restoreAwakenUnitCache()
+    if AS.awakenUnitByName and AS.awakenUnitByName[unitName] then
+        return AS.awakenUnitByName[unitName]
+    end
+    if not inLobby() then
+        return nil
+    end
     refreshPlayerData()
     local data = getPlayerData()
     if data and type(data.characters) == "table" then
@@ -1775,12 +1847,14 @@ local function findOwnedUnitByName(unitName)
             if type(ch) == "table" and ch.name then
                 local ok, folderName = isAwakenableUnitName(ch.name)
                 if ok and folderName == unitName then
-                    return {
+                    local unit = {
                         id = ch.id or id,
                         name = folderName,
                         index = ch.index,
                         level = ch.level,
                     }
+                    updateAwakenUnitsCache({ unit })
+                    return unit
                 end
             end
         end
@@ -2755,9 +2829,13 @@ local function loadSession()
         if type(data.awakeningFarm) == "table" then
             Session.awakeningFarm = data.awakeningFarm
         end
+        if type(data.awakenUnitCache) == "table" then
+            Session.awakenUnitCache = data.awakenUnitCache
+        end
     end
 end
 loadSession()
+restoreAwakenUnitCache()
 syncChallengeDoneFlags()
 if not CONFIG.autoDailyChallenge and not CONFIG.autoRegularChallenge then
     Session.challengeFarm = nil
@@ -3212,9 +3290,11 @@ local function refreshAwakeningLabels()
     else
         setLabel(statusLabels.awakenFarm, "Farm target: ready to awaken")
     end
-    local n = #getOwnedAwakenableUnits()
+    local n = countAwakenUnitCache()
+    if n == 0 then n = #getOwnedAwakenableUnits() end
     if statusLabels.awakenCount then
-        setLabel(statusLabels.awakenCount, ("Awakenable units found: %d"):format(n))
+        setLabel(statusLabels.awakenCount, ("Awakenable units found: %d%s"):format(
+            n, (not inLobby() and n > 0) and " (cached)" or ""))
     end
 end
 
@@ -3235,19 +3315,24 @@ local function cycleAwakenUnit(dir)
 end
 
 local function refreshAwakenUnitDropdown()
-    refreshPlayerData()
     local units = getOwnedAwakenableUnits()
     local names = {}
     for _, u in ipairs(units) do names[#names + 1] = u.name end
 
     if #names == 0 then
-        setLabel(statusLabels.awakenList, "Available: none (open Characters menu, then Refresh)")
+        setLabel(statusLabels.awakenList, "Available: none (open Characters menu in lobby, then Refresh)")
     else
-        if CONFIG.awakeningUnit == "" or not table.find(names, CONFIG.awakeningUnit) then
+        if CONFIG.awakeningUnit == "" then
             CONFIG.awakeningUnit = names[1]
             saveSettings()
         end
-        setLabel(statusLabels.awakenList, "Available: " .. table.concat(names, ", "))
+        local selectedOk = table.find(names, CONFIG.awakeningUnit) ~= nil
+            or (AS.awakenUnitByName and AS.awakenUnitByName[CONFIG.awakeningUnit] ~= nil)
+        local listText = "Available: " .. table.concat(names, ", ")
+        if not selectedOk and CONFIG.awakeningUnit ~= "" then
+            listText = listText .. " | Selected: " .. CONFIG.awakeningUnit .. " (cached)"
+        end
+        setLabel(statusLabels.awakenList, listText)
         if awakenUnitInput then
             pcall(function() awakenUnitInput.Set(CONFIG.awakeningUnit) end)
         end
@@ -3376,8 +3461,9 @@ local function buildUI()
     Aw:Section("Actions")
     Aw:Button("↺", "Refresh units", "Rescan player data + Characters menu for awakenable units", nil, function()
         AWAKENABLE_NAMES = nil
+        if inLobby() then refreshPlayerData() end
         local n = refreshAwakenUnitDropdown()
-        notify("Awakening", n > 0 and ("Found " .. n .. " awakenable unit(s).") or "No awakenable units — open Characters menu once, then refresh.", n > 0 and "success" or "error")
+        notify("Awakening", n > 0 and ("Found " .. n .. " awakenable unit(s).") or "No awakenable units — open Characters menu in lobby, then refresh.", n > 0 and "success" or "error")
     end)
 
     Aw:Section("Live status")
@@ -3601,7 +3687,7 @@ addThread(function()
             end)
             pcall(refreshDailyCapLabels)
             pcall(refreshChallengeLabels)
-            if not AS._awakenUnitsFound then
+            if inLobby() or not AS._awakenUnitsFound then
                 local n = refreshAwakenUnitDropdown()
                 if n > 0 then AS._awakenUnitsFound = true end
             else
