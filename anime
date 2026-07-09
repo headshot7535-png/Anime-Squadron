@@ -1,19 +1,11 @@
 --[[
-    Auto Bounty
+    Anime Squadron
     --------------------------------------------------------------------------
-    - Accepts ONLY bounties whose rewards include "Trait Shards" (trait rerolls)
-    - Declines bounties that do NOT give trait shards
-    - Runs ONE bounty active at a time
-    - Detects the bounty's world, launches that Story map (configurable Act /
-      Difficulty), waits for the run to clear (your units auto-fight), then
-      returns to the lobby, claims the reward and accepts the next trait bounty
-    - Repeats until there are no trait-reroll bounties left
-
     DAILY TRAIT FARM:
       Farms every Story/Raid/Challenge map that drops capped Trait Shards.
       Reads your daily cap progress from player data (same X/100 the Play menu
       shows). When a map hits its cap, returns to lobby and moves to the next
-      map. Loops through all maps until every daily trait cap is filled.
+      map. Loops through priority maps until every daily trait cap is filled.
 
     AUTO EXECUTE:
       queue_on_teleport re-runs this script after EVERY teleport (manual or
@@ -26,34 +18,41 @@
       Blocks the 20-minute idle kick (Idled hook + input nudge + disables any
       built-in AFK script). Toggle it in the Misc tab.
 
-    DPS METER (v1.9.5):
+    DPS METER:
       Live team DPS from leaderstats.Damage + theoretical per-slot DPS (dmg/cd)
       for equipped units. See the DPS tab.
 
-    DAILY TRAIT LEAVE (v1.9.8):
+    DAILY TRAIT LEAVE:
       Leaves the stage as soon as a map's daily Trait Shard cap is full. Tries
-      Play/leave, game Play.leave(), Matchmaking/leave, and GUI Leave buttons.
+      Settings Teleport, game Play.leave(), Matchmaking/leave, and GUI Leave.
 
-    DAILY TRAIT PRIORITY (v1.11.0):
-      Reorder and enable/disable which trait maps to farm. Top of the list is
-      farmed first; capped maps are skipped to the next enabled priority map.
+    DAILY TRAIT PRIORITY:
+      Reorder and enable/disable which trait maps to farm. Lower number = farmed
+      sooner; capped maps are skipped to the next enabled priority map.
+
+    ROTATING CHALLENGES:
+      Auto-clears Daily Challenge [1d] and Regular Challenge [30m] once per reset.
+
+    AUTO AWAKENING:
+      Pick a unit, farm maps for missing awakening materials (parsed from item
+      data + world rewards), handle special-quest items, then invoke awaken.
 --------------------------------------------------------------------------]]
 
-local VERSION = "1.11.1"   -- bump this each upload so you can confirm the live build
+local VERSION = "2.2.0"   -- bump this each upload so you can confirm the live build
 local NEXUSLIB_URL = "https://raw.githubusercontent.com/headshot7535-png/Nexuslib/main/Nexuslib"
 
 -- ============================================================
 -- Boot lock (prevents double GUI on teleport) — claim BEFORE bumping GEN
 -- so a rejected duplicate boot does not kill the live instance's status thread.
 -- ============================================================
-local BOOT_LOCK_FILE = "AutoBounty_boot_lock.json"
+local BOOT_LOCK_FILE = "AnimeSquadron_boot_lock.json"
 local function canFileEarly()
     return (writefile and readfile and isfile) and true or false
 end
 local function claimScriptBoot()
     local now = tick()
-    if _G.AB_BootAt and (now - _G.AB_BootAt) < 4 then return false end
-    _G.AB_BootAt = now
+    if _G.AS_BootAt and (now - _G.AS_BootAt) < 4 then return false end
+    _G.AS_BootAt = now
     if not canFileEarly() then return true end
     local job = game.JobId
     if isfile(BOOT_LOCK_FILE) then
@@ -77,15 +76,15 @@ end
 if not claimScriptBoot() then return end
 
 -- persistent state (survives re-execution / teleport)
-_G.AB = _G.AB or {}
-local AB = _G.AB
+_G.AS = _G.AS or _G.AB or {}
+local AS = _G.AS
 
 -- ============================================================
 -- Anti-stacking generation token (only after boot claimed)
 -- ============================================================
-_G.AutoBountyGen = (_G.AutoBountyGen or 0) + 1
-local GEN = _G.AutoBountyGen
-local function alive() return _G.AutoBountyGen == GEN end
+_G.AnimeSquadronGen = (_G.AnimeSquadronGen or _G.AutoBountyGen or 0) + 1
+local GEN = _G.AnimeSquadronGen
+local function alive() return _G.AnimeSquadronGen == GEN end
 
 -- ============================================================
 -- Services
@@ -103,58 +102,46 @@ local SCRIPT_URL = "https://raw.githubusercontent.com/headshot7535-png/Anime-Squ
 
 local g = getgenv and getgenv() or {}
 local CONFIG = {
-    traitReward      = "Trait Shards",                 -- reward keyword that marks a "trait reroll" bounty
-    traitKeywords    = { "trait", "reroll" },           -- any reward name/text containing these = keep it
-    act              = tonumber(g.AutoBountyAct) or 1,  -- Story act to farm
-    difficulty       = g.AutoBountyDifficulty or "Normal", -- "Normal" | "Hard"
-    soloOnly         = (g.AutoBountySolo ~= false),     -- create a friends-only (solo) room
-    declineNonTrait  = (g.AutoBountyDeclineNonTrait ~= false),
-    -- SAFETY: never decline anything unless the board has at least one detected
-    -- trait bounty. Prevents wiping the whole board if reward detection is off.
-    declineEvenIfNoTrait = (g.AutoBountyDeclineAlways == true),
-    useRefreshTicket = (g.AutoBountyUseTicket == true), -- spend bounty tickets to roll new bounties when none left
-    stopWhenDone     = (g.AutoBountyStopWhenDone ~= false),
+    soloOnly         = (g.AnimeSquadronSolo ~= false) and (g.AutoBountySolo ~= false),
     loopDelay        = 1.0,
-    actionCooldown   = 0.45,                            -- min gap between remote calls (rate-limit safety)
-    farmTimeout      = 600,                             -- max seconds to wait for a same-place run to progress
-    -- auto-execute: re-run this script automatically after each teleport (lobby <-> battle)
-    autoExecute      = (g.AutoBountyAutoExecute ~= false),
-    scriptUrl        = g.AutoBountyScriptURL or SCRIPT_URL, -- for queue_on_teleport persistence
-    -- auto-exec install: optional loader for MANUAL rejoins only (not teleports).
-    -- Disabled by default because queue_on_teleport handles in-game teleports
-    -- and running both caused double script execution on arrival.
-    autoexecInstall  = (g.AutoBountyAutoexecInstall == true),
-    -- anti-afk: prevent the 20-minute idle kick
-    antiAfk          = (g.AutoBountyAntiAFK ~= false),
-    antiAfkInterval  = 8,                               -- seconds between keep-alive nudges
-    maxActs          = tonumber(g.AutoBountyMaxActs) or 7, -- acts to cycle through when finding the enemy
-    liveKills        = (g.AutoBountyLiveKills ~= false), -- count bounty-enemy kills live while in Story mode
-    leaveWhenDone    = (g.AutoBountyLeaveWhenDone ~= false), -- leave the stage the moment the target count is met (self-disables if the server only banks on stage finish)
-    -- daily trait farm: clear capped Trait Shard drops on every eligible map
-    dailyTraitFarm   = (g.AutoBountyDailyTraits ~= false),
-    bountyFarm       = (g.AutoBountyBountyFarm ~= false),
-    dailyDifficulty  = g.AutoBountyDailyDifficulty or "Normal", -- "Normal" | "Hard" for daily maps
-    dailyStopWhenDone = (g.AutoBountyDailyStopWhenDone ~= false),
-    dailyStallRuns   = tonumber(g.AutoBountyDailyStallRuns) or 3, -- no cap gain after N clears => treat as maxed
-    -- priority order for daily trait maps (top = farmed first); enabled[key] toggles each map
-    dailyPriorityOrder   = type(g.AutoBountyDailyPriority) == "table" and g.AutoBountyDailyPriority or {},
-    dailyPriorityEnabled = type(g.AutoBountyDailyPriorityEnabled) == "table" and g.AutoBountyDailyPriorityEnabled or {},
-    dpsMeter         = (g.AutoBountyDpsMeter ~= false),           -- live team DPS + theoretical per-unit panel
+    actionCooldown   = 0.45,
+    farmTimeout      = 600,
+    autoExecute      = (g.AnimeSquadronAutoExecute ~= false) and (g.AutoBountyAutoExecute ~= false),
+    scriptUrl        = g.AnimeSquadronScriptURL or g.AutoBountyScriptURL or SCRIPT_URL,
+    autoexecInstall  = (g.AnimeSquadronAutoexecInstall == true) or (g.AutoBountyAutoexecInstall == true),
+    antiAfk          = (g.AnimeSquadronAntiAFK ~= false) and (g.AutoBountyAntiAFK ~= false),
+    antiAfkInterval  = 8,
+    dailyTraitFarm   = (g.AnimeSquadronDailyTraits ~= false) and (g.AutoBountyDailyTraits ~= false),
+    dailyDifficulty  = g.AnimeSquadronDailyDifficulty or g.AutoBountyDailyDifficulty or "Normal",
+    dailyStopWhenDone = (g.AnimeSquadronDailyStopWhenDone ~= false) and (g.AutoBountyDailyStopWhenDone ~= false),
+    dailyStallRuns   = tonumber(g.AnimeSquadronDailyStallRuns or g.AutoBountyDailyStallRuns) or 3,
+    dailyPriorityOrder   = type(g.AnimeSquadronDailyPriority) == "table" and g.AnimeSquadronDailyPriority
+        or (type(g.AutoBountyDailyPriority) == "table" and g.AutoBountyDailyPriority or {}),
+    dailyPriorityEnabled = type(g.AnimeSquadronDailyPriorityEnabled) == "table" and g.AnimeSquadronDailyPriorityEnabled
+        or (type(g.AutoBountyDailyPriorityEnabled) == "table" and g.AutoBountyDailyPriorityEnabled or {}),
+    dpsMeter         = (g.AnimeSquadronDpsMeter ~= false) and (g.AutoBountyDpsMeter ~= false),
+    autoDailyChallenge   = (g.AnimeSquadronDailyChallenge ~= false) and (g.AutoBountyDailyChallenge ~= false),
+    autoRegularChallenge = (g.AnimeSquadronRegularChallenge ~= false) and (g.AutoBountyRegularChallenge ~= false),
+    challengeDone        = type(g.AnimeSquadronChallengeDone) == "table" and g.AnimeSquadronChallengeDone
+        or (type(g.AutoBountyChallengeDone) == "table" and g.AutoBountyChallengeDone or {}),
+    autoAwakening        = g.AnimeSquadronAutoAwakening == true,
+    awakeningUnit      = type(g.AnimeSquadronAwakeningUnit) == "string" and g.AnimeSquadronAwakeningUnit or "",
+    awakeningDifficulty = g.AnimeSquadronAwakeningDifficulty or g.AutoBountyAwakeningDifficulty or "Normal",
+    awakeningStallRuns = tonumber(g.AnimeSquadronAwakeningStallRuns) or 4,
 }
 CONFIG.enabled = false                                 -- set from the saved session below
 
 -- ============================================================
 -- Cross-teleport memory.
--- _G is WIPED on teleport (new place = new Luau VM), so the bounty board can't
--- be tracked while in Story mode. We persist the running state AND the active
--- bounty target (world / enemy / required / progress / run count) to DISK so it
--- survives the lobby <-> battle teleports and we reconcile progress on return.
+-- _G is WIPED on teleport (new place = new Luau VM). We persist the running
+-- state and daily farm progress to DISK so it survives lobby <-> battle hops.
 -- ============================================================
-local Session = { running = false, bounty = nil, dailyFarm = nil }
+local Session = { running = false, dailyFarm = nil, challengeFarm = nil, awakeningFarm = nil }
 -- forward declarations (these are referenced earlier than they are defined)
 local saveSession
 local saveSettings
-local setEnabled, mainLoop, rememberBounty, forgetBounty
+local SESSION_FILE
+local setEnabled, mainLoop
 local armReexec
 
 -- ============================================================
@@ -173,7 +160,7 @@ local function cleanupAll()
     _conns, _threads = {}, {}
 end
 -- kill the previous instance's connections/threads/GUI
-if AB.cleanup then pcall(AB.cleanup) end
+if AS.cleanup then pcall(AS.cleanup) end
 
 -- ============================================================
 -- Wait for PlayerGui
@@ -226,52 +213,12 @@ local function fireR(folder, name, ...)
 end
 
 -- ============================================================
--- Authoritative bounty data (server-pushed, exact rewards table)
--- ------------------------------------------------------------
--- The game's server sends the full bounty list to the client via the
--- Bounties.setup RemoteEvent, and accept/decline/claim/use_ticket all RETURN
--- the updated list. Each bounty carries: world, enemy, difficulty, progress,
--- required, active, rewards = { ["Trait Shards"] = qty, ... }. Reading this is
--- 100% reliable - no fragile GUI/icon parsing. We cache it on AB so it survives
--- re-execution within the same place; setup fires again on each lobby (re)join.
--- ============================================================
-local function setBountyCache(bounties, tickets)
-    if type(bounties) == "table" then AB.bountyData = bounties end
-    if type(tickets) == "number" then AB.bountyTickets = tickets end
-end
-do
-    local setupR = getRemote("Bounties", "setup")
-    if setupR and setupR.OnClientEvent then
-        addConn(setupR.OnClientEvent:Connect(function(bounties, tickets)
-            setBountyCache(bounties, tickets)
-        end))
-    end
-end
-
--- does a rewards table (or a list of reward names) contain a trait/reroll reward?
-local function rewardsAreTrait(rewards)
-    if type(rewards) ~= "table" then return false end
-    for itemName in pairs(rewards) do
-        local lc = tostring(itemName):lower()
-        for _, kw in ipairs(CONFIG.traitKeywords) do
-            if lc:find(kw, 1, true) then return true end
-        end
-    end
-    return false
-end
-
--- ============================================================
 -- GUI helpers / place detection
 -- ============================================================
 local function getMenus()
     local pg = LP:FindFirstChildOfClass("PlayerGui")
     return pg and pg:FindFirstChild("Menus")
 end
-local function getBountyGui()
-    local m = getMenus()
-    return m and m:FindFirstChild("Bounty")
-end
-
 local function inBattle()
     local chars = workspace:FindFirstChild("Characters")
     if not chars then return false end
@@ -281,10 +228,10 @@ local function inBattle()
     return false
 end
 
--- We're "in the lobby" if the Bounty menu exists and we're not mid-fight
+-- We're "in the lobby" when Menus exist and we're not mid-fight
 local function inLobby()
     if inBattle() then return false end
-    return getBountyGui() ~= nil
+    return getMenus() ~= nil
 end
 
 -- UI handle (set later) + status helpers — must be before leaveStage / daily helpers
@@ -495,222 +442,20 @@ local function leaveStage(force)
     return true
 end
 
--- the game's own bounty client module (calls remotes AND refreshes the GUI)
-local _bModule
-local function ensureModule()
-    if _bModule then return _bModule end
-    local ok, m = pcall(function()
-        return require(LP.PlayerScripts.Client.Bounties)
-    end)
-    if ok and type(m) == "table" then _bModule = m end
-    return _bModule
-end
--- best-effort refresh of the game's own bounty GUI after a direct remote call
-local function refreshGUI(bounties, tickets)
-    if not bounties then return end
-    local m = ensureModule()
-    if m and m.setup then pcall(m.setup, bounties, tickets) end
-end
-
--- ============================================================
--- Bounty reading (parse the live GUI)
--- ============================================================
-local function parseProgress(text)
-    if type(text) ~= "string" then return 0, 0 end
-    local p, r = text:match(">%s*(%d+)%s*</font>%s*/%s*(%d+)")
-    if not p then
-        local clean = text:gsub("<[^>]->", "")
-        p, r = clean:match("(%d+)%s*/%s*(%d+)")
-    end
-    return tonumber(p) or 0, tonumber(r) or 0
-end
-
--- returns a list: { {id, world, progress, required, active, complete, trait}, ... }
-local _diagBounties = false
-
--- Build the bounty list straight from the authoritative server data when we have
--- it (exact rewards). Returns nil if we have no cached data yet.
-local function readBountiesFromData()
-    local data = AB.bountyData
-    if type(data) ~= "table" then return nil end
-    local out = {}
-    for k, b in pairs(data) do
-        if type(b) == "table" then
-            local entry = {
-                id       = tonumber(k) or k,
-                world    = b.world,
-                enemy    = b.enemy,
-                progress = tonumber(b.progress) or 0,
-                required = tonumber(b.required) or 0,
-                active   = b.active == true,
-                rewards  = b.rewards,
-                rewardNames = {},
-            }
-            for itemName in pairs(b.rewards or {}) do
-                entry.rewardNames[#entry.rewardNames + 1] = tostring(itemName)
-            end
-            entry.trait = rewardsAreTrait(b.rewards)
-            entry.complete = (entry.required > 0) and (entry.progress >= entry.required)
-            out[#out + 1] = entry
-        end
-    end
-    if #out == 0 then return nil end
-
-    -- one-time diagnostic if the (exact) server rewards still show no trait bounty
-    if not _diagBounties then
-        _diagBounties = true
-        local anyTrait = false
-        for _, e in ipairs(out) do if e.trait then anyTrait = true end end
-        if not anyTrait then
-            for _, e in ipairs(out) do
-                warn(("[Auto Bounty] (server) Bounty %s (%s) rewards: %s"):format(
-                    tostring(e.id), tostring(e.world or "?"),
-                    #e.rewardNames > 0 and table.concat(e.rewardNames, ", ") or "(none)"))
-            end
-            warn("[Auto Bounty] None match trait keywords " ..
-                table.concat(CONFIG.traitKeywords, "/") ..
-                ". Tell me which reward above is the trait/reroll one.")
-        end
-    end
-    return out
-end
-
-local function readBounties()
-    -- 1) authoritative server data (preferred - exact rewards)
-    local fromData = readBountiesFromData()
-    if fromData then return fromData end
-
-    -- 2) fallback: parse the live GUI (cold start before setup has fired)
-    local out = {}
-    local gui = getBountyGui()
-    if not gui then return out end
-    local sf = gui:FindFirstChild("ScrollingFrame")
-    if not sf then return out end
-    for _, f in ipairs(sf:GetChildren()) do
-        local id = tonumber(f.Name)
-        if id and f:IsA("GuiObject") then
-            local entry = { id = id, progress = 0, required = 0, active = false, trait = false }
-
-            local worldL = f:FindFirstChild("World")
-            entry.world = worldL and worldL.Text or nil
-
-            -- enemy name lives in the Description: "-> <font...>Scout Ninja</font> is seeking..."
-            local descL = f:FindFirstChild("Description")
-            if descL then
-                entry.enemy = descL.Text:match(">([^<]+)</font>")
-                if entry.enemy then entry.enemy = entry.enemy:match("^%s*(.-)%s*$") end
-            end
-
-            local progL = f:FindFirstChild("Progress")
-            if progL then entry.progress, entry.required = parseProgress(progL.Text) end
-
-            local isAct = f:FindFirstChild("Is_Active")
-            if isAct and isAct.Visible then entry.active = true end
-            local accept = f:FindFirstChild("Accept")
-            local acceptLbl = accept and accept:FindFirstChild("TextLabel")
-            if acceptLbl then
-                local t = acceptLbl.Text
-                if t == "Pending" or t == "Claim" then entry.active = true end
-            end
-
-            -- Reward detection (GUI fallback). Reward icons are clones of
-            -- Templates.item, parented under a "Rewards" frame, named by the item
-            -- and carrying an "ItemName" TextLabel = item name. We scan the whole
-            -- entry for any "trait"/"reroll" reward (covers it even if the Rewards
-            -- frame is structured differently than expected).
-            entry.rewardNames = {}
-            local function consider(str)
-                if type(str) ~= "string" or str == "" then return end
-                local lc = str:lower()
-                for _, kw in ipairs(CONFIG.traitKeywords) do
-                    if lc:find(kw, 1, true) then entry.trait = true end
-                end
-            end
-            local rew = f:FindFirstChild("Rewards")
-            local scanRoot = rew or f
-            for _, r in ipairs(scanRoot:GetDescendants()) do
-                -- record an ItemName text (or named icon) for diagnostics
-                if r.Name == "ItemName" and (r:IsA("TextLabel") or r:IsA("TextButton")) then
-                    entry.rewardNames[#entry.rewardNames + 1] = r.Text
-                end
-                consider(r.Name)
-                if r:IsA("TextLabel") or r:IsA("TextButton") then consider(r.Text) end
-            end
-
-            entry.complete = (entry.required > 0) and (entry.progress >= entry.required)
-            out[#out + 1] = entry
-        end
-    end
-
-    -- one-time diagnostic: show what each bounty's rewards are actually called so
-    -- we can confirm trait detection (only when we found bounties but no traits)
-    if not _diagBounties and #out > 0 then
-        _diagBounties = true
-        local anyTrait = false
-        for _, e in ipairs(out) do if e.trait then anyTrait = true end end
-        if not anyTrait then
-            for _, e in ipairs(out) do
-                warn(("[Auto Bounty] Bounty %s (%s) rewards: %s"):format(
-                    tostring(e.id), tostring(e.world or "?"),
-                    #e.rewardNames > 0 and table.concat(e.rewardNames, ", ") or "(none read)"))
-            end
-            warn("[Auto Bounty] No trait bounty detected above. If one of these IS " ..
-                "a trait/reroll reward, tell me its exact name so I can match it.")
-        end
-    end
-    return out
-end
-
-local function getTickets()
-    local gui = getBountyGui()
-    local tl = gui and gui:FindFirstChild("Tickets Left")
-    local amt = tl and tl:FindFirstChild("Amount")
-    if amt then
-        local n = tostring(amt.Text):gsub("%D", "")
-        return tonumber(n) or 0
-    end
-    return 0
-end
-
--- ============================================================
--- Bounty actions (direct remotes + GUI refresh)
--- ============================================================
--- Prefer the game's module fn (it InvokeServers + rebuilds the GUI in one go),
--- fall back to a direct remote call + manual GUI refresh.
-local function doAction(method, remoteName, id)
-    -- Direct remote first: it RETURNS (success, bounties, tickets) so we can keep
-    -- our authoritative cache fresh AND refresh the game's GUI ourselves.
-    local ok, suc, bounties, tickets = invokeR("Bounties", remoteName, id)
-    if ok and suc then
-        setBountyCache(bounties, tickets)
-        refreshGUI(bounties, tickets)
-        return true
-    end
-    -- fallback to the game's own module fn (it InvokeServers + rebuilds the GUI)
-    local m = ensureModule()
-    if m and m[method] then
-        throttle()
-        local ok2 = pcall(m[method], id)
-        if ok2 then return true end
-    end
-    return false, suc
-end
-local function bAccept(id)    return doAction("accept",      "accept",      id) end
-local function bDecline(id)   return doAction("decline",     "decline",     id) end
-local function bClaim(id)     return doAction("claim",       "claim",       id) end
-local function bUseTicket()   return doAction("use_ticket",  "use_ticket",  nil) end
-
 -- ============================================================
 -- Matchmaking (start a stage)
 -- ============================================================
-local function startMap(world, act, mode, difficulty)
+local function startMap(world, act, mode, difficulty, rewards)
     local current = {
         world        = world,
-        act          = act or CONFIG.act,
+        act          = act or 1,
         mode         = mode or "Story",
-        difficulty   = difficulty or CONFIG.difficulty,
+        difficulty   = difficulty or CONFIG.dailyDifficulty,
         only_friends = CONFIG.soloOnly and true or false,
     }
+    if type(rewards) == "table" then
+        current.rewards = rewards
+    end
     local okC, sucC, room = invokeR("Play", "create_room", current)
     if not (okC and sucC) then
         return false, tostring(room or "create_room failed")
@@ -870,16 +615,16 @@ end
 local function getPlayerData()
     local ok, util = pcall(function() return require(LP.PlayerScripts.Client.Utility) end)
     if ok and util and type(util.data) == "table" then
-        AB.playerData = util.data
+        AS.playerData = util.data
         return util.data
     end
-    return AB.playerData
+    return AS.playerData
 end
 
 local function refreshPlayerData()
     local ok, data = invokeR("Player", "get")
     if ok and type(data) == "table" then
-        AB.playerData = data
+        AS.playerData = data
         pcall(function()
             local util = require(LP.PlayerScripts.Client.Utility)
             if util then util.data = data end
@@ -924,8 +669,8 @@ local function advanceDailyMapIdx(fromIdx, cappedMap)
     df.mode = nil
     df.act = nil
     if cappedMap then
-        AB._lastCapLeaveKey = capKey(cappedMap.mode, cappedMap.world, cappedMap.act)
-        AB._lastCapLeaveAt = tick()
+        AS._lastCapLeaveKey = capKey(cappedMap.mode, cappedMap.world, cappedMap.act)
+        AS._lastCapLeaveAt = tick()
     end
     Session.dailyFarm = df
     saveSession()
@@ -935,7 +680,7 @@ end
 local function shouldSkipMapAfterCapLeave(map)
     if not map then return false end
     local ck = capKey(map.mode, map.world, map.act)
-    return AB._lastCapLeaveKey == ck and (tick() - (AB._lastCapLeaveAt or 0)) < 45
+    return AS._lastCapLeaveKey == ck and (tick() - (AS._lastCapLeaveAt or 0)) < 45
 end
 
 local function countOpenTraitMaps()
@@ -1275,7 +1020,7 @@ local function leaveStageIfCapped(map, reason, fromIdx)
         notify("Daily Traits", map.world .. " cap reached (" .. getTraitCapCount(map) .. "/" .. map.cap .. ") — next map.", "success")
     end
     leaveStage(true)
-    AB._dailyLeftCap = true
+    AS._dailyLeftCap = true
     advanceDailyMapIdx(fromIdx or (Session.dailyFarm and Session.dailyFarm.idx), map)
     return true
 end
@@ -1326,59 +1071,815 @@ local function waitForDailyRun(map)
     return true
 end
 
--- block until we leave lobby (battle started) then return to lobby
-local function waitForStageReturn()
+-- ============================================================
+-- Rotating challenges (Daily [1d] + Regular [30m], once per reset)
+-- ============================================================
+local CHALLENGE_ORDER = { "1d", "30m" }
+local CHALLENGE_NAMES = { ["1d"] = "Daily Challenge", ["30m"] = "Regular Challenge" }
+
+local function getChallengeTimers()
+    local ok, util = pcall(function() return require(LP.PlayerScripts.Client.Utility) end)
+    if ok and util and type(util.timers) == "table" then
+        return tonumber(util.timers.day) or 0, tonumber(util.timers.half_hour) or 0
+    end
+    return 0, 0
+end
+
+local function fmtChallengeTimer(sec)
+    sec = math.max(0, math.floor(tonumber(sec) or 0))
+    local h = math.floor(sec / 3600)
+    local m = math.floor((sec % 3600) / 60)
+    local s = sec % 60
+    if h > 0 then return string.format("%d:%02d:%02d", h, m, s) end
+    return string.format("%02d:%02d", m, s)
+end
+
+local function getRotatingChallenges()
+    local ok, data = invokeR("Play", "get_challenges")
+    if ok and type(data) == "table" then
+        AS.challengeCache = data
+        return data
+    end
+    return AS.challengeCache or {}
+end
+
+local function syncChallengeDoneFlags(chs)
+    if type(CONFIG.challengeDone) ~= "table" then CONFIG.challengeDone = {} end
+    AS.challengeDoneSession = AS.challengeDoneSession or {}
+    for _, key in ipairs(CHALLENGE_ORDER) do
+        if chs[key] then
+            CONFIG.challengeDone[key] = nil
+            AS.challengeDoneSession[key] = nil
+        end
+    end
+end
+
+local function isChallengeEnabled(key)
+    if key == "1d" then return CONFIG.autoDailyChallenge end
+    if key == "30m" then return CONFIG.autoRegularChallenge end
+    return false
+end
+
+local function shouldRunChallenge(key, ch)
+    if not isChallengeEnabled(key) then return false end
+    if type(ch) ~= "table" or not ch.world or not ch.act then return false end
+    if AS.challengeDoneSession and AS.challengeDoneSession[key] then return false end
+    return true
+end
+
+local function countPendingChallenges()
+    if not CONFIG.autoDailyChallenge and not CONFIG.autoRegularChallenge then return 0 end
+    local chs = getRotatingChallenges()
+    syncChallengeDoneFlags(chs)
+    local n = 0
+    for _, key in ipairs(CHALLENGE_ORDER) do
+        if shouldRunChallenge(key, chs[key]) then n = n + 1 end
+    end
+    return n
+end
+
+local function challengesTakePriority()
+    if Session.challengeFarm then return true end
+    return countPendingChallenges() > 0
+end
+
+local function rememberChallenge(key, ch)
+    Session.challengeFarm = {
+        key   = key,
+        world = ch.world,
+        act   = ch.act,
+    }
+    saveSession()
+end
+
+local function forgetChallenge()
+    Session.challengeFarm = nil
+    saveSession()
+end
+
+local function markChallengeDone(key)
+    AS.challengeDoneSession = AS.challengeDoneSession or {}
+    AS.challengeDoneSession[key] = true
+    if type(CONFIG.challengeDone) ~= "table" then CONFIG.challengeDone = {} end
+    CONFIG.challengeDone[key] = os.time()
+    saveSettings()
+    saveSession()
+end
+
+local function waitForChallengeRun(key, ch)
+    local label = CHALLENGE_NAMES[key] or key
     local t0 = tick()
     while alive() and CONFIG.enabled and inLobby() and (tick() - t0) < 12 do
         task.wait(0.5)
     end
+    if not alive() or not CONFIG.enabled then return false end
+
+    if inLobby() then
+        setStatus(label .. " - waiting for stage to start...")
+        local t1 = tick()
+        while alive() and CONFIG.enabled and inLobby() and (tick() - t1) < CONFIG.farmTimeout do
+            task.wait(2)
+        end
+        if inLobby() then return false end
+    end
+
+    setStatus(("%s - fighting %s Act %d..."):format(label, ch.world, ch.act))
+    local t2 = tick()
+    while alive() and CONFIG.enabled and (not inLobby() or inBattle()) and (tick() - t2) < CONFIG.farmTimeout do
+        task.wait(1)
+    end
+
+    if inLobby() and not inBattle() then return true end
+    waitForLobbyReturn(30)
+    return true
+end
+
+local function challengeStep()
+    if not CONFIG.autoDailyChallenge and not CONFIG.autoRegularChallenge then return end
+
     if not inLobby() then
-        setStatus("Daily traits - in battle, waiting to return...")
-        while alive() and not inLobby() do task.wait(1) end
-        task.wait(2)
-        setStatus("Returned to lobby.")
+        local cf = Session.challengeFarm
+        if cf then
+            setStatus(("%s - in %s Act %d, fighting..."):format(
+                CHALLENGE_NAMES[cf.key] or cf.key or "Challenge",
+                cf.world or "?", cf.act or "?"))
+        else
+            setStatus("Challenge - in stage, waiting to return...")
+        end
+        return
+    end
+
+    local chs = getRotatingChallenges()
+    syncChallengeDoneFlags(chs)
+
+    for _, key in ipairs(CHALLENGE_ORDER) do
+        local ch = chs[key]
+        if shouldRunChallenge(key, ch) then
+            local label = CHALLENGE_NAMES[key] or key
+            rememberChallenge(key, ch)
+            setStatus(("%s: %s Act %d — starting..."):format(label, ch.world, ch.act))
+
+            local ok, err = startMap(ch.world, ch.act, "Challenge", key, ch.rewards)
+            if not ok then
+                forgetChallenge()
+                setStatus("Challenge launch failed: " .. tostring(err))
+                task.wait(2)
+                return
+            end
+
+            waitForChallengeRun(key, ch)
+            forgetChallenge()
+            markChallengeDone(key)
+            notify("Challenges", label .. " cleared — " .. ch.world, "success")
+            return
+        end
+    end
+end
+
+-- ============================================================
+-- Auto awakening (farm materials + special quests, then awaken)
+-- Priority: challenges > awakening > daily traits
+-- ============================================================
+local ITEM_LOC_CACHE = {}
+local SPECIAL_QUEST_ITEM = {
+    ["Beast Core"] = "Furious Beast",
+    ["Fusion Core"] = "Strongest Fusion",
+    ["Primal Core"] = "Primal Fusion",
+}
+
+local function stripHtml(s)
+    if type(s) ~= "string" then return "" end
+    s = s:gsub("<[^>]+>", ""):gsub("&nbsp;", " "):gsub("%s+", " ")
+    return (s:match("^%s*(.-)%s*$") or s)
+end
+
+local function getItemCount(itemName)
+    local data = getPlayerData()
+    if not data then return 0 end
+    if data.stats and data.stats[itemName] ~= nil then
+        return tonumber(data.stats[itemName]) or 0
+    end
+    if data.items and data.items[itemName] ~= nil then
+        return tonumber(data.items[itemName]) or 0
+    end
+    return 0
+end
+
+local function getCharacterData(unitName)
+    local folder = ReplicatedStorage.Characters:FindFirstChild(unitName)
+    if not folder then return nil end
+    local ok, data = pcall(function() return require(folder.data) end)
+    if ok and type(data) == "table" then return data end
+    return nil
+end
+
+local function getAwakeningCost(unitName)
+    local data = getCharacterData(unitName)
+    if data and type(data.awakening) == "table" and type(data.awakening.cost) == "table" then
+        return data.awakening.cost, data.awakening.object
+    end
+    return nil
+end
+
+local function getOwnedAwakenableUnits()
+    local data = getPlayerData()
+    local list = {}
+    if not data or type(data.characters) ~= "table" then return list end
+    for id, ch in pairs(data.characters) do
+        if type(ch) == "table" and ch.name then
+            local cost = getAwakeningCost(ch.name)
+            if cost then
+                list[#list + 1] = {
+                    id = id,
+                    name = ch.name,
+                    index = ch.index,
+                    level = ch.level,
+                }
+            end
+        end
+    end
+    table.sort(list, function(a, b) return tostring(a.name) < tostring(b.name) end)
+    return list
+end
+
+local function findOwnedUnitByName(unitName)
+    if type(unitName) ~= "string" or unitName == "" then return nil end
+    for _, u in ipairs(getOwnedAwakenableUnits()) do
+        if u.name == unitName then return u end
+    end
+    return nil
+end
+
+local function getMissingAwakeningReqs(unitName)
+    local cost = getAwakeningCost(unitName)
+    if not cost then return {} end
+    local missing = {}
+    for item, need in pairs(cost) do
+        need = tonumber(need) or 0
+        if need > 0 then
+            local have = getItemCount(item)
+            if have < need then
+                missing[#missing + 1] = {
+                    item = item,
+                    need = need,
+                    have = have,
+                    deficit = need - have,
+                }
+            end
+        end
+    end
+    table.sort(missing, function(a, b)
+        if a.deficit ~= b.deficit then return a.deficit > b.deficit end
+        return a.item < b.item
+    end)
+    return missing
+end
+
+local function parseItemDescriptionLocation(itemName)
+    if ITEM_LOC_CACHE[itemName] then return ITEM_LOC_CACHE[itemName] end
+    local folder = ReplicatedStorage.Items:FindFirstChild(itemName)
+    if not folder then return nil end
+    local ok, data = pcall(function() return require(folder.data) end)
+    if not ok or type(data) ~= "table" then return nil end
+    local desc = stripHtml(tostring(data.description or ""))
+    local loc = desc:match("Obtainable in%s*→%s*(.+)$")
+        or desc:match("Obtainable in%s+(.+)$")
+    if not loc or loc == "" then return nil end
+    loc = loc:gsub("%.$", "")
+
+    if loc:find("Special Quest", 1, true) then
+        local quest = loc:match("Special Quest%s+(.+)")
+        local parsed = { type = "special", quest = quest and quest:gsub("%.$", "") or loc }
+        ITEM_LOC_CACHE[itemName] = parsed
+        return parsed
+    end
+    if loc:find("Crafting", 1, true) then
+        local parsed = { type = "crafting" }
+        ITEM_LOC_CACHE[itemName] = parsed
+        return parsed
+    end
+
+    local world, mode, act1, act2, difficulty = loc:match("^(.-) Story Act (%d+)%s*,%s*(%d+)")
+    if world then
+        local parsed = {
+            type = "map", world = world, mode = "Story",
+            acts = { tonumber(act1), tonumber(act2) }, difficulty = "Normal",
+        }
+        ITEM_LOC_CACHE[itemName] = parsed
+        return parsed
+    end
+
+    world, act1 = loc:match("^(.-) Squadron Act (%d+)")
+    if world then
+        local parsed = {
+            type = "map", world = world, mode = "Squadron",
+            acts = { tonumber(act1) }, difficulty = "Normal",
+        }
+        ITEM_LOC_CACHE[itemName] = parsed
+        return parsed
+    end
+
+    world, act1 = loc:match("^(.-) Act (%d+) Squadron")
+    if world then
+        local parsed = {
+            type = "map", world = world, mode = "Squadron",
+            acts = { tonumber(act1) }, difficulty = "Normal",
+        }
+        ITEM_LOC_CACHE[itemName] = parsed
+        return parsed
+    end
+
+    world, act1, difficulty = loc:match("^(.-) Squadron Act (%d+)%s+(Hard)")
+    if world then
+        local parsed = {
+            type = "map", world = world, mode = "Squadron",
+            acts = { tonumber(act1) }, difficulty = difficulty,
+        }
+        ITEM_LOC_CACHE[itemName] = parsed
+        return parsed
+    end
+
+    world, act1 = loc:match("^(.-) Act (%d+) Raid")
+    if world then
+        local parsed = {
+            type = "map", world = world, mode = "Raid",
+            acts = { tonumber(act1) }, difficulty = "Normal",
+        }
+        ITEM_LOC_CACHE[itemName] = parsed
+        return parsed
+    end
+
+    world = loc:match("^(.-) Invasion")
+    if world then
+        local parsed = {
+            type = "map", world = world, mode = "Invasion",
+            acts = { 1 }, difficulty = "Normal",
+        }
+        ITEM_LOC_CACHE[itemName] = parsed
+        return parsed
+    end
+
+    return nil
+end
+
+local function discoverItemDropMaps(itemName)
+    local found, seen = {}, {}
+    local ok, Worlds = pcall(function() return require(LP.PlayerScripts.Client.Play.Worlds) end)
+    if ok and type(Worlds) == "table" then
+        for _, idx in ipairs(WORLD_INDICES) do
+            local w = Worlds[idx]
+            if type(w) == "table" and w.name and type(w.Rewards) == "table" then
+                for mode, modeData in pairs(w.Rewards) do
+                    if type(modeData) == "table" then
+                        for diff, diffData in pairs(modeData) do
+                            if type(diffData) == "table" then
+                                for act, actRewards in ipairs(diffData) do
+                                    if type(actRewards) == "table" and actRewards[itemName] then
+                                        local key = mode .. "|" .. w.name .. "|" .. act .. "|" .. diff
+                                        if not seen[key] then
+                                            seen[key] = true
+                                            found[#found + 1] = {
+                                                world = w.name,
+                                                mode = mode,
+                                                act = act,
+                                                difficulty = (diff == "Hard") and "Hard" or "Normal",
+                                            }
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    table.sort(found, function(a, b)
+        if a.mode ~= b.mode then return a.mode < b.mode end
+        if a.world ~= b.world then return a.world < b.world end
+        return a.act < b.act
+    end)
+    return found
+end
+
+local function buildFarmTargetsForItem(itemName)
+    local targets = {}
+    local seen = {}
+    local function addTarget(t)
+        if type(t) ~= "table" or not t.world or not t.mode or not t.act then return end
+        local key = t.mode .. "|" .. t.world .. "|" .. t.act .. "|" .. (t.difficulty or "Normal")
+        if seen[key] then return end
+        seen[key] = true
+        targets[#targets + 1] = t
+    end
+
+    for _, m in ipairs(discoverItemDropMaps(itemName)) do addTarget(m) end
+
+    local parsed = parseItemDescriptionLocation(itemName)
+    if parsed and parsed.type == "map" then
+        for _, act in ipairs(parsed.acts or {}) do
+            addTarget({
+                world = parsed.world,
+                mode = parsed.mode,
+                act = act,
+                difficulty = parsed.difficulty or CONFIG.awakeningDifficulty,
+            })
+        end
+    elseif parsed and parsed.type == "special" then
+        return { special = parsed.quest or SPECIAL_QUEST_ITEM[itemName] }
+    elseif parsed and parsed.type == "crafting" then
+        return { crafting = true }
+    elseif SPECIAL_QUEST_ITEM[itemName] then
+        return { special = SPECIAL_QUEST_ITEM[itemName] }
+    end
+
+    if #targets == 0 and parsed and parsed.type == "map" and parsed.world then
+        addTarget({
+            world = parsed.world,
+            mode = parsed.mode or "Story",
+            act = (parsed.acts and parsed.acts[1]) or 1,
+            difficulty = parsed.difficulty or CONFIG.awakeningDifficulty,
+        })
+    end
+
+    return targets
+end
+
+local function getSpecialQuestCatalog()
+    local ok, data = invokeR("Quests", "get_specials")
+    if ok and type(data) == "table" then
+        AS.specialQuestCache = data
+        return data
+    end
+    return AS.specialQuestCache or {}
+end
+
+local function claimReadySpecialTasks(questName)
+    refreshPlayerData()
+    local data = getPlayerData()
+    local catalog = getSpecialQuestCatalog()
+    local questDef = catalog[questName]
+    local playerQuest = data and data.specials and data.specials[questName]
+    if not questDef or not playerQuest then return false end
+    local claimed = false
+    for idx, taskDef in pairs(questDef.quests or {}) do
+        if type(taskDef) == "table" then
+            local prog = playerQuest.quests and playerQuest.quests[tostring(idx)]
+            if prog and not prog.claimed and tonumber(prog.progress) >= tonumber(taskDef.required) then
+                local ok, suc, newData = invokeR("Quests", "claim_special", questName, tostring(idx))
+                if ok and suc then
+                    claimed = true
+                    if type(newData) == "table" then
+                        AS.playerData = newData
+                        pcall(function()
+                            local util = require(LP.PlayerScripts.Client.Utility)
+                            if util then util.data = newData end
+                        end)
+                    end
+                end
+            end
+        end
+    end
+    refreshPlayerData()
+    return claimed
+end
+
+local function parseTaskFarmTarget(taskDesc)
+    if type(taskDesc) ~= "string" then return nil end
+    local desc = stripHtml(taskDesc):lower()
+    local solo = desc:find("solo", 1, true) ~= nil
+
+    local world, mode, act
+    if desc:find("invasion", 1, true) then
+        mode = "Invasion"
+        if desc:find("bralu", 1, true) or desc:find("lava", 1, true) then
+            world = "The Lava Continent"
+        elseif desc:find("ice", 1, true) then
+            world = "The Ice Continent"
+        end
+        act = 1
+    elseif desc:find("infinite", 1, true) then
+        mode = "Infinite"
+        world = "The Lava Continent"
+        act = 1
+    elseif desc:find("raid", 1, true) then
+        mode = "Raid"
+        world = desc:match("(%w[%w%s%(%)%-]+) raid") or world
+        act = tonumber(desc:match("act (%d+)")) or 1
+    elseif desc:find("squadron", 1, true) or desc:find("stage", 1, true) then
+        mode = "Squadron"
+        world = desc:match("(%w[%w%s%(%)%-]+) invasion")
+            or desc:match("(%w[%w%s%(%)%-]+) squadron")
+            or world
+        act = tonumber(desc:match("act (%d+)")) or 1
+    end
+
+    if not world or not mode then return nil end
+    return { world = world, mode = mode, act = act, difficulty = CONFIG.awakeningDifficulty, solo = solo }
+end
+
+local function pickSpecialQuestFarmTarget(questName, itemName)
+    claimReadySpecialTasks(questName)
+    if getItemCount(itemName) > 0 then return nil end
+
+    local data = getPlayerData()
+    local catalog = getSpecialQuestCatalog()
+    local questDef = catalog[questName]
+    local playerQuest = data and data.specials and data.specials[questName]
+    if not questDef or not playerQuest then return nil end
+
+    local best
+    for idx, taskDef in pairs(questDef.quests or {}) do
+        if type(taskDef) == "table" then
+            local prog = playerQuest.quests and playerQuest.quests[tostring(idx)]
+            local progress = prog and tonumber(prog.progress) or 0
+            local required = tonumber(taskDef.required) or 0
+            if not (prog and prog.claimed) and progress < required then
+                local target = parseTaskFarmTarget(taskDef.desc or taskDef.name or "")
+                if target then
+                    target.quest = questName
+                    target.taskIndex = tostring(idx)
+                    target.taskName = taskDef.name or ("Task " .. tostring(idx))
+                    target.progress = progress
+                    target.required = required
+                    if not best or (required - progress) > (best.required - best.progress) then
+                        best = target
+                    end
+                end
+            end
+        end
+    end
+    return best
+end
+
+local function pickNextAwakeningFarmTarget(unitName, focusItem)
+    local missing = getMissingAwakeningReqs(unitName)
+    if #missing == 0 then return nil, "ready" end
+
+    local itemEntry = missing[1]
+    if focusItem then
+        for _, m in ipairs(missing) do
+            if m.item == focusItem then itemEntry = m break end
+        end
+    end
+
+    local itemName = itemEntry.item
+    local targets = buildFarmTargetsForItem(itemName)
+    if type(targets) == "table" and targets.special then
+        local sq = pickSpecialQuestFarmTarget(targets.special, itemName)
+        if sq then return sq, itemName end
+        return {
+            type = "special_wait",
+            quest = targets.special,
+            item = itemName,
+        }, itemName
+    end
+    if type(targets) == "table" and targets.crafting then
+        return { type = "crafting", item = itemName }, itemName
+    end
+
+    local af = Session.awakeningFarm
+    local startIdx = 1
+    if af and af.item == itemName and af.targetIdx then
+        startIdx = af.targetIdx
+    end
+
+    if type(targets) == "table" and #targets > 0 then
+        for i = 0, #targets - 1 do
+            local idx = ((startIdx - 1 + i) % #targets) + 1
+            local t = targets[idx]
+            return {
+                world = t.world,
+                mode = t.mode,
+                act = t.act,
+                difficulty = t.difficulty or CONFIG.awakeningDifficulty,
+                item = itemName,
+                targetIdx = idx,
+                targetCount = #targets,
+            }, itemName
+        end
+    end
+
+    return { type = "unknown", item = itemName }, itemName
+end
+
+local function awakeningHasWork()
+    if not CONFIG.autoAwakening then return false end
+    return findOwnedUnitByName(CONFIG.awakeningUnit) ~= nil
+end
+
+local function awakeningTakesPriority()
+    if Session.awakeningFarm then return true end
+    return awakeningHasWork()
+end
+
+local function rememberAwakeningFarm(target, unitName)
+    Session.awakeningFarm = Session.awakeningFarm or {}
+    local af = Session.awakeningFarm
+    af.unitName = unitName
+    af.item = target.item or af.item
+    af.world = target.world
+    af.mode = target.mode
+    af.act = target.act
+    af.difficulty = target.difficulty
+    af.quest = target.quest
+    af.taskName = target.taskName
+    af.targetIdx = target.targetIdx
+    af.targetCount = target.targetCount
+    af.runs = af.runs or 0
+    af.stall = af.stall or 0
+    af.lastCount = getItemCount(af.item or "")
+    saveSession()
+end
+
+local function forgetAwakeningFarm()
+    Session.awakeningFarm = nil
+    saveSession()
+end
+
+local function tryAwakenUnit(unit)
+    if not unit or not unit.id then return false, "no_unit" end
+    setStatus("Awakening " .. tostring(unit.name) .. "...")
+    local ok, suc, newName, newData = invokeR("Awakening", "awaken", unit.id)
+    if ok and suc then
+        if type(newData) == "table" then
+            AS.playerData = newData
+            pcall(function()
+                local util = require(LP.PlayerScripts.Client.Utility)
+                if util then util.data = newData end
+            end)
+        end
+        forgetAwakeningFarm()
+        notify("Awakening", (unit.name or "Unit") .. " awakened → " .. tostring(newName or "?"), "success")
         return true
     end
-    -- same-place fallback: wait until we leave the lobby UI or timeout
-    setStatus("Daily traits - waiting for stage to start...")
-    local t1 = tick()
-    while alive() and CONFIG.enabled and inLobby() and (tick() - t1) < CONFIG.farmTimeout do
-        task.wait(2)
+    return false, tostring(newName or suc or "awaken_failed")
+end
+
+local function waitForAwakeningRun(target)
+    local t0 = tick()
+    while alive() and CONFIG.enabled and inLobby() and (tick() - t0) < 12 do
+        task.wait(0.5)
     end
-    return not inLobby()
+    if not alive() or not CONFIG.enabled then return false end
+
+    if inLobby() then
+        setStatus("Awakening farm - waiting for stage to start...")
+        local t1 = tick()
+        while alive() and CONFIG.enabled and inLobby() and (tick() - t1) < CONFIG.farmTimeout do
+            task.wait(2)
+        end
+        if inLobby() then return false end
+    end
+
+    local label = target.quest and ("Special: " .. target.quest) or "Awakening"
+    setStatus(("%s - farming %s %s Act %d for %s..."):format(
+        label, target.mode or "?", target.world or "?", target.act or 0, target.item or "?"))
+
+    local t2 = tick()
+    while alive() and CONFIG.enabled and (not inLobby() or inBattle()) and (tick() - t2) < CONFIG.farmTimeout do
+        task.wait(1)
+    end
+
+    if inLobby() and not inBattle() then return true end
+    waitForLobbyReturn(30)
+    return true
+end
+
+local function awakeningStep()
+    if not CONFIG.autoAwakening then return end
+
+    local unit = findOwnedUnitByName(CONFIG.awakeningUnit)
+    if not unit then
+        setStatus("Awakening - select an owned awakenable unit.")
+        return
+    end
+
+    if not inLobby() then
+        local af = Session.awakeningFarm
+        if af then
+            setStatus(("Awakening - in %s %s Act %d for %s..."):format(
+                af.mode or "?", af.world or "?", af.act or 0, af.item or unit.name))
+        else
+            setStatus("Awakening - in stage, waiting to return...")
+        end
+        return
+    end
+
+    refreshPlayerData()
+    local af = Session.awakeningFarm
+    if af and af.quest then pcall(claimReadySpecialTasks, af.quest) end
+    claimReadySpecialTasks(SPECIAL_QUEST_ITEM[Session.awakeningFarm and Session.awakeningFarm.item or ""] or "")
+
+    local missing = getMissingAwakeningReqs(unit.name)
+    if #missing == 0 then
+        local ok, err = tryAwakenUnit(unit)
+        if ok then
+            setStatus("Awakening complete for " .. unit.name)
+            return "done"
+        end
+        setStatus("Awaken failed: " .. tostring(err))
+        task.wait(2)
+        return
+    end
+
+    local focusItem = Session.awakeningFarm and Session.awakeningFarm.item
+    local target, itemName = pickNextAwakeningFarmTarget(unit.name, focusItem)
+
+    if not target then
+        setStatus("Awakening - no farm route for missing items.")
+        return
+    end
+
+    if target.type == "ready" then
+        tryAwakenUnit(unit)
+        return
+    end
+    if target.type == "crafting" then
+        setStatus("Need " .. target.item .. " from Crafting (manual).")
+        notify("Awakening", target.item .. " requires Crafting — farm manually.", "error")
+        task.wait(5)
+        return
+    end
+    if target.type == "unknown" then
+        setStatus("No farm location for " .. target.item)
+        notify("Awakening", "Can't find farm map for " .. target.item, "error")
+        task.wait(5)
+        return
+    end
+    if target.type == "special_wait" then
+        setStatus("Special quest " .. target.quest .. " — claim tasks / check progress.")
+        claimReadySpecialTasks(target.quest)
+        task.wait(3)
+        return
+    end
+
+    local before = getItemCount(itemName)
+    rememberAwakeningFarm(target, unit.name)
+    local af = Session.awakeningFarm
+    af.runs = (af.runs or 0) + 1
+
+    local soloNote = (target.solo and CONFIG.soloOnly) and " solo" or ""
+    local needAmt = before
+    for _, m in ipairs(getMissingAwakeningReqs(unit.name)) do
+        if m.item == itemName then needAmt = m.need break end
+    end
+    setStatus(("Awakening: need %s (%d/%d) — %s %s Act %d%s run #%d"):format(
+        itemName, before, needAmt,
+        target.mode, target.world, target.act, soloNote, af.runs))
+
+    local prevSolo = CONFIG.soloOnly
+    if target.solo then CONFIG.soloOnly = true end
+    local ok, err = startMap(target.world, target.act, target.mode, target.difficulty or CONFIG.awakeningDifficulty)
+    if target.solo then CONFIG.soloOnly = prevSolo end
+
+    if not ok then
+        setStatus("Awakening launch failed: " .. tostring(err))
+        if af.targetIdx and af.targetCount and af.targetCount > 1 then
+            af.targetIdx = (af.targetIdx % af.targetCount) + 1
+            saveSession()
+        end
+        task.wait(2)
+        return
+    end
+
+    waitForAwakeningRun(target)
+    refreshPlayerData()
+    if target.quest then claimReadySpecialTasks(target.quest) end
+
+    local after = getItemCount(itemName)
+    if after > before then
+        af.stall = 0
+        af.lastCount = after
+        notify("Awakening", itemName .. " " .. after .. " (+" .. (after - before) .. ")", "success")
+    else
+        af.stall = (af.stall or 0) + 1
+        if af.targetIdx and af.targetCount and af.stall >= CONFIG.awakeningStallRuns then
+            af.targetIdx = (af.targetIdx % af.targetCount) + 1
+            af.stall = 0
+            setStatus(itemName .. " stalled — trying next map...")
+        end
+    end
+    saveSession()
 end
 
 -- ============================================================
 -- Core loop logic
 -- ============================================================
--- after launching a stage, block here until we leave the lobby (teleport) or,
--- if it's a same-place arena, until the bounty progress changes.
-local function waitForRun(bountyId, startProg)
-    local t0 = tick()
-    while alive() and CONFIG.enabled and inLobby() and (tick() - t0) < 12 do
-        task.wait(0.5)
-    end
-    if not inLobby() then
-        setStatus("In battle - auto-fighting, waiting to return...")
-        while alive() and not inLobby() do task.wait(1) end
-        task.wait(2) -- let lobby GUI repopulate
-        setStatus("Returned to lobby.")
-        return
-    end
-    -- same-place fallback: wait for progress to move
-    setStatus("Farming - waiting for bounty progress...")
-    local t1 = tick()
-    while alive() and CONFIG.enabled and inLobby() and (tick() - t1) < CONFIG.farmTimeout do
-        for _, b in ipairs(readBounties()) do
-            if b.id == bountyId and (b.progress ~= startProg or b.complete) then return end
-        end
-        task.wait(2)
-    end
-end
-
 -- one decision step for daily trait caps; returns "done" when all maps are maxed
 local function dailyTraitStep()
     if not CONFIG.dailyTraitFarm then return end
+    if challengesTakePriority() then
+        local pending = countPendingChallenges()
+        if pending > 0 then
+            setStatus(("Challenges first — %d available this reset"):format(pending))
+        end
+        return
+    end
+    if awakeningTakesPriority() then
+        setStatus("Awakening farm active — daily traits paused.")
+        return
+    end
 
     refreshPlayerData()
 
@@ -1461,10 +1962,10 @@ local function dailyTraitStep()
     saveSession()
 
     if isTraitCapMaxed(map) or shouldSkipMapAfterCapLeave(map) then
-        if not AB._dailyLeftCap then
+        if not AS._dailyLeftCap then
             notify("Daily Traits", map.world .. " cap reached (" .. map.cap .. ") — next map.", "success")
         end
-        AB._dailyLeftCap = nil
+        AS._dailyLeftCap = nil
         advanceDailyMapIdx(idx, map)
         return
     end
@@ -1477,217 +1978,45 @@ local function dailyTraitStep()
     end
 end
 
--- one decision step; returns "done" when there is nothing left to do
-local function step()
-    if not CONFIG.bountyFarm then return end
-    if not inLobby() then
-        setStatus("Not in lobby (battle/loading) - waiting...")
-        return
-    end
-
-    local list = readBounties()
-    if #list == 0 then
-        -- board not populated yet (just joined / still loading) - wait, don't stop
-        setStatus("Waiting for bounty board to load...")
-        return
-    end
-
-    -- SAFETY: figure out if ANY bounty on the board is a trait/reroll one. If not,
-    -- we refuse to decline (unless explicitly forced) so we never wipe the whole
-    -- board because of a reward-name mismatch. This is what caused "all bounties
-    -- disappear on execute".
-    local anyTrait = false
-    for _, b in ipairs(list) do if b.trait then anyTrait = true break end end
-    local mayDecline = CONFIG.declineNonTrait and (anyTrait or CONFIG.declineEvenIfNoTrait)
-
-    -- 1) handle the active bounty first (one active at a time)
-    local active
-    for _, b in ipairs(list) do if b.active then active = b break end end
-    if active then
-        if active.complete then
-            setStatus(("Claiming completed bounty (%s)"):format(active.world or "?"))
-            if bClaim(active.id) then
-                notify("Bounty", "Claimed reward from " .. (active.world or "bounty"), "success")
-                forgetBounty()
-            end
-            return
-        end
-        if active.trait then
-            -- remember this target on disk so it survives the Story-mode teleport.
-            -- We can't read the enemy in Story mode, so we MATCH the enemy to the
-            -- right act by trial: if the last run added 0 progress, that act has no
-            -- such enemy -> cycle to the next act. When progress moves, lock the act.
-            local prev = Session.bounty
-            local madeProgress = true
-            if prev and prev.id == active.id and prev.lastLaunchProgress ~= nil then
-                madeProgress = active.progress > prev.lastLaunchProgress
-            end
-            -- self-correct: if we left early last run but the server didn't credit
-            -- the kills, stop early-leaving and just finish stages fully instead.
-            if AB._earlyLeft then
-                AB._earlyLeft = false
-                if not madeProgress then
-                    AB._noEarlyLeave = true
-                    madeProgress = true -- banking issue, not a wrong-act issue
-                    setStatus("Early-leave didn't bank progress - switching to full runs.")
-                    notify("Auto Bounty", "Leaving early didn't credit kills; finishing stages fully now.", "info")
-                end
-            end
-            rememberBounty(active) -- preserves act / actsTried / foundAct for the same id
-            local s = Session.bounty
-
-            if madeProgress then
-                s.foundAct = true   -- this act spawns the enemy; lock it in
-                s.actsTried = 0
-                s.failRuns = 0
-            elseif prev and prev.lastLaunchProgress ~= nil then
-                if s.foundAct then
-                    -- right act, but the run didn't clear (lost / unlucky) - retry,
-                    -- but don't loop forever if the loadout simply can't do it
-                    s.failRuns = (s.failRuns or 0) + 1
-                    if s.failRuns >= CONFIG.maxActs then
-                        setStatus(("Runs on %s Act %d aren't clearing - stopping (loadout?)")
-                            :format(active.world or "?", s.act or CONFIG.act))
-                        notify("Auto Bounty", "Can't clear the stage for " ..
-                            (active.enemy or "the target") .. ". Stopped.", "error")
-                        setEnabled(false)
-                        return "done"
-                    end
-                else
-                    -- enemy not in this act yet -> cycle to the next act
-                    s.actsTried = (s.actsTried or 0) + 1
-                    if s.actsTried >= CONFIG.maxActs then
-                        setStatus(("Tried every act in %s, %s never appeared - stopping")
-                            :format(active.world or "?", active.enemy or "target"))
-                        notify("Auto Bounty", "Couldn't find " ..
-                            (active.enemy or "the target") .. " in any act of " ..
-                            (active.world or "that world") .. ".", "error")
-                        setEnabled(false)
-                        return "done"
-                    end
-                    s.act = ((s.act or CONFIG.act) % CONFIG.maxActs) + 1
-                    setStatus(("%s not found - trying %s Act %d")
-                        :format(active.enemy or "target", active.world or "?", s.act))
-                end
-            end
-
-            local act = s.act or CONFIG.act
-            setStatus(("Farming %s Act %d: eliminate %s  %d/%d  (run #%d)")
-                :format(active.world or "?", act, active.enemy or "target",
-                    active.progress, active.required, (s.runs or 0) + 1))
-            s.runs = (s.runs or 0) + 1
-            s.lastLaunchProgress = active.progress
-            Session.runKills = 0 -- reset live counter for this new run
-            AB._leftRun = false  -- allow one early-leave for this new run
-            saveSession()
-
-            local ok, err = startMap(active.world, act)
-            if ok then
-                waitForRun(active.id, active.progress)
-            else
-                setStatus("Launch failed: " .. tostring(err))
-                task.wait(2)
-            end
-            return
-        end
-        -- active bounty does NOT reward trait shards
-        if mayDecline then
-            setStatus("Active bounty has no trait reward - declining it")
-            bDecline(active.id)
-        elseif CONFIG.declineNonTrait then
-            setStatus("No trait bounty on board - NOT declining (safety). See console.")
-            task.wait(3)
-        else
-            setStatus("Active bounty has no trait reward (decline disabled) - idle")
-            task.wait(2)
-        end
-        return
-    end
-
-    -- no active bounty -> drop any stale memory of one
-    if Session.bounty then forgetBounty() end
-
-    -- 2) no active bounty -> clear out a non-trait bounty (one per step)
-    if mayDecline then
-        for _, b in ipairs(list) do
-            if (not b.trait) and (not b.active) then
-                setStatus(("Declining non-trait bounty (%s)"):format(b.world or "?"))
-                bDecline(b.id)
-                return
-            end
-        end
-    end
-
-    -- 3) accept a trait-reroll bounty
-    for _, b in ipairs(list) do
-        if b.trait and (not b.active) then
-            setStatus(("Accepting trait bounty (%s)"):format(b.world or "?"))
-            if bAccept(b.id) then
-                notify("Bounty", "Accepted: " .. (b.world or "bounty"), "info")
-            end
-            return
-        end
-    end
-
-    -- 4) nothing acceptable left
-    if not anyTrait then
-        if CONFIG.useRefreshTicket and getTickets() > 0 then
-            setStatus("No trait bounties - using a ticket to roll a new one")
-            bUseTicket()
-            return
-        end
-        -- don't claim "done" and stop; without declining we just idle and keep
-        -- watching in case the board changes (and we never wipe it)
-        setStatus("No trait/reroll bounty available - waiting (board left intact).")
-        task.wait(3)
-        return
-    end
-end
-
 local _looping = false
 local _inSetEnabled = false
 function mainLoop()
     if _looping then return end
     _looping = true
-    setStatus("Auto Bounty started.")
+    setStatus("Anime Squadron started.")
     while alive() and CONFIG.enabled do
-        local bountyDone, dailyDone = false, false
+        if CONFIG.autoDailyChallenge or CONFIG.autoRegularChallenge then
+            local okC, errC = pcall(challengeStep)
+            if not okC then
+                setStatus("Challenge error: " .. tostring(errC))
+            end
+        end
 
-        if CONFIG.bountyFarm then
-            local ok, res = pcall(step)
+        if CONFIG.autoAwakening and not challengesTakePriority() then
+            local okA, resA = pcall(awakeningStep)
+            if not okA then
+                setStatus("Awakening error: " .. tostring(resA))
+            elseif resA == "done" then
+                setStatus("Awakening complete.")
+            end
+        end
+
+        if CONFIG.dailyTraitFarm and not challengesTakePriority() and not awakeningTakesPriority() then
+            local ok, res = pcall(dailyTraitStep)
             if not ok then
-                setStatus("Error: " .. tostring(res))
+                setStatus("Daily error: " .. tostring(res))
             elseif res == "done" then
-                bountyDone = true
-                if CONFIG.stopWhenDone and not CONFIG.dailyTraitFarm then
-                    setStatus("No trait-reroll bounties left - stopped.")
-                    notify("Auto Bounty", "No trait bounties left. Done.", "success")
+                if CONFIG.dailyStopWhenDone then
+                    setStatus("All daily trait caps filled - stopped.")
+                    notify("Anime Squadron", "Every daily trait cap is full. Done.", "success")
                     setEnabled(false)
                     break
                 end
             end
+        elseif not (CONFIG.autoDailyChallenge or CONFIG.autoRegularChallenge or CONFIG.autoAwakening) then
+            setStatus("Enable Challenges, Awakening, and/or Daily Trait Farm to start.")
+            task.wait(2)
         end
-
-        if CONFIG.dailyTraitFarm and alive() and CONFIG.enabled then
-            local ok2, res2 = pcall(dailyTraitStep)
-            if not ok2 then
-                setStatus("Daily error: " .. tostring(res2))
-            elseif res2 == "done" then
-                dailyDone = true
-                if CONFIG.dailyStopWhenDone and (not CONFIG.bountyFarm or bountyDone) then
-                    setEnabled(false)
-                    break
-                end
-            end
-        end
-
-        if CONFIG.bountyFarm and CONFIG.dailyTraitFarm and bountyDone and dailyDone then
-            setStatus("Bounty + daily trait caps all done - stopped.")
-            notify("Auto Bounty", "Nothing left to farm. Done.", "success")
-            setEnabled(false)
-            break
-        end
-
         task.wait(CONFIG.loopDelay)
     end
     _looping = false
@@ -1699,49 +2028,48 @@ function setEnabled(on)
     if _inSetEnabled then return end
     if CONFIG.enabled == on then
         Session.running = on
-        AB.enabled = on
+        AS.enabled = on
         return
     end
     _inSetEnabled = true
     CONFIG.enabled = on
-    AB.enabled = CONFIG.enabled
+    AS.enabled = CONFIG.enabled
     Session.running = CONFIG.enabled
+    persistMasterToggleImmediate()
     pcall(saveSettings)
-    if canFile and canFile() then
-        pcall(function() writefile("AutoBounty_session.json", HttpService:JSONEncode(Session)) end)
+    if canFile() then
+        pcall(function() writefile(SESSION_FILE, HttpService:JSONEncode(Session)) end)
     end
     if CONFIG.enabled then addThread(mainLoop) end
     _inSetEnabled = false
 end
 
--- remember/forget the bounty we are currently farming (persists across teleport)
-function rememberBounty(b)
-    if not b then return end
-    local s = Session.bounty
-    if not s or s.id ~= b.id then
-        -- new target: start at the configured act, will auto-cycle if no enemy
-        s = { id = b.id, runs = 0, act = CONFIG.act, actsTried = 0,
-              foundAct = false, failRuns = 0, lastLaunchProgress = nil }
-    end
-    s.world    = b.world
-    s.enemy    = b.enemy
-    s.required = b.required
-    s.progress = b.progress
-    Session.bounty = s
-    if saveSession then saveSession() end
-end
-function forgetBounty()
-    Session.bounty = nil
-    if saveSession then saveSession() end
-end
-
 -- ============================================================
 -- Settings persistence (JSON, debounced)
 -- ============================================================
-local SETTINGS_FILE = "AutoBounty_settings.json"
+local SETTINGS_FILE = "AnimeSquadron_settings.json"
+local LEGACY_SETTINGS_FILE = "AutoBounty_settings.json"
 local function canFile()
     return (writefile and readfile and isfile) and true or false
 end
+local function persistMasterToggleImmediate()
+    if not canFile() then return end
+    local data = {}
+    local path = SETTINGS_FILE
+    if not isfile(path) and isfile(LEGACY_SETTINGS_FILE) then
+        path = LEGACY_SETTINGS_FILE
+    end
+    if isfile(path) then
+        local ok, raw = pcall(readfile, path)
+        if ok and raw then
+            local ok2, d = pcall(function() return HttpService:JSONDecode(raw) end)
+            if ok2 and type(d) == "table" then data = d end
+        end
+    end
+    data.enabled = CONFIG.enabled == true
+    pcall(function() writefile(SETTINGS_FILE, HttpService:JSONEncode(data)) end)
+end
+
 local _saveQueued = false
 local function saveSettings()
     if not canFile() then return end
@@ -1752,51 +2080,45 @@ local function saveSettings()
         _saveQueued = false
         local data = {
             enabled          = CONFIG.enabled,
-            act              = CONFIG.act,
-            difficulty       = CONFIG.difficulty,
             soloOnly         = CONFIG.soloOnly,
-            declineNonTrait  = CONFIG.declineNonTrait,
-            useRefreshTicket = CONFIG.useRefreshTicket,
-            stopWhenDone     = CONFIG.stopWhenDone,
             scriptUrl        = CONFIG.scriptUrl,
             autoExecute      = CONFIG.autoExecute,
             autoexecInstall  = CONFIG.autoexecInstall,
             antiAfk          = CONFIG.antiAfk,
-            liveKills        = CONFIG.liveKills,
-            leaveWhenDone    = CONFIG.leaveWhenDone,
             dailyTraitFarm   = CONFIG.dailyTraitFarm,
-            bountyFarm       = CONFIG.bountyFarm,
             dailyDifficulty  = CONFIG.dailyDifficulty,
             dailyStopWhenDone = CONFIG.dailyStopWhenDone,
             dailyPriorityOrder   = CONFIG.dailyPriorityOrder,
             dailyPriorityEnabled = CONFIG.dailyPriorityEnabled,
             dpsMeter          = CONFIG.dpsMeter,
+            autoDailyChallenge   = CONFIG.autoDailyChallenge,
+            autoRegularChallenge = CONFIG.autoRegularChallenge,
+            challengeDone        = CONFIG.challengeDone,
+            autoAwakening        = CONFIG.autoAwakening,
+            awakeningUnit        = CONFIG.awakeningUnit,
+            awakeningDifficulty  = CONFIG.awakeningDifficulty,
+            awakeningStallRuns   = CONFIG.awakeningStallRuns,
         }
         pcall(function() writefile(SETTINGS_FILE, HttpService:JSONEncode(data)) end)
     end)
 end
 local function loadSettings()
     if not canFile() then return end
-    if not isfile(SETTINGS_FILE) then return end
-    local ok, raw = pcall(readfile, SETTINGS_FILE)
+    local path = SETTINGS_FILE
+    if not isfile(path) and isfile(LEGACY_SETTINGS_FILE) then
+        path = LEGACY_SETTINGS_FILE
+    end
+    if not isfile(path) then return end
+    local ok, raw = pcall(readfile, path)
     if not ok or not raw then return end
     local ok2, data = pcall(function() return HttpService:JSONDecode(raw) end)
     if not ok2 or type(data) ~= "table" then return end
     if data.enabled ~= nil then CONFIG.enabled = data.enabled == true end
-    CONFIG.act              = math.clamp(tonumber(data.act) or CONFIG.act, 1, 7)
-    if data.difficulty == "Normal" or data.difficulty == "Hard" then CONFIG.difficulty = data.difficulty end
-    CONFIG.soloOnly         = data.soloOnly == true
-    CONFIG.declineNonTrait  = data.declineNonTrait == true
-    CONFIG.useRefreshTicket = data.useRefreshTicket == true
-    CONFIG.stopWhenDone     = data.stopWhenDone == true
-    -- default these to true when missing from an older settings file
+    if data.soloOnly ~= nil then CONFIG.soloOnly = data.soloOnly == true end
     if data.autoExecute ~= nil then CONFIG.autoExecute = data.autoExecute == true end
     if data.autoexecInstall ~= nil then CONFIG.autoexecInstall = data.autoexecInstall == true end
     if data.antiAfk ~= nil then CONFIG.antiAfk = data.antiAfk == true end
-    if data.liveKills ~= nil then CONFIG.liveKills = data.liveKills == true end
-    if data.leaveWhenDone ~= nil then CONFIG.leaveWhenDone = data.leaveWhenDone == true end
     if data.dailyTraitFarm ~= nil then CONFIG.dailyTraitFarm = data.dailyTraitFarm == true end
-    if data.bountyFarm ~= nil then CONFIG.bountyFarm = data.bountyFarm == true end
     if data.dailyDifficulty == "Normal" or data.dailyDifficulty == "Hard" then
         CONFIG.dailyDifficulty = data.dailyDifficulty
     end
@@ -1808,13 +2130,30 @@ local function loadSettings()
         end
     end
     if data.dpsMeter ~= nil then CONFIG.dpsMeter = data.dpsMeter == true end
+    if data.autoDailyChallenge ~= nil then CONFIG.autoDailyChallenge = data.autoDailyChallenge == true end
+    if data.autoRegularChallenge ~= nil then CONFIG.autoRegularChallenge = data.autoRegularChallenge == true end
+    if type(data.challengeDone) == "table" then
+        CONFIG.challengeDone = {}
+        for k, v in pairs(data.challengeDone) do
+            CONFIG.challengeDone[k] = tonumber(v)
+        end
+    end
+    if data.autoAwakening ~= nil then CONFIG.autoAwakening = data.autoAwakening == true end
+    if type(data.awakeningUnit) == "string" then CONFIG.awakeningUnit = data.awakeningUnit end
+    if data.awakeningDifficulty == "Normal" or data.awakeningDifficulty == "Hard" then
+        CONFIG.awakeningDifficulty = data.awakeningDifficulty
+    end
+    if data.awakeningStallRuns ~= nil then
+        CONFIG.awakeningStallRuns = math.clamp(tonumber(data.awakeningStallRuns) or 4, 1, 20)
+    end
     if type(data.scriptUrl) == "string" and data.scriptUrl ~= "" then CONFIG.scriptUrl = data.scriptUrl end
 end
 loadSettings()
 ensureDailyPriorityConfig()
 
 -- ----- session memory (survives teleports) -----
-local SESSION_FILE = "AutoBounty_session.json"
+SESSION_FILE = "AnimeSquadron_session.json"
+local LEGACY_SESSION_FILE = "AutoBounty_session.json"
 local _sessionSaveQueued = false
 saveSession = function()
     if not canFile() then return end
@@ -1827,35 +2166,56 @@ saveSession = function()
     end)
 end
 local function loadSession()
-    if not canFile() or not isfile(SESSION_FILE) then return end
-    local ok, raw = pcall(readfile, SESSION_FILE)
+    if not canFile() then return end
+    local path = SESSION_FILE
+    if not isfile(path) and isfile(LEGACY_SESSION_FILE) then
+        path = LEGACY_SESSION_FILE
+    end
+    if not isfile(path) then return end
+    local ok, raw = pcall(readfile, path)
     if not ok or not raw then return end
     local ok2, data = pcall(function() return HttpService:JSONDecode(raw) end)
     if ok2 and type(data) == "table" then
-        Session.running = data.running == true
-        if type(data.bounty) == "table" and data.bounty.id then
-            Session.bounty = data.bounty
-        end
         if type(data.dailyFarm) == "table" then
             Session.dailyFarm = data.dailyFarm
+        end
+        if type(data.challengeFarm) == "table" then
+            Session.challengeFarm = data.challengeFarm
+        end
+        if type(data.awakeningFarm) == "table" then
+            Session.awakeningFarm = data.awakeningFarm
         end
     end
 end
 loadSession()
--- resume master toggle: session file + settings + in-memory AB (same-place re-exec)
-CONFIG.enabled = (Session.running == true) or (CONFIG.enabled == true) or (AB.enabled == true)
-if CONFIG.enabled then
-    Session.running = true
-    AB.enabled = true
-end
+AS.challengeDoneSession = AS.challengeDoneSession or {}
+-- Master toggle comes ONLY from settings (not session.running / AS.enabled OR chain)
+Session.running = CONFIG.enabled == true
+AS.enabled = CONFIG.enabled == true
 
 -- ============================================================
 -- Teleport + reconnect persistence
 -- queue_on_teleport = in-game teleports (lobby <-> raid)
 -- autoexec loader   = full disconnect / Roblox reconnect button
 -- ============================================================
-local QUEUE_ARM_FILE = "AutoBounty_queue_arm.json"
-local LOCAL_SCRIPT   = "AutoBounty.lua"
+local QUEUE_ARM_FILE = "AnimeSquadron_queue_arm.json"
+local LEGACY_QUEUE_ARM_FILE = "AutoBounty_queue_arm.json"
+local LOCAL_SCRIPT = "AnimeSquadron.lua"
+local LEGACY_LOCAL_SCRIPT = "AutoBounty.lua"
+
+local LOCAL_LOAD_SNIPPET = [[
+    local function loadLocalScript()
+        local names = { "AnimeSquadron.lua", "AutoBounty.lua" }
+        if readfile and isfile then
+            for _, name in ipairs(names) do
+                if isfile(name) then
+                    local ok, loc = pcall(readfile, name)
+                    if ok and loc and #loc > 1000 then return loc end
+                end
+            end
+        end
+    end
+]]
 
 local function getQueueFn()
     return (syn and syn.queue_on_teleport)
@@ -1881,14 +2241,13 @@ local function markQueueArmed()
     end)
 end
 
--- compact loader injected into queue_on_teleport (runs after teleport)
 local function buildQueuePayload(url)
     return ([[
--- Auto Bounty teleport loader
-if _G.AB_TP_BOOT and (tick() - _G.AB_TP_BOOT) < 8 then return end
-_G.AB_TP_BOOT = tick()
+-- Anime Squadron teleport loader
+if _G.AS_TP_BOOT and (tick() - _G.AS_TP_BOOT) < 8 then return end
+_G.AS_TP_BOOT = tick()
 local _u = %q
-local function abGet(u)
+local function asGet(u)
     local ok, s = pcall(function() return game:HttpGet(u) end)
     if ok and s and #s > 500 then return s end
     local req = (syn and syn.request) or request or http_request or (http and http.request)
@@ -1897,28 +2256,25 @@ local function abGet(u)
         if ok2 and r and #r > 500 then return r end
     end
 end
+%s
 task.defer(function()
     if not game:IsLoaded() then pcall(function() game.Loaded:Wait() end) end
     task.wait(0.6)
-    local src
-    if readfile and isfile and isfile("AutoBounty.lua") then
-        local ok, loc = pcall(readfile, "AutoBounty.lua")
-        if ok and loc and #loc > 1000 then src = loc end
-    end
-    if not src then src = abGet(_u) end
+    local src = loadLocalScript()
+    if not src then src = asGet(_u) end
     if src then pcall(function() loadstring(src)() end) end
 end)
-]]):format(url)
+]]):format(url, LOCAL_LOAD_SNIPPET)
 end
 
 local function buildReconnectLoader(url)
     local gid = tostring(game.GameId)
     return ([[
--- Auto Bounty reconnect loader (auto-generated)
+-- Anime Squadron reconnect loader (auto-generated)
 if tostring(game.GameId) ~= %q then return end
-if _G.AB_TP_BOOT and (tick() - _G.AB_TP_BOOT) < 8 then return end
+if _G.AS_TP_BOOT and (tick() - _G.AS_TP_BOOT) < 8 then return end
 local _u = %q
-local function abGet(u)
+local function asGet(u)
     local ok, s = pcall(function() return game:HttpGet(u) end)
     if ok and s and #s > 500 then return s end
     local req = (syn and syn.request) or request or http_request or (http and http.request)
@@ -1927,32 +2283,30 @@ local function abGet(u)
         if ok2 and r and #r > 500 then return r end
     end
 end
+%s
 task.defer(function()
     if not game:IsLoaded() then pcall(function() game.Loaded:Wait() end) end
     task.wait(0.8)
-    if _G.AB_TP_BOOT and (tick() - _G.AB_TP_BOOT) < 8 then return end
-    if _G.AB_BootAt and (tick() - _G.AB_BootAt) < 5 then return end
+    if _G.AS_TP_BOOT and (tick() - _G.AS_TP_BOOT) < 8 then return end
+    if _G.AS_BootAt and (tick() - _G.AS_BootAt) < 5 then return end
     local HS = game:GetService("HttpService")
-    local arm = "AutoBounty_queue_arm.json"
-    if readfile and isfile and isfile(arm) then
-        local ok, r = pcall(readfile, arm)
-        if ok and r and r ~= "" then
-            local ok2, d = pcall(function() return HS:JSONDecode(r) end)
-            if ok2 and d and d.job == game.JobId and os.time() - (tonumber(d.ts) or 0) < 20 then
-                return
+    for _, arm in ipairs({ "AnimeSquadron_queue_arm.json", "AutoBounty_queue_arm.json" }) do
+        if readfile and isfile and isfile(arm) then
+            local ok, r = pcall(readfile, arm)
+            if ok and r and r ~= "" then
+                local ok2, d = pcall(function() return HS:JSONDecode(r) end)
+                if ok2 and d and d.job == game.JobId and os.time() - (tonumber(d.ts) or 0) < 20 then
+                    return
+                end
             end
         end
     end
-    _G.AB_TP_BOOT = tick()
-    local src
-    if readfile and isfile and isfile("AutoBounty.lua") then
-        local ok, loc = pcall(readfile, "AutoBounty.lua")
-        if ok and loc and #loc > 1000 then src = loc end
-    end
-    if not src then src = abGet(_u) end
+    _G.AS_TP_BOOT = tick()
+    local src = loadLocalScript()
+    if not src then src = asGet(_u) end
     if src then pcall(function() loadstring(src)() end) end
 end)
-]]):format(gid, url)
+]]):format(gid, url, LOCAL_LOAD_SNIPPET)
 end
 
 local function installReconnectLoader()
@@ -1962,12 +2316,14 @@ local function installReconnectLoader()
     if type(writefile) ~= "function" then return false end
     local loader = buildReconnectLoader(url)
     local targets = {
+        "autoexec/AnimeSquadron.lua",
+        "autoexec/animesquadron.lua",
+        "../autoexec/AnimeSquadron.lua",
+        "../autoexec/animesquadron.lua",
+        "auto_exec/AnimeSquadron.lua",
+        "Autoexec/AnimeSquadron.lua",
         "autoexec/AutoBounty.lua",
-        "autoexec/autobounty.lua",
         "../autoexec/AutoBounty.lua",
-        "../autoexec/autobounty.lua",
-        "auto_exec/AutoBounty.lua",
-        "Autoexec/AutoBounty.lua",
     }
     local wrote = false
     for _, path in ipairs(targets) do
@@ -1982,17 +2338,18 @@ local function installReconnectLoader()
         end)
         if ok then wrote = true end
     end
-    AB._autoexecPaths = targets
+    AS._autoexecPaths = targets
     return wrote
 end
 
 local function uninstallReconnectLoader()
     if type(delfile) ~= "function" then return false end
     local any = false
-    for _, path in ipairs(AB._autoexecPaths or {
-        "autoexec/AutoBounty.lua", "autoexec/autobounty.lua",
-        "../autoexec/AutoBounty.lua", "../autoexec/autobounty.lua",
-        "auto_exec/AutoBounty.lua", "Autoexec/AutoBounty.lua",
+    for _, path in ipairs(AS._autoexecPaths or {
+        "autoexec/AnimeSquadron.lua", "autoexec/animesquadron.lua",
+        "../autoexec/AnimeSquadron.lua", "../autoexec/animesquadron.lua",
+        "auto_exec/AnimeSquadron.lua", "Autoexec/AnimeSquadron.lua",
+        "autoexec/AutoBounty.lua", "../autoexec/AutoBounty.lua",
     }) do
         pcall(function()
             if type(isfile) == "function" and isfile(path) then
@@ -2010,15 +2367,15 @@ armReexec = function()
     if type(url) ~= "string" or url == "" then return false end
     local q = getQueueFn()
     if not q then
-        if not AB._queueWarned then
-            AB._queueWarned = true
-            warn("[Auto Bounty] queue_on_teleport missing — enable reconnect loader or use Misc > Re-arm")
+        if not AS._queueWarned then
+            AS._queueWarned = true
+            warn("[Anime Squadron] queue_on_teleport missing — enable reconnect loader or use Misc > Re-arm")
         end
         return false
     end
     local now = tick()
-    if AB._lastQueue and (now - AB._lastQueue) < 1.5 then return true end
-    AB._lastQueue = now
+    if AS._lastQueue and (now - AS._lastQueue) < 1.5 then return true end
+    AS._lastQueue = now
     markQueueArmed()
     pcall(q, buildQueuePayload(url))
     return true
@@ -2182,90 +2539,6 @@ local function startAntiAFK()
     end)
 end
 startAntiAFK()
-
--- ============================================================
--- Live in-stage elimination tracker (Story/battle place)
--- The bounty board doesn't exist in Story mode, so we count the bounty enemy's
--- deaths directly: any Model named like the enemy with a Humanoid that Dies = 1
--- kill. This is a live readout; the server still credits the real bounty count
--- (reconciled in the lobby). Solo room => every kill is yours.
--- ============================================================
-local function norm(s) return tostring(s):lower():gsub("%s+", "") end
--- This is exactly how the game itself registers a kill on the client: the enemy
--- is a Model in workspace.Characters tagged with attribute type=="Enemies", and
--- when it dies the server's "destroy" event makes the client Destroy that model
--- -> fires ChildRemoved. We listen to the SAME removal and count it for the
--- bounty enemy. Works whether the stage is in-place or a separate place, and we
--- never depend on lobby detection (which can stay true during in-place battles).
-local function isTargetEnemy(m)
-    local enemy = Session.bounty and Session.bounty.enemy
-    if not enemy then return false end
-    if not (m and m:IsA("Model")) then return false end
-    local ok, t = pcall(function() return m:GetAttribute("type") end)
-    if not ok or t ~= "Enemies" then return false end
-    return norm(m.Name) == norm(enemy)
-end
-local function startKillTracker()
-    local bound = setmetatable({}, { __mode = "k" })
-    local function bind(container)
-        if not container or bound[container] then return end
-        bound[container] = true
-        addConn(container.ChildRemoved:Connect(function(m)
-            if CONFIG.liveKills and isTargetEnemy(m) then
-                Session.runKills = (Session.runKills or 0) + 1
-            end
-        end))
-    end
-    local existing = workspace:FindFirstChild("Characters")
-    if existing then bind(existing) end
-    -- workspace.Characters may be (re)created per place/stage - rebind on add
-    addConn(workspace.ChildAdded:Connect(function(c)
-        if c.Name == "Characters" then bind(c) end
-    end))
-
-    addThread(function()
-        local warned = false
-        while alive() do
-            -- leave the stage the moment the target is met, so we return to the
-            -- lobby to claim + accept the next one. Fires once per run (AB._leftRun),
-            -- and self-disables (AB._noEarlyLeave) if it turns out the server only
-            -- banks progress on stage completion (see step()).
-            if CONFIG.leaveWhenDone and not AB._noEarlyLeave and not AB._leftRun
-                and Session.bounty and Session.bounty.required then
-                local total = (Session.bounty.progress or 0) + (Session.runKills or 0)
-                if (Session.runKills or 0) > 0 and total >= Session.bounty.required then
-                    AB._leftRun = true
-                    AB._earlyLeft = true
-                    setStatus("Target reached in-stage - leaving to claim...")
-                    leaveStage()
-                end
-            end
-            -- diagnostic: bounty active, enemies present, but none match the name
-            if not warned and Session.bounty and Session.bounty.enemy then
-                local c = workspace:FindFirstChild("Characters")
-                if c then
-                    local target, names, seen, found, anyEnemy = norm(Session.bounty.enemy), {}, {}, false, false
-                    for _, m in ipairs(c:GetChildren()) do
-                        local ok, t = pcall(function() return m:GetAttribute("type") end)
-                        if ok and t == "Enemies" and m:IsA("Model") then
-                            anyEnemy = true
-                            if norm(m.Name) == target then found = true end
-                            if not seen[m.Name] then seen[m.Name] = true; names[#names + 1] = m.Name end
-                        end
-                    end
-                    if anyEnemy and not found then
-                        warned = true
-                        warn("[Auto Bounty] Bounty enemy is '" .. tostring(Session.bounty.enemy) ..
-                            "' but enemies present are: " .. table.concat(names, ", ") ..
-                            ". Tell me the right one if the live count stays 0.")
-                    end
-                end
-            end
-            task.wait(1)
-        end
-    end)
-end
-startKillTracker()
 startDpsTracker()
 
 -- independent cap watcher — leaves mid-raid even if main loop is blocked
@@ -2273,7 +2546,7 @@ local function startDailyCapWatcher()
     addThread(function()
         local lastTry = 0
         while alive() do
-            if CONFIG.enabled and CONFIG.dailyTraitFarm and inBattle() then
+            if CONFIG.enabled and CONFIG.dailyTraitFarm and inBattle() and not Session.challengeFarm and not Session.awakeningFarm then
                 refreshPlayerData()
                 local map = resolveDailyMap()
                 if map and (isTraitCapMaxed(map) or shouldSkipMapAfterCapLeave(map)) then
@@ -2322,58 +2595,159 @@ local function refreshDailyCapLabels()
         setLabel(statusLabels.dailyCaps, "Priority caps: " .. table.concat(parts, " | "))
     end
 end
+
+local function refreshAwakeningLabels()
+    local unitName = CONFIG.awakeningUnit
+    if unitName == "" then
+        setLabel(statusLabels.awakenUnit, "Unit: none selected")
+        setLabel(statusLabels.awakenReqs, "Requirements: -")
+        setLabel(statusLabels.awakenFarm, "Farm target: -")
+        return
+    end
+    local unit = findOwnedUnitByName(unitName)
+    if not unit then
+        setLabel(statusLabels.awakenUnit, "Unit: " .. unitName .. " (not owned)")
+        setLabel(statusLabels.awakenReqs, "Requirements: -")
+        setLabel(statusLabels.awakenFarm, "Farm target: -")
+        return
+    end
+    setLabel(statusLabels.awakenUnit, "Unit: " .. unit.name .. " (id " .. tostring(unit.id) .. ")")
+    local missing = getMissingAwakeningReqs(unit.name)
+    if #missing == 0 then
+        setLabel(statusLabels.awakenReqs, "Requirements: ALL MET — ready to awaken")
+    else
+        local parts = {}
+        for _, m in ipairs(missing) do
+            parts[#parts + 1] = m.item .. " " .. m.have .. "/" .. m.need
+        end
+        setLabel(statusLabels.awakenReqs, "Missing: " .. table.concat(parts, " | "))
+    end
+    local af = Session.awakeningFarm
+    if af and af.world and af.mode then
+        setLabel(statusLabels.awakenFarm, ("Farming: %s %s Act %d for %s"):format(
+            af.mode, af.world, af.act or 0, af.item or "?"))
+    elseif af and af.quest then
+        setLabel(statusLabels.awakenFarm, "Special quest: " .. tostring(af.quest))
+    else
+        setLabel(statusLabels.awakenFarm, "Farm target: idle in lobby")
+    end
+end
+
+local function refreshChallengeLabels()
+    local dayT, halfT = getChallengeTimers()
+    setLabel(statusLabels.chTimers, ("Reset timers: Daily %s | Regular %s")
+        :format(fmtChallengeTimer(dayT), fmtChallengeTimer(halfT)))
+
+    local chs = getRotatingChallenges()
+    syncChallengeDoneFlags(chs)
+
+    for _, key in ipairs(CHALLENGE_ORDER) do
+        local lbl = (key == "1d") and statusLabels.chDaily or statusLabels.chRegular
+        if lbl then
+        local name = CHALLENGE_NAMES[key] or key
+        local ch = chs[key]
+        local enabled = isChallengeEnabled(key)
+        if not enabled then
+            setLabel(lbl, name .. ": disabled")
+        elseif type(ch) == "table" and ch.world then
+            local done = AS.challengeDoneSession and AS.challengeDoneSession[key]
+            setLabel(lbl, name .. ": " .. ch.world .. " Act " .. tostring(ch.act)
+                .. (done and " (done this cycle)" or " (ready)"))
+        else
+            setLabel(lbl, name .. ": done / on cooldown")
+        end
+        end
+    end
+end
+
 local function buildUI()
     if not Lib then return end
-    Win = Lib:Window({ title = "Auto Bounty  v" .. VERSION })
+    Win = Lib:Window({ title = "Anime Squadron  v" .. VERSION })
 
     -- ----- Main tab -----
-    local Main = Win:Tab("⚔️", "Bounty")
+    local Main = Win:Tab("🏠", "Main")
     Main:Section("Automation")
 
-    local masterToggle = Main:Toggle("Enable (master)",
-        "Master on/off for all automation loops", CONFIG.enabled, function(on)
+    Main:Toggle("Enable (master)",
+        "Master on/off for all automation", CONFIG.enabled, function(on)
             setEnabled(on)
         end)
 
-    Main:Toggle("Auto Bounty",
-        "Accept trait bounties, farm, claim, repeat", CONFIG.bountyFarm, function(on)
-            CONFIG.bountyFarm = on; saveSettings()
-        end)
-
     Main:Toggle("Auto Daily Trait Farm",
-        "Farm every map with daily Trait Shard caps until maxed", CONFIG.dailyTraitFarm, function(on)
+        "Farm priority maps with daily Trait Shard caps until maxed", CONFIG.dailyTraitFarm, function(on)
             CONFIG.dailyTraitFarm = on; saveSettings()
         end)
 
-    Main:Toggle("Decline non-trait bounties",
-        "Clear bounties that don't reward Trait Shards", CONFIG.declineNonTrait, function(on)
-            CONFIG.declineNonTrait = on; saveSettings()
-        end)
-
     Main:Toggle("Solo room (friends only)",
-        "Run the stage alone", CONFIG.soloOnly, function(on)
+        "Run stages alone (traits + challenges)", CONFIG.soloOnly, function(on)
             CONFIG.soloOnly = on; saveSettings()
         end)
 
-    Main:Toggle("Use tickets when none left",
-        "Spend bounty tickets to roll new bounties", CONFIG.useRefreshTicket, function(on)
-            CONFIG.useRefreshTicket = on; saveSettings()
+    -- ----- Challenges tab -----
+    local Ch = Win:Tab("⚔️", "Challenges")
+    Ch:Section("Rotating challenges (once per reset)")
+    Ch:Toggle("Auto Daily Challenge [1d]",
+        "Clear the daily challenge once before it resets", CONFIG.autoDailyChallenge, function(on)
+            CONFIG.autoDailyChallenge = on; saveSettings()
+        end)
+    Ch:Toggle("Auto Regular Challenge [30m]",
+        "Clear the regular challenge once before it resets", CONFIG.autoRegularChallenge, function(on)
+            CONFIG.autoRegularChallenge = on; saveSettings()
+        end)
+    Ch:Label("Challenges run before daily trait farming until both are cleared.")
+    Ch:Section("Live status")
+    statusLabels.chDaily   = Ch:Label("Daily [1d]: -")
+    statusLabels.chRegular = Ch:Label("Regular [30m]: -")
+    statusLabels.chTimers  = Ch:Label("Reset timers: -")
+
+    task.defer(refreshChallengeLabels)
+
+    -- ----- Awakening tab -----
+    local Aw = Win:Tab("✨", "Awakening")
+    Aw:Section("Auto farm awakening materials")
+    Aw:Toggle("Auto Awakening",
+        "Farm missing materials and awaken the selected unit", CONFIG.autoAwakening, function(on)
+            CONFIG.autoAwakening = on; saveSettings()
+        end)
+    Aw:Label("Priority: challenges → awakening → daily traits.")
+
+    local function getAwakenUnitNames()
+        local units = getOwnedAwakenableUnits()
+        local names = {}
+        for _, u in ipairs(units) do names[#names + 1] = u.name end
+        if #names == 0 then names[1] = "(no awakenable units)" end
+        return names
+    end
+
+    local unitNames = getAwakenUnitNames()
+    local unitIdx = 1
+    for i, n in ipairs(unitNames) do
+        if n == CONFIG.awakeningUnit then unitIdx = i break end
+    end
+    Aw:Dropdown("Target unit", "Owned unit to awaken", unitNames, unitIdx, function(opt)
+        if opt and opt ~= "(no awakenable units)" then
+            CONFIG.awakeningUnit = opt
+            saveSettings()
+            pcall(refreshAwakeningLabels)
+        end
+    end)
+
+    Aw:Dropdown("Farm difficulty", "Difficulty for awakening farm maps", { "Normal", "Hard" },
+        (CONFIG.awakeningDifficulty == "Hard") and 2 or 1, function(opt)
+            CONFIG.awakeningDifficulty = opt; saveSettings()
         end)
 
-    Main:Toggle("Auto-stop when finished",
-        "Stop once no trait bounties remain", CONFIG.stopWhenDone, function(on)
-            CONFIG.stopWhenDone = on; saveSettings()
-        end)
+    Aw:Button("↺", "Refresh", "Rescan units and requirement progress", nil, function()
+        refreshPlayerData()
+        pcall(refreshAwakeningLabels)
+        notify("Awakening", "Requirements refreshed.", "info")
+    end)
 
-    Main:Section("Stage")
-    Main:Slider("Story Act", "Act to farm the bounty enemy",
-        { min = 1, max = 7, default = CONFIG.act }, function(v)
-            CONFIG.act = math.floor(v); saveSettings()
-        end)
-    Main:Dropdown("Difficulty", "Story difficulty", { "Normal", "Hard" },
-        (CONFIG.difficulty == "Hard") and 2 or 1, function(opt)
-            CONFIG.difficulty = opt; saveSettings()
-        end)
+    Aw:Section("Live status")
+    statusLabels.awakenUnit = Aw:Label("Unit: -")
+    statusLabels.awakenReqs = Aw:Label("Requirements: -")
+    statusLabels.awakenFarm = Aw:Label("Farm target: -")
+    task.defer(refreshAwakeningLabels)
 
     -- ----- Daily Traits tab -----
     local Daily = Win:Tab("🌀", "Daily Traits")
@@ -2456,14 +2830,8 @@ local function buildUI()
     local St = Win:Tab("📊", "Status")
     St:Label("Version: v" .. VERSION)
     St:Section("Live")
-    statusLabels.place   = St:Label("Place: -")
-    statusLabels.tickets = St:Label("Tickets: -")
-    statusLabels.active  = St:Label("Active bounty: -")
-    statusLabels.trait   = St:Label("Trait bounties available: -")
-    statusLabels.board   = St:Label("Board: -")
-    St:Section("Remembered (survives Story teleport)")
-    statusLabels.memory  = St:Label("Target: none")
-    statusLabels.kills   = St:Label("Live kills this run: -")
+    statusLabels.place = St:Label("Place: -")
+    statusLabels.automation = St:Label("Automation: -")
 
     -- ----- DPS tab -----
     local DpsTab = Win:Tab("📈", "DPS")
@@ -2525,17 +2893,8 @@ local function buildUI()
             end
         end)
     Misc:Label((type(writefile) == "function")
-        and "Reconnect: loads workspace/AutoBounty.lua first, then Script URL"
+        and "Reconnect: loads AnimeSquadron.lua / AutoBounty.lua, then Script URL"
         or  "Reconnect: unavailable (no writefile) ✗")
-
-    Misc:Toggle("Live kill counter (in Story)",
-        "Count the bounty enemy's kills during the stage", CONFIG.liveKills, function(on)
-            CONFIG.liveKills = on; saveSettings()
-        end)
-    Misc:Toggle("Leave stage when target met",
-        "Exit to lobby the instant kills hit the goal, then claim + accept next", CONFIG.leaveWhenDone, function(on)
-            CONFIG.leaveWhenDone = on; AB._noEarlyLeave = false; saveSettings()
-        end)
 
     Misc:Section("Actions")
     Misc:Button("💾", "Save Settings", "Write settings to file", nil, function()
@@ -2571,54 +2930,19 @@ addThread(function()
         if next(statusLabels) then
             local lobby = inLobby()
             pcall(function() statusLabels.place.Set("Place: " .. (lobby and "Lobby" or "Battle/Loading")) end)
-            -- remembered target works in Story mode too (read from disk-backed Session)
             pcall(function()
-                local sb = Session.bounty
-                if sb then
-                    statusLabels.memory.Set(("Target: %s Act %s | %s | %s/%s | runs %d")
-                        :format(sb.world or "?", tostring(sb.act or CONFIG.act),
-                            sb.enemy or "?",
-                            tostring(sb.progress or 0), tostring(sb.required or 0),
-                            sb.runs or 0))
-                else
-                    statusLabels.memory.Set("Target: none")
-                end
+                local parts = {}
+                if CONFIG.enabled then parts[#parts + 1] = "master ON" end
+                if CONFIG.dailyTraitFarm then parts[#parts + 1] = "daily traits ON" end
+                if CONFIG.autoDailyChallenge then parts[#parts + 1] = "daily challenge ON" end
+                if CONFIG.autoRegularChallenge then parts[#parts + 1] = "regular challenge ON" end
+                if CONFIG.autoAwakening then parts[#parts + 1] = "awakening ON" end
+                if #parts == 0 then parts[1] = "idle" end
+                statusLabels.automation.Set("Automation: " .. table.concat(parts, ", "))
             end)
-            pcall(function()
-                local sb = Session.bounty
-                if sb then
-                    local need = "?"
-                    if sb.required then
-                        need = math.max(0, sb.required - (sb.progress or 0) - (Session.runKills or 0))
-                    end
-                    statusLabels.kills.Set(("Live kills this run: %d  (need ~%s more)")
-                        :format(Session.runKills or 0, tostring(need)))
-                else
-                    statusLabels.kills.Set("Live kills this run: -")
-                end
-            end)
-            if lobby then
-                local list = readBounties()
-                local active, traitCount = nil, 0
-                for _, b in ipairs(list) do
-                    if b.active then active = b end
-                    if b.trait then traitCount = traitCount + 1 end
-                end
-                pcall(function() statusLabels.tickets.Set("Tickets: " .. getTickets()) end)
-                pcall(function()
-                    if active then
-                        statusLabels.active.Set(("Active: %s  %d/%d%s")
-                            :format(active.world or "?", active.progress, active.required,
-                                active.trait and " (trait)" or ""))
-                    else
-                        statusLabels.active.Set("Active bounty: none")
-                    end
-                end)
-                pcall(function() statusLabels.trait.Set("Trait bounties available: " .. traitCount) end)
-                pcall(function() statusLabels.board.Set("Board: " .. #list .. " bounties") end)
-            end
-            -- daily trait cap readout (lobby or battle)
             pcall(refreshDailyCapLabels)
+            pcall(refreshChallengeLabels)
+            pcall(refreshAwakeningLabels)
             pcall(refreshDpsLabels)
         end
         task.wait(1)
@@ -2628,7 +2952,7 @@ end)
 -- ============================================================
 -- Register cleanup for the next re-execution, then resume if needed
 -- ============================================================
-AB.cleanup = function()
+AS.cleanup = function()
     pcall(cleanupAll)
     if Win then pcall(function() Win:Destroy() end) end
 end
@@ -2641,10 +2965,10 @@ if CONFIG.enabled then
 end
 
 if CONFIG.enabled then
-    setStatus(("v%s resumed — master ON, automation running."):format(VERSION))
-    notify("Auto Bounty", "Resumed v" .. VERSION .. " (master ON)", "success")
+    setStatus(("v%s resumed — master ON, daily trait farm running."):format(VERSION))
+    notify("Anime Squadron", "Resumed v" .. VERSION .. " (master ON)", "success")
 else
     setStatus(("v%s loaded. Toggle 'Enable (master)' to start."):format(VERSION))
-    notify("Auto Bounty", "Loaded v" .. VERSION, "success")
+    notify("Anime Squadron", "Loaded v" .. VERSION, "success")
 end
-print("[Auto Bounty] loaded v" .. VERSION .. (CONFIG.enabled and " (resumed)" or ""))
+print("[Anime Squadron] loaded v" .. VERSION .. (CONFIG.enabled and " (resumed)" or ""))
