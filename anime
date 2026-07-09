@@ -38,7 +38,7 @@
       data + world rewards), handle special-quest items, then invoke awaken.
 --------------------------------------------------------------------------]]
 
-local VERSION = "2.2.0"   -- bump this each upload so you can confirm the live build
+local VERSION = "2.2.3"   -- bump this each upload so you can confirm the live build
 local NEXUSLIB_URL = "https://raw.githubusercontent.com/headshot7535-png/Nexuslib/main/Nexuslib"
 
 -- ============================================================
@@ -143,6 +143,7 @@ local saveSettings
 local SESSION_FILE
 local setEnabled, mainLoop
 local armReexec
+local persistMasterToggleImmediate
 
 -- ============================================================
 -- Cleanup system
@@ -1106,17 +1107,152 @@ end
 local function syncChallengeDoneFlags(chs)
     if type(CONFIG.challengeDone) ~= "table" then CONFIG.challengeDone = {} end
     AS.challengeDoneSession = AS.challengeDoneSession or {}
+    AS._challengeAvail = AS._challengeAvail or {}
     for _, key in ipairs(CHALLENGE_ORDER) do
-        if chs[key] then
+        local nowAvail = chs[key] ~= nil
+        -- Only clear "done" when a challenge reappears after being unavailable (new reset)
+        if nowAvail and AS._challengeAvail[key] == false then
             CONFIG.challengeDone[key] = nil
             AS.challengeDoneSession[key] = nil
         end
+        AS._challengeAvail[key] = nowAvail
     end
 end
 
 local function isChallengeEnabled(key)
     if key == "1d" then return CONFIG.autoDailyChallenge end
     if key == "30m" then return CONFIG.autoRegularChallenge end
+    return false
+end
+
+local CHALLENGE_DONE_PATTERNS = {
+    "already completed",
+    "already cleared",
+    "already done",
+    "completed!",
+}
+
+local function textIndicatesChallengeDone(txt)
+    if type(txt) ~= "string" or txt == "" then return false end
+    local lower = txt:lower()
+    for _, pat in ipairs(CHALLENGE_DONE_PATTERNS) do
+        if lower:find(pat, 1, true) then return true end
+    end
+    return lower:find("completed", 1, true) ~= nil and lower:find("already", 1, true) ~= nil
+end
+
+local function challengeCapKey(world, act, itemName)
+    local s = ("Challenge %s %s %s"):format(tostring(world), tostring(act), tostring(itemName))
+    return string.lower(s):gsub(" ", "_")
+end
+
+local function getChallengeCapCount(world, act, itemName)
+    local data = getPlayerData()
+    if not data or type(data.caps) ~= "table" then return 0 end
+    local key = challengeCapKey(world, act, itemName)
+    local count = tonumber(data.caps[key]) or 0
+    if count == 0 then
+        local want = key:gsub("_", "")
+        for k, v in pairs(data.caps) do
+            if type(k) == "string" and k:gsub("_", "") == want then
+                count = tonumber(v) or 0
+                break
+            end
+        end
+    end
+    return count
+end
+
+local function areChallengeRewardsCapped(ch)
+    if type(ch) ~= "table" or type(ch.rewards) ~= "table" then return false end
+    local hasCap = false
+    for itemName, itemData in pairs(ch.rewards) do
+        if type(itemData) == "table" and itemData.cap then
+            hasCap = true
+            local cap = tonumber(itemData.cap) or 0
+            if getChallengeCapCount(ch.world, ch.act, itemName) < cap then
+                return false
+            end
+        end
+    end
+    return hasCap
+end
+
+local function scanChallengeGuiCompleted(key)
+    local menus = getMenus()
+    if not menus then return false end
+    local roots = {
+        menus:FindFirstChild("Play"),
+        menus:FindFirstChild("StageInfo"),
+    }
+    for _, root in ipairs(roots) do
+        if root and (root:IsA("GuiObject") and root.Visible) then
+            for _, d in ipairs(root:GetDescendants()) do
+                if d:IsA("TextLabel") or d:IsA("TextButton") then
+                    local t = d.Text
+                    if textIndicatesChallengeDone(t) then return true end
+                end
+            end
+        end
+    end
+    -- Daily/regular challenge world buttons live under Play.Worlds
+    local play = menus:FindFirstChild("Play")
+    local worlds = play and play:FindFirstChild("Worlds")
+    local btn = worlds and worlds:FindFirstChild(key)
+    if btn then
+        for _, d in ipairs(btn:GetDescendants()) do
+            if d:IsA("TextLabel") then
+                if textIndicatesChallengeDone(d.Text) then return true end
+            end
+        end
+    end
+    return false
+end
+
+local function leaveChallengeRoomQuiet()
+    pcall(function() fireR("Play", "leave") end)
+    pcall(function() invokeR("Matchmaking", "leave") end)
+    pcall(function() invokeR("Player", "physical_teleport", "play") end)
+end
+
+local function probeChallengeBlocked(key, ch)
+    if type(ch) ~= "table" or not ch.world or not ch.act then return false end
+    AS.challengeProbeCache = AS.challengeProbeCache or {}
+    local cacheKey = ("%s|%s|%s"):format(key, ch.world, ch.act)
+    if AS.challengeProbeCache[cacheKey] ~= nil then
+        return AS.challengeProbeCache[cacheKey]
+    end
+
+    local current = {
+        world        = ch.world,
+        act          = ch.act,
+        mode         = "Challenge",
+        difficulty   = key,
+        only_friends = CONFIG.soloOnly and true or false,
+    }
+    if type(ch.rewards) == "table" then
+        current.rewards = ch.rewards
+    end
+
+    local okC, sucC, res = invokeR("Play", "create_room", current)
+    if okC and sucC then
+        leaveChallengeRoomQuiet()
+        task.wait(0.4)
+        AS.challengeProbeCache[cacheKey] = false
+        return false
+    end
+
+    local blocked = textIndicatesChallengeDone(tostring(res or sucC or ""))
+    AS.challengeProbeCache[cacheKey] = blocked
+    return blocked
+end
+
+local function isChallengeAlreadyCompleted(key, ch)
+    if AS.challengeDoneSession and AS.challengeDoneSession[key] then return true, "session" end
+    refreshPlayerData()
+    if areChallengeRewardsCapped(ch) then return true, "caps" end
+    if scanChallengeGuiCompleted(key) then return true, "gui" end
+    if probeChallengeBlocked(key, ch) then return true, "probe" end
     return false
 end
 
@@ -1133,7 +1269,12 @@ local function countPendingChallenges()
     syncChallengeDoneFlags(chs)
     local n = 0
     for _, key in ipairs(CHALLENGE_ORDER) do
-        if shouldRunChallenge(key, chs[key]) then n = n + 1 end
+        local ch = chs[key]
+        if isChallengeEnabled(key) and type(ch) == "table" and ch.world then
+            if not isChallengeAlreadyCompleted(key, ch) then
+                n = n + 1
+            end
+        end
     end
     return n
 end
@@ -1162,6 +1303,13 @@ local function markChallengeDone(key)
     AS.challengeDoneSession[key] = true
     if type(CONFIG.challengeDone) ~= "table" then CONFIG.challengeDone = {} end
     CONFIG.challengeDone[key] = os.time()
+    if AS.challengeProbeCache then
+        for ck in pairs(AS.challengeProbeCache) do
+            if ck:sub(1, #key + 1) == (key .. "|") then
+                AS.challengeProbeCache[ck] = true
+            end
+        end
+    end
     saveSettings()
     saveSession()
 end
@@ -1185,12 +1333,26 @@ local function waitForChallengeRun(key, ch)
 
     setStatus(("%s - fighting %s Act %d..."):format(label, ch.world, ch.act))
     local t2 = tick()
-    while alive() and CONFIG.enabled and (not inLobby() or inBattle()) and (tick() - t2) < CONFIG.farmTimeout do
+    local idleSince = nil
+    while alive() and CONFIG.enabled and (tick() - t2) < CONFIG.farmTimeout do
+        if inLobby() and not inBattle() then break end
+        if not inBattle() then
+            idleSince = idleSince or tick()
+            if tick() - idleSince >= 3 then
+                setStatus(label .. " - challenge done, leaving stage...")
+                leaveStage(true)
+                waitForLobbyReturn(45)
+                return true
+            end
+        else
+            idleSince = nil
+        end
         task.wait(1)
     end
 
     if inLobby() and not inBattle() then return true end
-    waitForLobbyReturn(30)
+    leaveStage(true)
+    waitForLobbyReturn(45)
     return true
 end
 
@@ -1200,21 +1362,53 @@ local function challengeStep()
     if not inLobby() then
         local cf = Session.challengeFarm
         if cf then
+            if not inBattle() then
+                AS._challengeIdleAt = AS._challengeIdleAt or tick()
+                if tick() - AS._challengeIdleAt >= 3 then
+                    setStatus("Challenge complete — leaving stage...")
+                    leaveStage(true)
+                    waitForLobbyReturn(45)
+                    AS._challengeIdleAt = nil
+                    return
+                end
+            else
+                AS._challengeIdleAt = nil
+            end
             setStatus(("%s - in %s Act %d, fighting..."):format(
                 CHALLENGE_NAMES[cf.key] or cf.key or "Challenge",
                 cf.world or "?", cf.act or "?"))
         else
+            if not inBattle() then
+                AS._challengeIdleAt = AS._challengeIdleAt or tick()
+                if tick() - AS._challengeIdleAt >= 4 then
+                    setStatus("Challenge - leaving finished stage...")
+                    leaveStage(true)
+                    waitForLobbyReturn(45)
+                    AS._challengeIdleAt = nil
+                end
+            end
             setStatus("Challenge - in stage, waiting to return...")
         end
         return
     end
+    AS._challengeIdleAt = nil
 
     local chs = getRotatingChallenges()
     syncChallengeDoneFlags(chs)
 
     for _, key in ipairs(CHALLENGE_ORDER) do
         local ch = chs[key]
-        if shouldRunChallenge(key, ch) then
+        if not isChallengeEnabled(key) or type(ch) ~= "table" or not ch.world then
+            continue
+        end
+
+        local already, reason = isChallengeAlreadyCompleted(key, ch)
+        if already then
+            if not (AS.challengeDoneSession and AS.challengeDoneSession[key]) then
+                markChallengeDone(key)
+                notify("Challenges", (CHALLENGE_NAMES[key] or key) .. " already completed — skipping.", "info")
+            end
+        else
             local label = CHALLENGE_NAMES[key] or key
             rememberChallenge(key, ch)
             setStatus(("%s: %s Act %d — starting..."):format(label, ch.world, ch.act))
@@ -1222,16 +1416,21 @@ local function challengeStep()
             local ok, err = startMap(ch.world, ch.act, "Challenge", key, ch.rewards)
             if not ok then
                 forgetChallenge()
-                setStatus("Challenge launch failed: " .. tostring(err))
-                task.wait(2)
+                if textIndicatesChallengeDone(tostring(err)) then
+                    markChallengeDone(key)
+                    notify("Challenges", label .. " already completed.", "info")
+                else
+                    setStatus("Challenge launch failed: " .. tostring(err))
+                    task.wait(2)
+                    return
+                end
+            else
+                waitForChallengeRun(key, ch)
+                forgetChallenge()
+                markChallengeDone(key)
+                notify("Challenges", label .. " cleared — " .. ch.world, "success")
                 return
             end
-
-            waitForChallengeRun(key, ch)
-            forgetChallenge()
-            markChallengeDone(key)
-            notify("Challenges", label .. " cleared — " .. ch.world, "success")
-            return
         end
     end
 end
@@ -1268,9 +1467,47 @@ end
 local function getCharacterData(unitName)
     local folder = ReplicatedStorage.Characters:FindFirstChild(unitName)
     if not folder then return nil end
-    local ok, data = pcall(function() return require(folder.data) end)
+    local dataMod = folder:FindFirstChild("data")
+    if not dataMod then return nil end
+    local ok, data = pcall(function() return require(dataMod) end)
     if ok and type(data) == "table" then return data end
     return nil
+end
+
+local AWAKENABLE_NAMES = nil
+local function scanAwakenableCharacterNames()
+    if AWAKENABLE_NAMES then return AWAKENABLE_NAMES end
+    local map = {}
+    local chars = ReplicatedStorage:FindFirstChild("Characters")
+    if chars then
+        for _, child in ipairs(chars:GetChildren()) do
+            local dataMod = child:FindFirstChild("data")
+            if dataMod then
+                local ok, data = pcall(function() return require(dataMod) end)
+                if ok and type(data) == "table"
+                    and type(data.awakening) == "table"
+                    and type(data.awakening.cost) == "table" then
+                    map[child.Name] = true
+                end
+            end
+        end
+    end
+    AWAKENABLE_NAMES = map
+    return map
+end
+
+local function isAwakenableUnitName(unitName)
+    if type(unitName) ~= "string" or unitName == "" then return false, nil end
+    local awakenable = scanAwakenableCharacterNames()
+    if awakenable[unitName] then return true, unitName end
+    local folder = ReplicatedStorage.Characters:FindFirstChild(unitName)
+    if folder then
+        local data = getCharacterData(unitName)
+        if data and type(data.awakening) == "table" and type(data.awakening.cost) == "table" then
+            return true, unitName
+        end
+    end
+    return false, nil
 end
 
 local function getAwakeningCost(unitName)
@@ -1281,29 +1518,90 @@ local function getAwakeningCost(unitName)
     return nil
 end
 
-local function getOwnedAwakenableUnits()
-    local data = getPlayerData()
+local function discoverUnitsFromCharactersGui(seen)
     local list = {}
-    if not data or type(data.characters) ~= "table" then return list end
-    for id, ch in pairs(data.characters) do
-        if type(ch) == "table" and ch.name then
-            local cost = getAwakeningCost(ch.name)
-            if cost then
+    seen = seen or {}
+    local menus = getMenus()
+    local charsFrame = menus and menus:FindFirstChild("Characters")
+    local scroll = charsFrame and charsFrame:FindFirstChild("ScrollingFrame")
+    local awakenable = scanAwakenableCharacterNames()
+    if not scroll then return list end
+
+    for _, child in ipairs(scroll:GetChildren()) do
+        if child:IsA("GuiButton") then
+            local modelName = nil
+            local vp = child:FindFirstChild("ViewportFrame")
+            local wm = vp and vp:FindFirstChildOfClass("WorldModel")
+            if wm then modelName = wm.Name end
+            if not modelName and child:FindFirstChild("UnitName") then
+                modelName = child.UnitName.Text
+            end
+            if modelName and awakenable[modelName] and not seen[modelName] then
+                seen[modelName] = true
                 list[#list + 1] = {
-                    id = id,
-                    name = ch.name,
-                    index = ch.index,
-                    level = ch.level,
+                    id = child.Name,
+                    name = modelName,
+                    index = tonumber(child.Name),
+                    level = nil,
                 }
             end
         end
     end
+    return list
+end
+
+local function getOwnedAwakenableUnits()
+    refreshPlayerData()
+    local data = getPlayerData()
+    local list = {}
+    local seen = {}
+
+    if data and type(data.characters) == "table" then
+        for id, ch in pairs(data.characters) do
+            if type(ch) == "table" and type(ch.name) == "string" and ch.name ~= "" then
+                local ok, folderName = isAwakenableUnitName(ch.name)
+                if ok and folderName and not seen[folderName] then
+                    seen[folderName] = true
+                    list[#list + 1] = {
+                        id = ch.id or id,
+                        name = folderName,
+                        index = ch.index,
+                        level = ch.level,
+                    }
+                end
+            end
+        end
+    end
+
+    if #list == 0 then
+        for _, u in ipairs(discoverUnitsFromCharactersGui(seen)) do
+            list[#list + 1] = u
+        end
+    end
+
     table.sort(list, function(a, b) return tostring(a.name) < tostring(b.name) end)
     return list
 end
 
 local function findOwnedUnitByName(unitName)
     if type(unitName) ~= "string" or unitName == "" then return nil end
+    refreshPlayerData()
+    local data = getPlayerData()
+    if data and type(data.characters) == "table" then
+        for id, ch in pairs(data.characters) do
+            if type(ch) == "table" and ch.name then
+                local ok, folderName = isAwakenableUnitName(ch.name)
+                if ok and folderName == unitName then
+                    return {
+                        id = ch.id or id,
+                        name = folderName,
+                        index = ch.index,
+                        level = ch.level,
+                    }
+                end
+            end
+        end
+    end
     for _, u in ipairs(getOwnedAwakenableUnits()) do
         if u.name == unitName then return u end
     end
@@ -2035,7 +2333,7 @@ function setEnabled(on)
     CONFIG.enabled = on
     AS.enabled = CONFIG.enabled
     Session.running = CONFIG.enabled
-    persistMasterToggleImmediate()
+    pcall(persistMasterToggleImmediate)
     pcall(saveSettings)
     if canFile() then
         pcall(function() writefile(SESSION_FILE, HttpService:JSONEncode(Session)) end)
@@ -2052,7 +2350,7 @@ local LEGACY_SETTINGS_FILE = "AutoBounty_settings.json"
 local function canFile()
     return (writefile and readfile and isfile) and true or false
 end
-local function persistMasterToggleImmediate()
+persistMasterToggleImmediate = function()
     if not canFile() then return end
     local data = {}
     local path = SETTINGS_FILE
@@ -2189,6 +2487,11 @@ local function loadSession()
 end
 loadSession()
 AS.challengeDoneSession = AS.challengeDoneSession or {}
+for _, key in ipairs({ "1d", "30m" }) do
+    if CONFIG.challengeDone and CONFIG.challengeDone[key] then
+        AS.challengeDoneSession[key] = true
+    end
+end
 -- Master toggle comes ONLY from settings (not session.running / AS.enabled OR chain)
 Session.running = CONFIG.enabled == true
 AS.enabled = CONFIG.enabled == true
@@ -2626,11 +2929,42 @@ local function refreshAwakeningLabels()
     if af and af.world and af.mode then
         setLabel(statusLabels.awakenFarm, ("Farming: %s %s Act %d for %s"):format(
             af.mode, af.world, af.act or 0, af.item or "?"))
-    elseif af and af.quest then
+    else    if af and af.quest then
         setLabel(statusLabels.awakenFarm, "Special quest: " .. tostring(af.quest))
     else
         setLabel(statusLabels.awakenFarm, "Farm target: idle in lobby")
     end
+    local n = #getOwnedAwakenableUnits()
+    if statusLabels.awakenCount then
+        setLabel(statusLabels.awakenCount, ("Awakenable units found: %d"):format(n))
+    end
+end
+
+local awakenUnitDropdown = nil
+local function refreshAwakenUnitDropdown()
+    refreshPlayerData()
+    local units = getOwnedAwakenableUnits()
+    local names = {}
+    for _, u in ipairs(units) do names[#names + 1] = u.name end
+
+    if #names == 0 then
+        names[1] = "(no awakenable units)"
+    elseif CONFIG.awakeningUnit == "" or not table.find(names, CONFIG.awakeningUnit) then
+        CONFIG.awakeningUnit = names[1]
+        saveSettings()
+    end
+
+    if awakenUnitDropdown then
+        pcall(function()
+            if awakenUnitDropdown.Refresh then
+                local pick = CONFIG.awakeningUnit
+                if pick == "(no awakenable units)" then pick = nil end
+                awakenUnitDropdown:Refresh(names, pick)
+            end
+        end)
+    end
+    pcall(refreshAwakeningLabels)
+    return #units
 end
 
 local function refreshChallengeLabels()
@@ -2650,9 +2984,10 @@ local function refreshChallengeLabels()
         if not enabled then
             setLabel(lbl, name .. ": disabled")
         elseif type(ch) == "table" and ch.world then
-            local done = AS.challengeDoneSession and AS.challengeDoneSession[key]
+            local done = (AS.challengeDoneSession and AS.challengeDoneSession[key])
+                or scanChallengeGuiCompleted(key)
             setLabel(lbl, name .. ": " .. ch.world .. " Act " .. tostring(ch.act)
-                .. (done and " (done this cycle)" or " (ready)"))
+                .. (done and " (already completed)" or " (ready)"))
         else
             setLabel(lbl, name .. ": done / on cooldown")
         end
@@ -2711,20 +3046,15 @@ local function buildUI()
         end)
     Aw:Label("Priority: challenges → awakening → daily traits.")
 
-    local function getAwakenUnitNames()
-        local units = getOwnedAwakenableUnits()
-        local names = {}
-        for _, u in ipairs(units) do names[#names + 1] = u.name end
-        if #names == 0 then names[1] = "(no awakenable units)" end
-        return names
-    end
-
-    local unitNames = getAwakenUnitNames()
+    local unitNames = {}
+    local units = getOwnedAwakenableUnits()
+    for _, u in ipairs(units) do unitNames[#unitNames + 1] = u.name end
+    if #unitNames == 0 then unitNames[1] = "(no awakenable units)" end
     local unitIdx = 1
     for i, n in ipairs(unitNames) do
         if n == CONFIG.awakeningUnit then unitIdx = i break end
     end
-    Aw:Dropdown("Target unit", "Owned unit to awaken", unitNames, unitIdx, function(opt)
+    awakenUnitDropdown = Aw:Dropdown("Target unit", "Owned base-form units that can awaken", unitNames, unitIdx, function(opt)
         if opt and opt ~= "(no awakenable units)" then
             CONFIG.awakeningUnit = opt
             saveSettings()
@@ -2737,17 +3067,25 @@ local function buildUI()
             CONFIG.awakeningDifficulty = opt; saveSettings()
         end)
 
-    Aw:Button("↺", "Refresh", "Rescan units and requirement progress", nil, function()
-        refreshPlayerData()
-        pcall(refreshAwakeningLabels)
-        notify("Awakening", "Requirements refreshed.", "info")
+    Aw:Button("↺", "Refresh units", "Rescan player data + Characters menu for awakenable units", nil, function()
+        AWAKENABLE_NAMES = nil
+        local n = refreshAwakenUnitDropdown()
+        notify("Awakening", n > 0 and ("Found " .. n .. " awakenable unit(s).") or "No awakenable units — open Characters menu once, then refresh.", n > 0 and "success" or "error")
     end)
 
     Aw:Section("Live status")
+    statusLabels.awakenCount = Aw:Label("Awakenable units found: -")
     statusLabels.awakenUnit = Aw:Label("Unit: -")
     statusLabels.awakenReqs = Aw:Label("Requirements: -")
     statusLabels.awakenFarm = Aw:Label("Farm target: -")
-    task.defer(refreshAwakeningLabels)
+    task.defer(refreshAwakenUnitDropdown)
+    addThread(function()
+        for _ = 1, 30 do
+            if not alive() then break end
+            if refreshAwakenUnitDropdown() > 0 then break end
+            task.wait(1)
+        end
+    end)
 
     -- ----- Daily Traits tab -----
     local Daily = Win:Tab("🌀", "Daily Traits")
@@ -2942,7 +3280,12 @@ addThread(function()
             end)
             pcall(refreshDailyCapLabels)
             pcall(refreshChallengeLabels)
-            pcall(refreshAwakeningLabels)
+            if not AS._awakenUnitsFound then
+                local n = refreshAwakenUnitDropdown()
+                if n > 0 then AS._awakenUnitsFound = true end
+            else
+                pcall(refreshAwakeningLabels)
+            end
             pcall(refreshDpsLabels)
         end
         task.wait(1)
