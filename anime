@@ -38,7 +38,7 @@
       data + world rewards), handle special-quest items, then invoke awaken.
 --------------------------------------------------------------------------]]
 
-local VERSION = "2.3.5"   -- bump this each upload so you can confirm the live build
+local VERSION = "2.3.6"   -- bump this each upload so you can confirm the live build
 local NEXUSLIB_URL = "https://raw.githubusercontent.com/headshot7535-png/Nexuslib/main/Nexuslib"
 
 -- ============================================================
@@ -1677,6 +1677,24 @@ local function readLiveItemCount(itemName, data)
     return 0
 end
 
+local function getCharacterData(unitName)
+    local folder = ReplicatedStorage.Characters:FindFirstChild(unitName)
+    if not folder then return nil end
+    local dataMod = folder:FindFirstChild("data")
+    if not dataMod then return nil end
+    local ok, data = pcall(function() return require(dataMod) end)
+    if ok and type(data) == "table" then return data end
+    return nil
+end
+
+local function getAwakeningCost(unitName)
+    local data = getCharacterData(unitName)
+    if data and type(data.awakening) == "table" and type(data.awakening.cost) == "table" then
+        return data.awakening.cost, data.awakening.object
+    end
+    return nil
+end
+
 local function updateAwakenItemCacheFromData(data, unitName)
     if type(data) ~= "table" then return end
     local cost = unitName and getAwakeningCost(unitName)
@@ -1724,16 +1742,6 @@ local function getItemCount(itemName)
     return live
 end
 
-local function getCharacterData(unitName)
-    local folder = ReplicatedStorage.Characters:FindFirstChild(unitName)
-    if not folder then return nil end
-    local dataMod = folder:FindFirstChild("data")
-    if not dataMod then return nil end
-    local ok, data = pcall(function() return require(dataMod) end)
-    if ok and type(data) == "table" then return data end
-    return nil
-end
-
 local function scanAwakenableCharacterNames()
     if AWAKENABLE_NAMES then return AWAKENABLE_NAMES end
     local map = {}
@@ -1767,14 +1775,6 @@ local function isAwakenableUnitName(unitName)
         end
     end
     return false, nil
-end
-
-local function getAwakeningCost(unitName)
-    local data = getCharacterData(unitName)
-    if data and type(data.awakening) == "table" and type(data.awakening.cost) == "table" then
-        return data.awakening.cost, data.awakening.object
-    end
-    return nil
 end
 
 local function discoverUnitsFromCharactersGui(seen)
