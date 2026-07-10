@@ -38,7 +38,7 @@
       data + world rewards), handle special-quest items, then invoke awaken.
 --------------------------------------------------------------------------]]
 
-local VERSION = "2.4.4"   -- bump this each upload so you can confirm the live build
+local VERSION = "2.4.5"   -- bump this each upload so you can confirm the live build
 local NEXUSLIB_URL = "https://raw.githubusercontent.com/headshot7535-png/Nexuslib/main/Nexuslib"
 
 -- ============================================================
@@ -708,7 +708,15 @@ local function capKey(mode, world, act)
 end
 
 local function getPlayerData()
-    local ok, util = pcall(function() return require(LP.PlayerScripts.Client.Utility) end)
+    local client = LP.PlayerScripts:FindFirstChild("Client")
+    local mod = client and client:FindFirstChild("Utility")
+    if mod and inPlayArea() and package and type(package.loaded) == "table" then
+        package.loaded[mod] = nil
+    end
+    local ok, util = pcall(function()
+        if mod then return require(mod) end
+        return require(LP.PlayerScripts.Client.Utility)
+    end)
     if ok and util and type(util.data) == "table" then
         AS.playerData = util.data
         return util.data
@@ -1697,6 +1705,36 @@ local function lookupExactInTable(tbl, key)
     return nil
 end
 
+local function parseCompactNumber(text)
+    if type(text) ~= "string" or text == "" then return nil end
+    local s = stripHtml(text):gsub(",", ""):gsub("%s+", "")
+    local n = tonumber(s)
+    if n then return math.floor(n) end
+    local num, suffix = s:match("^([%d%.]+)([kKmMbB])$")
+    num = tonumber(num)
+    if not num then return nil end
+    suffix = suffix:lower()
+    if suffix == "k" then num = num * 1e3
+    elseif suffix == "m" then num = num * 1e6
+    elseif suffix == "b" then num = num * 1e9 end
+    return math.floor(num)
+end
+
+-- Game hover/tooltip: items first, then stats (total owned vs session stat)
+local function readInventoryItemCount(data, itemName)
+    if type(data) ~= "table" or type(itemName) ~= "string" or itemName == "" then return nil end
+    local items = type(data.items) == "table" and data.items or nil
+    if items then
+        local n = lookupExactInTable(items, itemName)
+        if n ~= nil then return n end
+    end
+    local stats = type(data.stats) == "table" and data.stats or nil
+    if stats then
+        return lookupExactInTable(stats, itemName)
+    end
+    return nil
+end
+
 local function lookupGameStyleCount(data, itemName, firstTbl, secondTbl)
     if type(data) ~= "table" or type(itemName) ~= "string" or itemName == "" then return nil end
     local items = type(data.items) == "table" and data.items or nil
@@ -1724,6 +1762,8 @@ end
 
 local function lookupItemCountInData(data, itemName)
     if type(data) ~= "table" or type(itemName) ~= "string" or itemName == "" then return nil end
+    local inv = readInventoryItemCount(data, itemName)
+    if inv ~= nil then return inv end
     local best = nil
     local function consider(n)
         if n ~= nil and (not best or n > best) then best = n end
@@ -1738,7 +1778,8 @@ end
 
 local function readLiveItemCount(itemName, data)
     data = data or getPlayerData()
-    local n = lookupItemCountInData(data, itemName)
+    local n = readInventoryItemCount(data, itemName)
+    if n == nil then n = lookupItemCountInData(data, itemName) end
     return n ~= nil and n or 0
 end
 
@@ -1805,6 +1846,21 @@ local function requireUtilityFresh()
     return nil
 end
 
+local function invalidateMatchCountCaches()
+    AS._clientDataCache = nil
+    AS._lastClientScan = 0
+    AS._matchPlayerData = nil
+    AS._lastPlayersGet = 0
+end
+
+local function getLiveUtilityData()
+    local util = requireUtilityFresh()
+    if util and type(util.data) == "table" then
+        return util.data, util
+    end
+    return nil, util
+end
+
 local function collectAllClientDataTables()
     AS._lastClientScan = AS._lastClientScan or 0
     if AS._clientDataCache and tick() - AS._lastClientScan < 2.5 then
@@ -1819,21 +1875,8 @@ local function collectAllClientDataTables()
             sources[#sources + 1] = data
         end
     end
-    local util = requireUtilityFresh()
-    if util and type(util.data) == "table" then add(util.data) end
-    local client = LP.PlayerScripts:FindFirstChild("Client")
-    if client then
-        for _, child in ipairs(client:GetChildren()) do
-            if child:IsA("ModuleScript") and child.Name ~= "Utility" then
-                pcall(function()
-                    local mod = require(child)
-                    if type(mod) == "table" and type(mod.data) == "table" then
-                        add(mod.data)
-                    end
-                end)
-            end
-        end
-    end
+    local data = getLiveUtilityData()
+    if data then add(data) end
     AS._clientDataCache = sources
     return sources
 end
@@ -1866,10 +1909,9 @@ end
 local function parseOwnCountText(text)
     if type(text) ~= "string" or text == "" then return nil end
     local plain = text:gsub("<[^>]+>", "")
-    local num = tonumber(plain:match("x%s*([%d%.%,]+)"))
-        or tonumber(plain:match("([%d%.%,]+)"))
-    if num then return math.floor(num) end
-    return nil
+    local num = parseCompactNumber(plain:match("x%s*([%d%.%,]+[kKmMbB]?)"))
+        or parseCompactNumber(plain:match("([%d%.%,]+[kKmMbB]?)"))
+    return num
 end
 
 local function rememberHoverCount(itemName, count)
@@ -1910,7 +1952,7 @@ local function setupHoverCountWatcher()
                     end
                 end
             end
-            task.wait(2)
+            task.wait(1)
         end
     end)
 end
@@ -1941,51 +1983,50 @@ local function readHoverInfoOwnCount(itemName)
     return nil
 end
 
-local function readMatchPlayerDataThrottled()
-    AS._lastPlayersGet = AS._lastPlayersGet or 0
-    if tick() - AS._lastPlayersGet < 2.5 then
-        return AS._matchPlayerData
-    end
-    AS._lastPlayersGet = tick()
-    local ok, data = invokeR("Players", "get")
-    if ok and type(data) == "table" then
-        AS._matchPlayerData = data
-        return data
-    end
-    ok, data = invokeR("Player", "get")
-    if ok and type(data) == "table" then
-        AS._matchPlayerData = data
-        return data
-    end
-    return AS._matchPlayerData
-end
-
-local function getMatchDataSources()
-    local sources = {}
-    local seen = {}
-    local function add(data)
-        if type(data) ~= "table" or seen[data] then return end
-        seen[data] = true
-        sources[#sources + 1] = data
-    end
-    for _, data in ipairs(collectAllClientDataTables()) do add(data) end
-    add(readMatchPlayerDataThrottled())
-    return sources
-end
-
 local function readMatchItemCount(itemName)
-    local best = nil
-    local function consider(n)
+    if AS._countPlayArea ~= inPlayArea() then
+        AS._countPlayArea = inPlayArea()
+        if AS._countPlayArea then
+            invalidateMatchCountCaches()
+        end
+    end
+
+    local best, bestPri = nil, -1
+    local function consider(n, pri)
         n = tonumber(n)
-        if n ~= nil and (not best or n > best) then best = n end
+        if n == nil then return end
+        if pri > bestPri or (pri == bestPri and (not best or n > best)) then
+            best, bestPri = n, pri
+        end
     end
-    for _, data in ipairs(getMatchDataSources()) do
-        consider(gameExactItemCount(data, itemName))
-        consider(lookupItemCountInData(data, itemName))
-        consider(deepScanItemCount(data, itemName, 0))
+
+    consider(readCachedHoverCount(itemName), 4)
+
+    local okHover, hoverNow = pcall(function()
+        for _, hi in ipairs(collectHoverInfoFrames()) do
+            if hi.Visible then
+                local title = hi:FindFirstChild("title") or hi:FindFirstChild("name")
+                local own = hi:FindFirstChild("own")
+                if title and own and title:IsA("TextLabel") and own:IsA("TextLabel") then
+                    if titleMatchesItem(title.Text, itemName) then
+                        local n = parseOwnCountText(own.Text or "")
+                        if n then
+                            rememberHoverCount(itemName, n)
+                            return n
+                        end
+                    end
+                end
+            end
+        end
+        return nil
+    end)
+    if okHover then consider(hoverNow, 3) end
+
+    local utilData = getLiveUtilityData()
+    if utilData then
+        consider(readInventoryItemCount(utilData, itemName), 2)
     end
-    consider(readCachedHoverCount(itemName))
-    consider(readHoverInfoOwnCount(itemName))
+
     return best
 end
 
@@ -2029,7 +2070,8 @@ local function updateAwakenItemCacheFromData(data, unitName)
     AS.awakenItemCache = AS.awakenItemCache or {}
     Session.awakenItemCache = Session.awakenItemCache or {}
     for item in pairs(cost) do
-        local n = readLiveItemCount(item, data)
+        local n = readInventoryItemCount(data, item)
+        if n == nil then n = readLiveItemCount(item, data) end
         AS.awakenItemCache[item] = n
         Session.awakenItemCache[item] = n
     end
@@ -2075,11 +2117,17 @@ local function syncAwakenItemCount(itemName, live)
     live = tonumber(live)
     if live == nil then return nil end
     restoreAwakenItemCache()
+    local hover = readCachedHoverCount(itemName)
+    local out = live
+    if hover and hover > out then out = hover end
     local prev = tonumber(AS.awakenItemCache and AS.awakenItemCache[itemName])
         or tonumber(Session.awakenItemCache and Session.awakenItemCache[itemName])
-    local out = live
-    if prev and prev > out then out = prev end
-    if not prev or out > prev then
+    if inPlayArea() and isAwakeningCostItem(itemName) then
+        if prev and prev > out then out = prev end
+    elseif prev and prev > out then
+        out = prev
+    end
+    if not prev or out ~= prev then
         bumpAwakenItemCache(itemName, out)
     end
     syncReqSnapshotHave(itemName, out)
@@ -2092,6 +2140,10 @@ local function getItemCount(itemName)
         local live = readMatchItemCount(itemName)
         if live ~= nil then
             return syncAwakenItemCount(itemName, live)
+        end
+        local hover = readCachedHoverCount(itemName)
+        if hover ~= nil then
+            return syncAwakenItemCount(itemName, hover)
         end
         if AS.awakenItemCache and AS.awakenItemCache[itemName] ~= nil then
             return AS.awakenItemCache[itemName]
@@ -2830,6 +2882,7 @@ local function rememberAwakeningFarm(target, unitName)
     af.lastCount = getItemCount(af.item or "") or 0
     af.unitName = unitName
     if unitName and inLobby() then
+        invalidateMatchCountCaches()
         updateAwakenItemCacheFromData(getPlayerData(), unitName)
         local snap = getMissingAwakeningReqs(unitName)
         if type(snap) == "table" then
