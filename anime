@@ -38,7 +38,7 @@
       data + world rewards), handle special-quest items, then invoke awaken.
 --------------------------------------------------------------------------]]
 
-local VERSION = "2.4.2"   -- bump this each upload so you can confirm the live build
+local VERSION = "2.4.3"   -- bump this each upload so you can confirm the live build
 local NEXUSLIB_URL = "https://raw.githubusercontent.com/headshot7535-png/Nexuslib/main/Nexuslib"
 
 -- ============================================================
@@ -722,6 +722,8 @@ local function refreshPlayerData()
     end
     AS._matchPlayerData = nil
     AS._lastPlayersGet = 0
+    AS._clientDataCache = nil
+    AS._lastClientScan = 0
     local ok, data = invokeR("Player", "get")
     if ok and type(data) == "table" then
         AS.playerData = data
@@ -1740,18 +1742,123 @@ local function readLiveItemCount(itemName, data)
     return n ~= nil and n or 0
 end
 
+local function titleMatchesItem(titleText, itemName)
+    local t = normalizeItemKey(titleText or "")
+    local want = normalizeItemKey(itemName)
+    if t == "" or want == "" then return false end
+    if t == want then return true end
+    return t:find(want, 1, true) ~= nil
+end
+
+local function gameExactItemCount(data, itemName)
+    if type(data) ~= "table" or type(itemName) ~= "string" or itemName == "" then return nil end
+    local items = type(data.items) == "table" and data.items or nil
+    local stats = type(data.stats) == "table" and data.stats or nil
+    local keys = { itemName, string.lower(itemName) }
+    for _, key in ipairs(keys) do
+        local raw = items and items[key]
+        if raw == nil and stats then raw = stats[key] end
+        if raw ~= nil then
+            local n = coerceItemValue(raw)
+            return n ~= nil and n or 0
+        end
+    end
+    return nil
+end
+
+local DEEP_SCAN_SKIP = {
+    characters = true, units = true, traits = true, settings = true,
+    caps = true, equipped = true, equipped_skins = true, perks = true,
+    ingame = true, game_data = true,
+}
+
+local function deepScanItemCount(data, itemName, depth, seen)
+    if depth > 4 or type(data) ~= "table" then return nil end
+    seen = seen or {}
+    if seen[data] then return nil end
+    seen[data] = true
+    local direct = gameExactItemCount(data, itemName)
+    if direct == nil then direct = lookupItemCountInData(data, itemName) end
+    if direct ~= nil then return direct end
+    for k, v in pairs(data) do
+        if type(v) == "table" and not DEEP_SCAN_SKIP[k] then
+            local n = deepScanItemCount(v, itemName, depth + 1, seen)
+            if n ~= nil then return n end
+        end
+    end
+    return nil
+end
+
+local function clearModuleCache(mod)
+    if mod and package and type(package.loaded) == "table" then
+        package.loaded[mod] = nil
+    end
+end
+
+local function requireUtilityFresh()
+    local client = LP.PlayerScripts:FindFirstChild("Client")
+    local mod = client and client:FindFirstChild("Utility")
+    if not mod then return nil end
+    clearModuleCache(mod)
+    local ok, util = pcall(require, mod)
+    if ok and type(util) == "table" then return util end
+    return nil
+end
+
+local function collectAllClientDataTables()
+    AS._lastClientScan = AS._lastClientScan or 0
+    if AS._clientDataCache and tick() - AS._lastClientScan < 2.5 then
+        return AS._clientDataCache
+    end
+    AS._lastClientScan = tick()
+    local sources = {}
+    local seen = {}
+    local function add(data)
+        if type(data) == "table" and not seen[data] then
+            seen[data] = true
+            sources[#sources + 1] = data
+        end
+    end
+    local util = requireUtilityFresh()
+    if util and type(util.data) == "table" then add(util.data) end
+    local client = LP.PlayerScripts:FindFirstChild("Client")
+    if client then
+        for _, child in ipairs(client:GetChildren()) do
+            if child:IsA("ModuleScript") and child.Name ~= "Utility" then
+                pcall(function()
+                    local mod = require(child)
+                    if type(mod) == "table" and type(mod.data) == "table" then
+                        add(mod.data)
+                    end
+                end)
+            end
+        end
+    end
+    AS._clientDataCache = sources
+    return sources
+end
+
+local function collectHoverInfoFrames()
+    local out = {}
+    local pg = LP:FindFirstChildOfClass("PlayerGui")
+    if not pg then return out end
+    for _, desc in ipairs(pg:GetDescendants()) do
+        if desc.Name == "hover_info" and desc:FindFirstChild("own") then
+            out[#out + 1] = desc
+        end
+    end
+    return out
+end
+
 local function findHoverInfoGui()
     local pg = LP:FindFirstChildOfClass("PlayerGui")
     if not pg then return nil end
-    local menus = pg:FindFirstChild("Menus")
-    if menus then
-        local hi = menus:FindFirstChild("hover_info")
-        if hi then return hi end
-    end
-    local priority = pg:FindFirstChild("Priority")
-    if priority then
-        local hi = priority:FindFirstChild("hover_info")
-        if hi then return hi end
+    for _, path in ipairs({ "Priority", "Menus" }) do
+        local parent = pg:FindFirstChild(path)
+        if parent then
+            local hi = parent:FindFirstChild("hover_info")
+            if hi then return hi end
+        end
     end
     return pg:FindFirstChild("hover_info", true)
 end
@@ -1765,19 +1872,70 @@ local function parseOwnCountText(text)
     return nil
 end
 
+local function rememberHoverCount(itemName, count)
+    if type(itemName) ~= "string" or itemName == "" or count == nil then return end
+    AS.hoverCountCache = AS.hoverCountCache or {}
+    AS.hoverCountCache[normalizeItemKey(itemName)] = { count = count, at = tick(), name = itemName }
+end
+
+local function readCachedHoverCount(itemName)
+    local cache = AS.hoverCountCache and AS.hoverCountCache[normalizeItemKey(itemName)]
+    if cache and tick() - (cache.at or 0) < 120 then
+        return tonumber(cache.count)
+    end
+    return nil
+end
+
+local function setupHoverCountWatcher()
+    if AS._hoverWatcherOn then return end
+    AS._hoverWatcherOn = true
+    addThread(task.spawn(function()
+        local hooked = {}
+        while alive() do
+            for _, hi in ipairs(collectHoverInfoFrames()) do
+                if not hooked[hi] then
+                    hooked[hi] = true
+                    local own = hi:FindFirstChild("own")
+                    local title = hi:FindFirstChild("title") or hi:FindFirstChild("name")
+                    if own and title and own:IsA("TextLabel") and title:IsA("TextLabel") then
+                        local function capture()
+                            if not hi.Visible then return end
+                            local item = stripHtml(title.Text or "")
+                            local count = parseOwnCountText(own.Text or "")
+                            if item ~= "" and count then rememberHoverCount(item, count) end
+                        end
+                        addConn(own:GetPropertyChangedSignal("Text"):Connect(capture))
+                        addConn(title:GetPropertyChangedSignal("Text"):Connect(capture))
+                        addConn(hi:GetPropertyChangedSignal("Visible"):Connect(capture))
+                    end
+                end
+            end
+            task.wait(2)
+        end
+    end))
+end
+
 local function readHoverInfoOwnCount(itemName)
     if type(itemName) ~= "string" or itemName == "" then return nil end
-    local want = normalizeItemKey(itemName)
+    local cached = readCachedHoverCount(itemName)
+    if cached ~= nil then return cached end
     local ok, count = pcall(function()
-        local hi = findHoverInfoGui()
-        if not hi or not hi.Visible then return nil end
-        local title = hi:FindFirstChild("title")
-        local own = hi:FindFirstChild("own")
-        if not title or not own or not title:IsA("TextLabel") or not own:IsA("TextLabel") then
-            return nil
+        for _, hi in ipairs(collectHoverInfoFrames()) do
+            if hi.Visible then
+                local title = hi:FindFirstChild("title") or hi:FindFirstChild("name")
+                local own = hi:FindFirstChild("own")
+                if title and own and title:IsA("TextLabel") and own:IsA("TextLabel") then
+                    if titleMatchesItem(title.Text, itemName) then
+                        local n = parseOwnCountText(own.Text or "")
+                        if n then
+                            rememberHoverCount(itemName, n)
+                            return n
+                        end
+                    end
+                end
+            end
         end
-        if normalizeItemKey(title.Text or "") ~= want then return nil end
-        return parseOwnCountText(own.Text or "")
+        return nil
     end)
     if ok and count ~= nil then return count end
     return nil
@@ -1794,6 +1952,11 @@ local function readMatchPlayerDataThrottled()
         AS._matchPlayerData = data
         return data
     end
+    ok, data = invokeR("Player", "get")
+    if ok and type(data) == "table" then
+        AS._matchPlayerData = data
+        return data
+    end
     return AS._matchPlayerData
 end
 
@@ -1805,23 +1968,24 @@ local function getMatchDataSources()
         seen[data] = true
         sources[#sources + 1] = data
     end
-    pcall(function()
-        local util = require(LP.PlayerScripts.Client.Utility)
-        if util and type(util.data) == "table" then add(util.data) end
-    end)
+    for _, data in ipairs(collectAllClientDataTables()) do add(data) end
     add(readMatchPlayerDataThrottled())
-    add(AS.playerData)
     return sources
 end
 
 local function readMatchItemCount(itemName)
     local best = nil
-    for _, data in ipairs(getMatchDataSources()) do
-        local n = lookupItemCountInData(data, itemName)
+    local function consider(n)
+        n = tonumber(n)
         if n ~= nil and (not best or n > best) then best = n end
     end
-    local hover = readHoverInfoOwnCount(itemName)
-    if hover ~= nil and (not best or hover > best) then best = hover end
+    for _, data in ipairs(getMatchDataSources()) do
+        consider(gameExactItemCount(data, itemName))
+        consider(lookupItemCountInData(data, itemName))
+        consider(deepScanItemCount(data, itemName, 0))
+    end
+    consider(readCachedHoverCount(itemName))
+    consider(readHoverInfoOwnCount(itemName))
     return best
 end
 
@@ -2915,6 +3079,8 @@ local function awakeningStep()
     end
     saveSession()
 end
+
+setupHoverCountWatcher()
 
 return {
     step = awakeningStep,
