@@ -38,7 +38,7 @@
       data + world rewards), handle special-quest items, then invoke awaken.
 --------------------------------------------------------------------------]]
 
-local VERSION = "2.4.3"   -- bump this each upload so you can confirm the live build
+local VERSION = "2.4.4"   -- bump this each upload so you can confirm the live build
 local NEXUSLIB_URL = "https://raw.githubusercontent.com/headshot7535-png/Nexuslib/main/Nexuslib"
 
 -- ============================================================
@@ -1889,7 +1889,7 @@ end
 local function setupHoverCountWatcher()
     if AS._hoverWatcherOn then return end
     AS._hoverWatcherOn = true
-    addThread(task.spawn(function()
+    addThread(function()
         local hooked = {}
         while alive() do
             for _, hi in ipairs(collectHoverInfoFrames()) do
@@ -1912,7 +1912,7 @@ local function setupHoverCountWatcher()
             end
             task.wait(2)
         end
-    end))
+    end)
 end
 
 local function readHoverInfoOwnCount(itemName)
