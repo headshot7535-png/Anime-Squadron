@@ -38,7 +38,7 @@
       data + world rewards), handle special-quest items, then invoke awaken.
 --------------------------------------------------------------------------]]
 
-local VERSION = "2.4.1"   -- bump this each upload so you can confirm the live build
+local VERSION = "2.4.2"   -- bump this each upload so you can confirm the live build
 local NEXUSLIB_URL = "https://raw.githubusercontent.com/headshot7535-png/Nexuslib/main/Nexuslib"
 
 -- ============================================================
@@ -720,6 +720,8 @@ local function refreshPlayerData()
     if not inLobby() then
         return AS.playerData or getPlayerData()
     end
+    AS._matchPlayerData = nil
+    AS._lastPlayersGet = 0
     local ok, data = invokeR("Player", "get")
     if ok and type(data) == "table" then
         AS.playerData = data
@@ -1683,9 +1685,14 @@ end
 
 local function lookupExactInTable(tbl, key)
     if type(tbl) ~= "table" or type(key) ~= "string" then return nil end
-    if tbl[key] == nil then return nil end
-    local n = coerceItemValue(tbl[key])
-    return n ~= nil and n or 0
+    local keys = { key, string.lower(key) }
+    for _, k in ipairs(keys) do
+        if tbl[k] ~= nil then
+            local n = coerceItemValue(tbl[k])
+            return n ~= nil and n or 0
+        end
+    end
+    return nil
 end
 
 local function lookupGameStyleCount(data, itemName, firstTbl, secondTbl)
@@ -1715,12 +1722,16 @@ end
 
 local function lookupItemCountInData(data, itemName)
     if type(data) ~= "table" or type(itemName) ~= "string" or itemName == "" then return nil end
-    local hoverStyle = lookupGameStyleCount(data, itemName, "items", "stats")
-    local awakenStyle = lookupGameStyleCount(data, itemName, "stats", "items")
-    if hoverStyle ~= nil and awakenStyle ~= nil then
-        return math.max(hoverStyle, awakenStyle)
+    local best = nil
+    local function consider(n)
+        if n ~= nil and (not best or n > best) then best = n end
     end
-    return hoverStyle or awakenStyle
+    consider(lookupGameStyleCount(data, itemName, "stats", "items"))
+    consider(lookupGameStyleCount(data, itemName, "items", "stats"))
+    if type(data.all_items) == "table" then
+        consider(lookupExactInTable(data.all_items, itemName))
+    end
+    return best
 end
 
 local function readLiveItemCount(itemName, data)
@@ -1729,12 +1740,36 @@ local function readLiveItemCount(itemName, data)
     return n ~= nil and n or 0
 end
 
+local function findHoverInfoGui()
+    local pg = LP:FindFirstChildOfClass("PlayerGui")
+    if not pg then return nil end
+    local menus = pg:FindFirstChild("Menus")
+    if menus then
+        local hi = menus:FindFirstChild("hover_info")
+        if hi then return hi end
+    end
+    local priority = pg:FindFirstChild("Priority")
+    if priority then
+        local hi = priority:FindFirstChild("hover_info")
+        if hi then return hi end
+    end
+    return pg:FindFirstChild("hover_info", true)
+end
+
+local function parseOwnCountText(text)
+    if type(text) ~= "string" or text == "" then return nil end
+    local plain = text:gsub("<[^>]+>", "")
+    local num = tonumber(plain:match("x%s*([%d%.%,]+)"))
+        or tonumber(plain:match("([%d%.%,]+)"))
+    if num then return math.floor(num) end
+    return nil
+end
+
 local function readHoverInfoOwnCount(itemName)
     if type(itemName) ~= "string" or itemName == "" then return nil end
     local want = normalizeItemKey(itemName)
     local ok, count = pcall(function()
-        local menus = LP.PlayerGui:FindFirstChild("Menus")
-        local hi = menus and menus:FindFirstChild("hover_info")
+        local hi = findHoverInfoGui()
         if not hi or not hi.Visible then return nil end
         local title = hi:FindFirstChild("title")
         local own = hi:FindFirstChild("own")
@@ -1742,24 +1777,52 @@ local function readHoverInfoOwnCount(itemName)
             return nil
         end
         if normalizeItemKey(title.Text or "") ~= want then return nil end
-        local text = own.Text or ""
-        local num = tonumber(text:match("x([%d%.,]+)"))
-        if num then return math.floor(num) end
-        return nil
+        return parseOwnCountText(own.Text or "")
     end)
     if ok and count ~= nil then return count end
     return nil
 end
 
+local function readMatchPlayerDataThrottled()
+    AS._lastPlayersGet = AS._lastPlayersGet or 0
+    if tick() - AS._lastPlayersGet < 2.5 then
+        return AS._matchPlayerData
+    end
+    AS._lastPlayersGet = tick()
+    local ok, data = invokeR("Players", "get")
+    if ok and type(data) == "table" then
+        AS._matchPlayerData = data
+        return data
+    end
+    return AS._matchPlayerData
+end
+
+local function getMatchDataSources()
+    local sources = {}
+    local seen = {}
+    local function add(data)
+        if type(data) ~= "table" or seen[data] then return end
+        seen[data] = true
+        sources[#sources + 1] = data
+    end
+    pcall(function()
+        local util = require(LP.PlayerScripts.Client.Utility)
+        if util and type(util.data) == "table" then add(util.data) end
+    end)
+    add(readMatchPlayerDataThrottled())
+    add(AS.playerData)
+    return sources
+end
+
 local function readMatchItemCount(itemName)
-    local ok, util = pcall(function() return require(LP.PlayerScripts.Client.Utility) end)
-    if ok and type(util) == "table" and type(util.data) == "table" then
-        local n = lookupItemCountInData(util.data, itemName)
-        if n ~= nil then return n end
+    local best = nil
+    for _, data in ipairs(getMatchDataSources()) do
+        local n = lookupItemCountInData(data, itemName)
+        if n ~= nil and (not best or n > best) then best = n end
     end
     local hover = readHoverInfoOwnCount(itemName)
-    if hover ~= nil then return hover end
-    return nil
+    if hover ~= nil and (not best or hover > best) then best = hover end
+    return best
 end
 
 local function getCharacterData(unitName)
@@ -2789,6 +2852,8 @@ local function awakeningStep()
     end
 
     local before = getItemCount(itemName) or 0
+    refreshPlayerData()
+    updateAwakenItemCacheFromData(getPlayerData(), unit.name)
     rememberAwakeningFarm(target, unit.name)
     local af = Session.awakeningFarm
     af.runs = (af.runs or 0) + 1
