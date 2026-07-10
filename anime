@@ -38,7 +38,7 @@
       data + world rewards), handle special-quest items, then invoke awaken.
 --------------------------------------------------------------------------]]
 
-local VERSION = "2.4.5"   -- bump this each upload so you can confirm the live build
+local VERSION = "2.4.6"   -- bump this each upload so you can confirm the live build
 local NEXUSLIB_URL = "https://raw.githubusercontent.com/headshot7535-png/Nexuslib/main/Nexuslib"
 
 -- ============================================================
@@ -742,6 +742,29 @@ local function refreshPlayerData()
         return data
     end
     return getPlayerData()
+end
+
+local function refreshMatchPlayerData(force)
+    if inLobby() then return refreshPlayerData() end
+    AS._lastPlayersGet = AS._lastPlayersGet or 0
+    if not force and AS._matchPlayerData and tick() - AS._lastPlayersGet < 12 then
+        return AS._matchPlayerData
+    end
+    if not force and tick() - AS._lastPlayersGet < 12 then
+        return AS._matchPlayerData or AS.playerData or getPlayerData()
+    end
+    AS._lastPlayersGet = tick()
+    local ok, data = invokeR("Player", "get")
+    if ok and type(data) == "table" then
+        AS._matchPlayerData = data
+        AS.playerData = data
+        pcall(function()
+            local util = require(LP.PlayerScripts.Client.Utility)
+            if util then util.data = data end
+        end)
+        return data
+    end
+    return AS._matchPlayerData or AS.playerData or getPlayerData()
 end
 
 local function getTraitCapCount(map)
@@ -2025,6 +2048,28 @@ local function readMatchItemCount(itemName)
     local utilData = getLiveUtilityData()
     if utilData then
         consider(readInventoryItemCount(utilData, itemName), 2)
+        consider(lookupItemCountInData(utilData, itemName), 2)
+    end
+
+    local playerData = AS._matchPlayerData or AS.playerData or getPlayerData()
+    if playerData then
+        consider(lookupItemCountInData(playerData, itemName), 2)
+        consider(readInventoryItemCount(playerData, itemName), 2)
+    end
+
+    if AS.awakenItemCache and AS.awakenItemCache[itemName] ~= nil then
+        consider(AS.awakenItemCache[itemName], 1)
+    end
+    if Session.awakenItemCache and Session.awakenItemCache[itemName] ~= nil then
+        consider(Session.awakenItemCache[itemName], 1)
+    end
+
+    if best == nil then
+        local fresh = refreshMatchPlayerData(false)
+        if fresh then
+            consider(lookupItemCountInData(fresh, itemName), 2)
+            consider(readInventoryItemCount(fresh, itemName), 2)
+        end
     end
 
     return best
@@ -2070,7 +2115,8 @@ local function updateAwakenItemCacheFromData(data, unitName)
     AS.awakenItemCache = AS.awakenItemCache or {}
     Session.awakenItemCache = Session.awakenItemCache or {}
     for item in pairs(cost) do
-        local n = readInventoryItemCount(data, item)
+        local n = lookupItemCountInData(data, item)
+        if n == nil then n = readInventoryItemCount(data, item) end
         if n == nil then n = readLiveItemCount(item, data) end
         AS.awakenItemCache[item] = n
         Session.awakenItemCache[item] = n
@@ -2145,11 +2191,25 @@ local function getItemCount(itemName)
         if hover ~= nil then
             return syncAwakenItemCount(itemName, hover)
         end
+        local data = AS._matchPlayerData or AS.playerData or getPlayerData()
+        if data then
+            live = lookupItemCountInData(data, itemName)
+            if live ~= nil then
+                return syncAwakenItemCount(itemName, live)
+            end
+        end
         if AS.awakenItemCache and AS.awakenItemCache[itemName] ~= nil then
             return AS.awakenItemCache[itemName]
         end
         if Session.awakenItemCache and Session.awakenItemCache[itemName] ~= nil then
             return tonumber(Session.awakenItemCache[itemName]) or 0
+        end
+        data = refreshMatchPlayerData(false)
+        if data then
+            live = lookupItemCountInData(data, itemName)
+            if live ~= nil then
+                return syncAwakenItemCount(itemName, live)
+            end
         end
         return nil
     end
@@ -2368,71 +2428,83 @@ local function copyMissingSnapshot(list)
     return out
 end
 
+local function copyFullReqSnapshot(entries)
+    if type(entries) ~= "table" then return nil end
+    local out = {}
+    for i, m in ipairs(entries) do
+        if type(m) == "table" and m.item then
+            out[i] = {
+                item = m.item,
+                need = tonumber(m.need) or 0,
+                have = tonumber(m.have) or 0,
+                deficit = tonumber(m.deficit) or 0,
+            }
+        end
+    end
+    return out
+end
+
+local function resolveAwakenItemCount(itemName, snapByItem)
+    if type(itemName) ~= "string" or itemName == "" then return nil end
+    local have = getItemCount(itemName)
+    if have ~= nil then return have end
+    if type(snapByItem) == "table" and snapByItem[itemName] then
+        have = tonumber(snapByItem[itemName].have)
+        if have ~= nil then return have end
+    end
+    have = tonumber(AS.awakenItemCache and AS.awakenItemCache[itemName])
+        or tonumber(Session.awakenItemCache and Session.awakenItemCache[itemName])
+    if have ~= nil then return have end
+    local data = AS._matchPlayerData or AS.playerData or getPlayerData()
+    if data then
+        have = lookupItemCountInData(data, itemName)
+        if have ~= nil then return have end
+    end
+    if inPlayArea() then
+        data = refreshMatchPlayerData(false)
+        if data then
+            have = lookupItemCountInData(data, itemName)
+            if have ~= nil then return have end
+        end
+    end
+    return nil
+end
+
 local function getMissingAwakeningReqs(unitName)
     local cost = getAwakeningCost(unitName)
     if type(cost) ~= "table" or next(cost) == nil then return nil end
 
-    if inPlayArea() then
-        restoreAwakenItemCache()
-        local af = Session.awakeningFarm
-        if af and af.unitName == unitName then
-            local costTbl = getAwakeningCost(unitName)
-            if type(costTbl) == "table" then
-                for item in pairs(costTbl) do
-                    getItemCount(item)
-                end
-            end
-            local snapByItem = {}
-            if type(af.reqSnapshot) == "table" then
-                for _, m in ipairs(af.reqSnapshot) do snapByItem[m.item] = m end
-            end
-            local missing = {}
-            for item, need in pairs(cost) do
-                need = tonumber(need) or 0
-                if need > 0 then
-                    local have = getItemCount(item)
-                    if have == nil and snapByItem[item] then
-                        have = tonumber(snapByItem[item].have)
-                    end
-                    if have == nil then
-                        have = Session.awakenItemCache and tonumber(Session.awakenItemCache[item])
-                    end
-                    if have == nil then return nil end
-                    if have < need then
-                        missing[#missing + 1] = {
-                            item = item,
-                            need = need,
-                            have = have,
-                            deficit = need - have,
-                        }
-                    end
-                end
-            end
-            af.reqSnapshot = copyMissingSnapshot(missing)
-            table.sort(missing, function(a, b)
-                if a.deficit ~= b.deficit then return a.deficit > b.deficit end
-                return a.item < b.item
-            end)
-            return missing
+    if inLobby() then
+        refreshPlayerData()
+        updateAwakenItemCacheFromData(getPlayerData(), unitName)
+    end
+
+    local snapByItem = {}
+    local af = Session.awakeningFarm
+    if af and af.unitName == unitName then
+        if type(af.reqSnapshotFull) == "table" then
+            for _, m in ipairs(af.reqSnapshotFull) do snapByItem[m.item] = m end
+        elseif type(af.reqSnapshot) == "table" then
+            for _, m in ipairs(af.reqSnapshot) do snapByItem[m.item] = m end
         end
     end
 
     local missing = {}
+    local full = {}
     for item, need in pairs(cost) do
         need = tonumber(need) or 0
         if need > 0 then
-            local have = getItemCount(item)
-            if have == nil then
-                have = Session.awakenItemCache and tonumber(Session.awakenItemCache[item])
-            end
+            local have = resolveAwakenItemCount(item, snapByItem)
             if have == nil then return nil end
+            local entry = {
+                item = item,
+                need = need,
+                have = have,
+                deficit = math.max(0, need - have),
+            }
+            full[#full + 1] = entry
             if have < need then
-                missing[#missing + 1] = {
-                    item = item,
-                    need = need,
-                    have = have,
-                    deficit = need - have,
-                }
+                missing[#missing + 1] = entry
             end
         end
     end
@@ -2440,6 +2512,15 @@ local function getMissingAwakeningReqs(unitName)
         if a.deficit ~= b.deficit then return a.deficit > b.deficit end
         return a.item < b.item
     end)
+    table.sort(full, function(a, b)
+        if a.deficit ~= b.deficit then return a.deficit > b.deficit end
+        return a.item < b.item
+    end)
+
+    if af and af.unitName == unitName then
+        af.reqSnapshot = copyMissingSnapshot(missing)
+        af.reqSnapshotFull = copyFullReqSnapshot(full)
+    end
     return missing
 end
 
@@ -2887,6 +2968,27 @@ local function rememberAwakeningFarm(target, unitName)
         local snap = getMissingAwakeningReqs(unitName)
         if type(snap) == "table" then
             af.reqSnapshot = copyMissingSnapshot(snap)
+            if type(af.reqSnapshotFull) ~= "table" then
+                local cost = getAwakeningCost(unitName)
+                if type(cost) == "table" then
+                    local full = {}
+                    for item, need in pairs(cost) do
+                        need = tonumber(need) or 0
+                        if need > 0 then
+                            local have = resolveAwakenItemCount(item)
+                            if have ~= nil then
+                                full[#full + 1] = {
+                                    item = item, need = need, have = have,
+                                    deficit = math.max(0, need - have),
+                                }
+                            end
+                        end
+                    end
+                    if #full > 0 then
+                        af.reqSnapshotFull = copyFullReqSnapshot(full)
+                    end
+                end
+            end
         end
         if flushSession then pcall(flushSession) end
     end
@@ -3021,7 +3123,12 @@ local function awakeningStep()
     claimReadySpecialTasks(SPECIAL_QUEST_ITEM[Session.awakeningFarm and Session.awakeningFarm.item or ""] or "")
 
     local missing = getMissingAwakeningReqs(unit.name)
-    if type(missing) ~= "table" then
+    if missing == nil then
+        refreshPlayerData()
+        updateAwakenItemCacheFromData(getPlayerData(), unit.name)
+        missing = getMissingAwakeningReqs(unit.name)
+    end
+    if missing == nil then
         setStatus("Awakening - refresh material counts in lobby.")
         task.wait(2)
         return
@@ -3078,11 +3185,21 @@ local function awakeningStep()
     if type(snap) == "table" then
         af.reqSnapshot = copyMissingSnapshot(snap)
         af.unitName = unit.name
+    else
+        setStatus("Awakening - material counts unknown, not launching stage.")
+        notify("Awakening", "Refresh in lobby before farming — counts unknown.", "error")
+        forgetAwakeningFarm()
+        task.wait(3)
+        return
     end
     if flushSession then pcall(flushSession) end
 
     local soloNote = (target.solo and CONFIG.soloOnly) and " solo" or ""
     local needAmt = before
+    local costTbl = getAwakeningCost(unit.name)
+    if costTbl and costTbl[itemName] then
+        needAmt = tonumber(costTbl[itemName]) or needAmt
+    end
     for _, m in ipairs(snap or {}) do
         if m.item == itemName then needAmt = m.need break end
     end
@@ -3922,16 +4039,35 @@ local function refreshAwakeningLabels()
     end
     setLabel(statusLabels.awakenUnit, "Unit: " .. unit.name .. " (id " .. tostring(unit.id) .. ")")
     local missing = getMissingAwakeningReqs(unit.name)
+    local af = Session.awakeningFarm
     if missing == nil then
-        local af = Session.awakeningFarm
-        if inPlayArea() and af and af.unitName == unit.name and type(af.reqSnapshot) == "table" then
+        if inPlayArea() and af and af.unitName == unit.name and type(af.reqSnapshotFull) == "table" then
+            missing = {}
+            for _, m in ipairs(af.reqSnapshotFull) do
+                if (tonumber(m.deficit) or 0) > 0 then
+                    missing[#missing + 1] = m
+                end
+            end
+        elseif inPlayArea() and af and af.unitName == unit.name and type(af.reqSnapshot) == "table" then
             missing = af.reqSnapshot
+        elseif inLobby() then
+            refreshPlayerData()
+            updateAwakenItemCacheFromData(getPlayerData(), unit.name)
+            missing = getMissingAwakeningReqs(unit.name)
         end
     end
     if missing == nil then
         setLabel(statusLabels.awakenReqs, "Requirements: unknown — refresh in lobby")
     elseif #missing == 0 then
-        if inPlayArea() then
+        local full = af and af.unitName == unit.name and af.reqSnapshotFull
+        if full and #full > 0 then
+            local parts = {}
+            for _, m in ipairs(full) do
+                parts[#parts + 1] = m.item .. " " .. m.have .. "/" .. m.need
+            end
+            local suffix = inPlayArea() and " (in-match)" or ""
+            setLabel(statusLabels.awakenReqs, "Requirements" .. suffix .. ": ALL MET — " .. table.concat(parts, " | "))
+        elseif inPlayArea() then
             setLabel(statusLabels.awakenReqs, "Requirements: ALL MET (verify in lobby)")
         else
             setLabel(statusLabels.awakenReqs, "Requirements: ALL MET — ready to awaken")
@@ -3939,12 +4075,20 @@ local function refreshAwakeningLabels()
     else
         local suffix = inPlayArea() and " (in-match)" or ""
         local parts = {}
-        for _, m in ipairs(missing) do
-            parts[#parts + 1] = m.item .. " " .. m.have .. "/" .. m.need
+        local full = af and af.unitName == unit.name and af.reqSnapshotFull
+        if full and #full > 0 then
+            for _, m in ipairs(full) do
+                parts[#parts + 1] = m.item .. " " .. m.have .. "/" .. m.need
+            end
+            setLabel(statusLabels.awakenReqs, "Requirements" .. suffix .. ": " .. table.concat(parts, " | "))
+        else
+            for _, m in ipairs(missing) do
+                parts[#parts + 1] = m.item .. " " .. m.have .. "/" .. m.need
+            end
+            setLabel(statusLabels.awakenReqs, "Missing" .. suffix .. ": " .. table.concat(parts, " | "))
         end
-        setLabel(statusLabels.awakenReqs, "Missing" .. suffix .. ": " .. table.concat(parts, " | "))
     end
-    local af = Session.awakeningFarm
+    af = Session.awakeningFarm
     if af and af.world and af.mode then
         local leaveHint = inPlayArea() and " · leaves on clear or enough mats" or ""
         setLabel(statusLabels.awakenFarm, ("Farming: %s %s Act %d (%s) for %s%s"):format(
