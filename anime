@@ -38,7 +38,7 @@
       data + world rewards), handle special-quest items, then invoke awaken.
 --------------------------------------------------------------------------]]
 
-local VERSION = "2.4.6"   -- bump this each upload so you can confirm the live build
+local VERSION = "2.4.7"   -- bump this each upload so you can confirm the live build
 local NEXUSLIB_URL = "https://raw.githubusercontent.com/headshot7535-png/Nexuslib/main/Nexuslib"
 
 -- ============================================================
@@ -735,6 +735,7 @@ local function refreshPlayerData()
     local ok, data = invokeR("Player", "get")
     if ok and type(data) == "table" then
         AS.playerData = data
+        AS._lobbyPlayerData = data
         pcall(function()
             local util = require(LP.PlayerScripts.Client.Utility)
             if util then util.data = data end
@@ -751,20 +752,16 @@ local function refreshMatchPlayerData(force)
         return AS._matchPlayerData
     end
     if not force and tick() - AS._lastPlayersGet < 12 then
-        return AS._matchPlayerData or AS.playerData or getPlayerData()
+        return AS._matchPlayerData or AS._lobbyPlayerData or AS.playerData or getPlayerData()
     end
     AS._lastPlayersGet = tick()
     local ok, data = invokeR("Player", "get")
     if ok and type(data) == "table" then
+        -- Match snapshot: session stats only — never overwrite util.data / lobby bank.
         AS._matchPlayerData = data
-        AS.playerData = data
-        pcall(function()
-            local util = require(LP.PlayerScripts.Client.Utility)
-            if util then util.data = data end
-        end)
         return data
     end
-    return AS._matchPlayerData or AS.playerData or getPlayerData()
+    return AS._matchPlayerData or AS._lobbyPlayerData or AS.playerData or getPlayerData()
 end
 
 local function getTraitCapCount(map)
@@ -1744,18 +1741,81 @@ local function parseCompactNumber(text)
 end
 
 -- Game hover/tooltip: items first, then stats (total owned vs session stat)
-local function readInventoryItemCount(data, itemName)
+local function readItemsOnlyCount(data, itemName)
     if type(data) ~= "table" or type(itemName) ~= "string" or itemName == "" then return nil end
     local items = type(data.items) == "table" and data.items or nil
-    if items then
-        local n = lookupExactInTable(items, itemName)
-        if n ~= nil then return n end
-    end
-    local stats = type(data.stats) == "table" and data.stats or nil
-    if stats then
-        return lookupExactInTable(stats, itemName)
+    if not items then return nil end
+    local n = lookupExactInTable(items, itemName)
+    if n ~= nil then return n end
+    local want = normalizeItemKey(itemName)
+    for k, v in pairs(items) do
+        if type(k) == "string" and normalizeItemKey(k) == want then
+            local num = coerceItemValue(v)
+            return num ~= nil and num or 0
+        end
     end
     return nil
+end
+
+local function readStatsOnlyCount(data, itemName)
+    if type(data) ~= "table" or type(itemName) ~= "string" or itemName == "" then return nil end
+    local stats = type(data.stats) == "table" and data.stats or nil
+    if not stats then return nil end
+    local n = lookupExactInTable(stats, itemName)
+    if n ~= nil then return n end
+    local want = normalizeItemKey(itemName)
+    for k, v in pairs(stats) do
+        if type(k) == "string" and normalizeItemKey(k) == want then
+            local num = coerceItemValue(v)
+            return num ~= nil and num or 0
+        end
+    end
+    return nil
+end
+
+local function mergeItemsBankCache(items)
+    if type(items) ~= "table" then return end
+    AS._itemsBankCache = AS._itemsBankCache or {}
+    for k, v in pairs(items) do
+        if type(k) == "string" then
+            local n = coerceItemValue(v)
+            if n ~= nil then
+                local nk = normalizeItemKey(k)
+                local prev = AS._itemsBankCache[nk]
+                if not prev or n > prev.count then
+                    AS._itemsBankCache[nk] = { count = n, name = k }
+                end
+            end
+        end
+    end
+end
+
+local function readItemsBankCache(itemName)
+    local cache = AS._itemsBankCache and AS._itemsBankCache[normalizeItemKey(itemName)]
+    if cache then return tonumber(cache.count) end
+    return nil
+end
+
+local function readBestItemsBankCount(itemName)
+    local best = nil
+    local function take(n)
+        n = tonumber(n)
+        if n ~= nil and (not best or n > best) then best = n end
+    end
+    take(readItemsBankCache(itemName))
+    if AS._lobbyPlayerData then take(readItemsOnlyCount(AS._lobbyPlayerData, itemName)) end
+    if AS.playerData and AS.playerData ~= AS._matchPlayerData then
+        take(readItemsOnlyCount(AS.playerData, itemName))
+    end
+    return best
+end
+
+-- Hover semantics: items bank first, stats fallback (matches game tooltip)
+local function readInventoryItemCount(data, itemName)
+    if type(data) ~= "table" or type(itemName) ~= "string" or itemName == "" then return nil end
+    local bank = readItemsOnlyCount(data, itemName)
+    if bank ~= nil then return bank end
+    return readStatsOnlyCount(data, itemName)
 end
 
 local function lookupGameStyleCount(data, itemName, firstTbl, secondTbl)
@@ -1785,18 +1845,19 @@ end
 
 local function lookupItemCountInData(data, itemName)
     if type(data) ~= "table" or type(itemName) ~= "string" or itemName == "" then return nil end
-    local inv = readInventoryItemCount(data, itemName)
-    if inv ~= nil then return inv end
+    local bank = readItemsOnlyCount(data, itemName)
+    if bank ~= nil then return bank end
     local best = nil
     local function consider(n)
         if n ~= nil and (not best or n > best) then best = n end
     end
-    consider(lookupGameStyleCount(data, itemName, "stats", "items"))
-    consider(lookupGameStyleCount(data, itemName, "items", "stats"))
+    consider(readItemsBankCache(itemName))
+    consider(readInventoryItemCount(data, itemName))
     if type(data.all_items) == "table" then
         consider(lookupExactInTable(data.all_items, itemName))
     end
-    return best
+    if best ~= nil then return best end
+    return readStatsOnlyCount(data, itemName)
 end
 
 local function readLiveItemCount(itemName, data)
@@ -1941,6 +2002,12 @@ local function rememberHoverCount(itemName, count)
     if type(itemName) ~= "string" or itemName == "" or count == nil then return end
     AS.hoverCountCache = AS.hoverCountCache or {}
     AS.hoverCountCache[normalizeItemKey(itemName)] = { count = count, at = tick(), name = itemName }
+    AS._itemsBankCache = AS._itemsBankCache or {}
+    local nk = normalizeItemKey(itemName)
+    local prev = AS._itemsBankCache[nk]
+    if not prev or count > prev.count then
+        AS._itemsBankCache[nk] = { count = count, name = itemName }
+    end
 end
 
 local function readCachedHoverCount(itemName)
@@ -2014,17 +2081,16 @@ local function readMatchItemCount(itemName)
         end
     end
 
-    local best, bestPri = nil, -1
-    local function consider(n, pri)
+    setupHoverCountWatcher()
+
+    local best = nil
+    local function take(n)
         n = tonumber(n)
-        if n == nil then return end
-        if pri > bestPri or (pri == bestPri and (not best or n > best)) then
-            best, bestPri = n, pri
-        end
+        if n ~= nil and (not best or n > best) then best = n end
     end
 
-    consider(readCachedHoverCount(itemName), 4)
-
+    -- 1. Hover tooltip (game "You Own" — highest authority)
+    take(readCachedHoverCount(itemName))
     local okHover, hoverNow = pcall(function()
         for _, hi in ipairs(collectHoverInfoFrames()) do
             if hi.Visible then
@@ -2043,33 +2109,29 @@ local function readMatchItemCount(itemName)
         end
         return nil
     end)
-    if okHover then consider(hoverNow, 3) end
+    if okHover then take(hoverNow) end
 
+    -- 2. Items bank (util.data + lobby snapshot + bank cache) — never session stats
     local utilData = getLiveUtilityData()
     if utilData then
-        consider(readInventoryItemCount(utilData, itemName), 2)
-        consider(lookupItemCountInData(utilData, itemName), 2)
+        take(readItemsOnlyCount(utilData, itemName))
+        mergeItemsBankCache(utilData.items)
     end
-
-    local playerData = AS._matchPlayerData or AS.playerData or getPlayerData()
-    if playerData then
-        consider(lookupItemCountInData(playerData, itemName), 2)
-        consider(readInventoryItemCount(playerData, itemName), 2)
-    end
-
+    take(readBestItemsBankCount(itemName))
     if AS.awakenItemCache and AS.awakenItemCache[itemName] ~= nil then
-        consider(AS.awakenItemCache[itemName], 1)
+        take(AS.awakenItemCache[itemName])
     end
     if Session.awakenItemCache and Session.awakenItemCache[itemName] ~= nil then
-        consider(Session.awakenItemCache[itemName], 1)
+        take(Session.awakenItemCache[itemName])
     end
 
+    -- 3. Stats fallback only when no bank/hover count found (session drops)
     if best == nil then
+        local matchData = AS._matchPlayerData
+        if matchData then take(readStatsOnlyCount(matchData, itemName)) end
+        if utilData then take(readStatsOnlyCount(utilData, itemName)) end
         local fresh = refreshMatchPlayerData(false)
-        if fresh then
-            consider(lookupItemCountInData(fresh, itemName), 2)
-            consider(readInventoryItemCount(fresh, itemName), 2)
-        end
+        if fresh then take(readStatsOnlyCount(fresh, itemName)) end
     end
 
     return best
@@ -2110,12 +2172,14 @@ end
 
 local function updateAwakenItemCacheFromData(data, unitName)
     if type(data) ~= "table" then return end
+    mergeItemsBankCache(data.items)
     local cost = unitName and getAwakeningCost(unitName)
     if not cost then return end
     AS.awakenItemCache = AS.awakenItemCache or {}
     Session.awakenItemCache = Session.awakenItemCache or {}
     for item in pairs(cost) do
-        local n = lookupItemCountInData(data, item)
+        local n = readItemsOnlyCount(data, item)
+        if n == nil then n = readBestItemsBankCount(item) end
         if n == nil then n = readInventoryItemCount(data, item) end
         if n == nil then n = readLiveItemCount(item, data) end
         AS.awakenItemCache[item] = n
@@ -2149,12 +2213,16 @@ end
 
 local function syncReqSnapshotHave(itemName, have)
     local af = Session.awakeningFarm
-    if not af or type(af.reqSnapshot) ~= "table" then return end
+    if not af then return end
     have = tonumber(have) or 0
-    for _, m in ipairs(af.reqSnapshot) do
-        if m.item == itemName then
-            m.have = have
-            m.deficit = math.max(0, (tonumber(m.need) or 0) - have)
+    for _, list in ipairs({ af.reqSnapshot, af.reqSnapshotFull }) do
+        if type(list) == "table" then
+            for _, m in ipairs(list) do
+                if m.item == itemName then
+                    m.have = have
+                    m.deficit = math.max(0, (tonumber(m.need) or 0) - have)
+                end
+            end
         end
     end
 end
@@ -2164,20 +2232,22 @@ local function syncAwakenItemCount(itemName, live)
     if live == nil then return nil end
     restoreAwakenItemCache()
     local hover = readCachedHoverCount(itemName)
-    local out = live
-    if hover and hover > out then out = hover end
+    if hover and hover > live then live = hover end
+    local bank = readBestItemsBankCount(itemName)
+    if bank and bank > live then live = bank end
+    local utilData = getLiveUtilityData()
+    if utilData then
+        local utilBank = readItemsOnlyCount(utilData, itemName)
+        if utilBank and utilBank > live then live = utilBank end
+    end
     local prev = tonumber(AS.awakenItemCache and AS.awakenItemCache[itemName])
         or tonumber(Session.awakenItemCache and Session.awakenItemCache[itemName])
-    if inPlayArea() and isAwakeningCostItem(itemName) then
-        if prev and prev > out then out = prev end
-    elseif prev and prev > out then
-        out = prev
+    if prev and prev > live then live = prev end
+    if not prev or live ~= prev then
+        bumpAwakenItemCache(itemName, live)
     end
-    if not prev or out ~= prev then
-        bumpAwakenItemCache(itemName, out)
-    end
-    syncReqSnapshotHave(itemName, out)
-    return out
+    syncReqSnapshotHave(itemName, live)
+    return live
 end
 
 local function getItemCount(itemName)
@@ -2191,22 +2261,26 @@ local function getItemCount(itemName)
         if hover ~= nil then
             return syncAwakenItemCount(itemName, hover)
         end
-        local data = AS._matchPlayerData or AS.playerData or getPlayerData()
-        if data then
-            live = lookupItemCountInData(data, itemName)
+        local bank = readBestItemsBankCount(itemName)
+        if bank ~= nil then
+            return syncAwakenItemCount(itemName, bank)
+        end
+        local utilData = getLiveUtilityData()
+        if utilData then
+            live = readItemsOnlyCount(utilData, itemName)
             if live ~= nil then
                 return syncAwakenItemCount(itemName, live)
             end
         end
         if AS.awakenItemCache and AS.awakenItemCache[itemName] ~= nil then
-            return AS.awakenItemCache[itemName]
+            return syncAwakenItemCount(itemName, AS.awakenItemCache[itemName])
         end
         if Session.awakenItemCache and Session.awakenItemCache[itemName] ~= nil then
-            return tonumber(Session.awakenItemCache[itemName]) or 0
+            return syncAwakenItemCount(itemName, Session.awakenItemCache[itemName])
         end
-        data = refreshMatchPlayerData(false)
-        if data then
-            live = lookupItemCountInData(data, itemName)
+        local matchData = AS._matchPlayerData
+        if matchData then
+            live = readStatsOnlyCount(matchData, itemName)
             if live ~= nil then
                 return syncAwakenItemCount(itemName, live)
             end
@@ -2448,22 +2522,27 @@ local function resolveAwakenItemCount(itemName, snapByItem)
     if type(itemName) ~= "string" or itemName == "" then return nil end
     local have = getItemCount(itemName)
     if have ~= nil then return have end
-    if type(snapByItem) == "table" and snapByItem[itemName] then
-        have = tonumber(snapByItem[itemName].have)
-        if have ~= nil then return have end
-    end
+    have = readBestItemsBankCount(itemName)
+    if have ~= nil then return have end
     have = tonumber(AS.awakenItemCache and AS.awakenItemCache[itemName])
         or tonumber(Session.awakenItemCache and Session.awakenItemCache[itemName])
     if have ~= nil then return have end
-    local data = AS._matchPlayerData or AS.playerData or getPlayerData()
+    local data = AS._lobbyPlayerData or AS.playerData or getPlayerData()
     if data then
-        have = lookupItemCountInData(data, itemName)
+        have = readItemsOnlyCount(data, itemName)
+        if have ~= nil then return have end
+        have = readInventoryItemCount(data, itemName)
         if have ~= nil then return have end
     end
     if inPlayArea() then
-        data = refreshMatchPlayerData(false)
+        local utilData = getLiveUtilityData()
+        if utilData then
+            have = readItemsOnlyCount(utilData, itemName)
+            if have ~= nil then return have end
+        end
+        data = AS._matchPlayerData
         if data then
-            have = lookupItemCountInData(data, itemName)
+            have = readStatsOnlyCount(data, itemName)
             if have ~= nil then return have end
         end
     end
