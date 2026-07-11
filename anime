@@ -1,4633 +1,539 @@
 --[[
-    Anime Squadron
-    --------------------------------------------------------------------------
-    DAILY TRAIT FARM:
-      Farms every Story/Raid/Challenge map that drops capped Trait Shards.
-      Reads your daily cap progress from player data (same X/100 the Play menu
-      shows). When a map hits its cap, returns to lobby and moves to the next
-      map. Loops through priority maps until every daily trait cap is filled.
+    Combat Probe v1.0 — Anime Squadron combat data discovery
+    ------------------------------------------------------------------
+    Run this IN A STAGE (not lobby) while your units are fighting.
+    It sniffs remotes, workspace models, leaderstats, required modules,
+    and (if your executor supports it) getgc() for server combat tables.
 
-    AUTO EXECUTE:
-      queue_on_teleport re-runs this script after EVERY teleport (manual or
-      script-initiated). The queue is kept armed continuously + re-armed on
-      OnTeleport so manual lobby/stage hops still resume. Autoexec file (Misc
-      tab) is ONLY for full manual rejoins - it skips when a teleport queue
-      already fired, preventing double execution.
+    Output: CombatProbe_log.txt in your executor workspace folder.
 
-    ANTI-AFK:
-      Blocks the 20-minute idle kick (Idled hook + input nudge + disables any
-      built-in AFK script). Toggle it in the Misc tab.
+    getgenv().CombatProbeVerbose = true   -- print every hit to console too
+    getgenv().CombatProbeMaxLines = 8000  -- cap log size per session
+]]
 
-    DPS METER:
-      Live team DPS from leaderstats.Damage + theoretical per-slot DPS (dmg/cd)
-      for equipped units. See the DPS tab.
-
-    DAILY TRAIT LEAVE:
-      Leaves the stage as soon as a map's daily Trait Shard cap is full. Tries
-      Settings Teleport, game Play.leave(), Matchmaking/leave, and GUI Leave.
-
-    DAILY TRAIT PRIORITY:
-      Reorder and enable/disable which trait maps to farm. Lower number = farmed
-      sooner; capped maps are skipped to the next enabled priority map.
-
-    ROTATING CHALLENGES:
-      Auto-clears Daily Challenge [1d] and Regular Challenge [30m] once per reset.
-
-    AUTO AWAKENING:
-      Pick a unit, farm maps for missing awakening materials (parsed from item
-      data + world rewards), handle special-quest items, then invoke awaken.
---------------------------------------------------------------------------]]
-
-local VERSION = "2.4.7"   -- bump this each upload so you can confirm the live build
-local NEXUSLIB_URL = "https://raw.githubusercontent.com/headshot7535-png/Nexuslib/main/Nexuslib"
-
--- ============================================================
--- Boot lock (prevents double GUI on teleport) — claim BEFORE bumping GEN
--- so a rejected duplicate boot does not kill the live instance's status thread.
--- ============================================================
-local BOOT_LOCK_FILE = "AnimeSquadron_boot_lock.json"
-local SETTINGS_FILE = "AnimeSquadron_settings.json"
-local LEGACY_SETTINGS_FILE = "AutoBounty_settings.json"
-local function canFile()
-    return (writefile and readfile and isfile) and true or false
-end
-local function claimScriptBoot()
-    local now = tick()
-    if _G.AS_BootAt and (now - _G.AS_BootAt) < 4 then return false end
-    _G.AS_BootAt = now
-    if not canFile() then return true end
-    local job = game.JobId
-    if isfile(BOOT_LOCK_FILE) then
-        local ok, raw = pcall(readfile, BOOT_LOCK_FILE)
-        if ok and raw and raw ~= "" then
-            local ok2, d = pcall(function()
-                return game:GetService("HttpService"):JSONDecode(raw)
-            end)
-            if ok2 and type(d) == "table" and d.job == job and (now - (d.at or 0)) < 4 then
-                return false
-            end
-        end
-    end
-    pcall(function()
-        writefile(BOOT_LOCK_FILE, game:GetService("HttpService"):JSONEncode({
-            job = job, at = now,
-        }))
-    end)
-    return true
-end
-if not claimScriptBoot() then return end
-
--- persistent state (survives re-execution / teleport)
-_G.AS = _G.AS or _G.AB or {}
-local AS = _G.AS
-
--- ============================================================
--- Anti-stacking generation token (only after boot claimed)
--- ============================================================
-_G.AnimeSquadronGen = (_G.AnimeSquadronGen or _G.AutoBountyGen or 0) + 1
-local GEN = _G.AnimeSquadronGen
-local function alive() return _G.AnimeSquadronGen == GEN end
-
--- ============================================================
--- Services
--- ============================================================
-local Players           = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local HttpService       = game:GetService("HttpService")
-local LP                = Players.LocalPlayer
-
--- ============================================================
--- Config (with getgenv overrides)
--- ============================================================
--- Raw URL this script is hosted at (used for auto-execute / queue_on_teleport)
-local SCRIPT_URL = "https://raw.githubusercontent.com/headshot7535-png/Anime-Squadron/refs/heads/main/anime"
+local VERSION = "1.1"
+_G.CombatProbeGen = (_G.CombatProbeGen or 0) + 1
+local GEN = _G.CombatProbeGen
+local function alive() return _G.CombatProbeGen == GEN end
 
 local g = getgenv and getgenv() or {}
-local CONFIG = {
-    soloOnly         = (g.AnimeSquadronSolo ~= false) and (g.AutoBountySolo ~= false),
-    loopDelay        = 1.0,
-    actionCooldown   = 0.45,
-    farmTimeout      = 600,
-    autoExecute      = (g.AnimeSquadronAutoExecute ~= false) and (g.AutoBountyAutoExecute ~= false),
-    scriptUrl        = g.AnimeSquadronScriptURL or g.AutoBountyScriptURL or SCRIPT_URL,
-    autoexecInstall  = (g.AnimeSquadronAutoexecInstall == true) or (g.AutoBountyAutoexecInstall == true),
-    antiAfk          = (g.AnimeSquadronAntiAFK ~= false) and (g.AutoBountyAntiAFK ~= false),
-    antiAfkInterval  = 8,
-    dailyTraitFarm   = (g.AnimeSquadronDailyTraits ~= false) and (g.AutoBountyDailyTraits ~= false),
-    dailyDifficulty  = g.AnimeSquadronDailyDifficulty or g.AutoBountyDailyDifficulty or "Normal",
-    dailyStopWhenDone = (g.AnimeSquadronDailyStopWhenDone ~= false) and (g.AutoBountyDailyStopWhenDone ~= false),
-    dailyStallRuns   = tonumber(g.AnimeSquadronDailyStallRuns or g.AutoBountyDailyStallRuns) or 3,
-    dailyPriorityOrder   = type(g.AnimeSquadronDailyPriority) == "table" and g.AnimeSquadronDailyPriority
-        or (type(g.AutoBountyDailyPriority) == "table" and g.AutoBountyDailyPriority or {}),
-    dailyPriorityEnabled = type(g.AnimeSquadronDailyPriorityEnabled) == "table" and g.AnimeSquadronDailyPriorityEnabled
-        or (type(g.AutoBountyDailyPriorityEnabled) == "table" and g.AutoBountyDailyPriorityEnabled or {}),
-    dpsMeter         = (g.AnimeSquadronDpsMeter ~= false) and (g.AutoBountyDpsMeter ~= false),
-    autoDailyChallenge   = (g.AnimeSquadronDailyChallenge ~= false) and (g.AutoBountyDailyChallenge ~= false),
-    autoRegularChallenge = (g.AnimeSquadronRegularChallenge ~= false) and (g.AutoBountyRegularChallenge ~= false),
-    challengeDone        = type(g.AnimeSquadronChallengeDone) == "table" and g.AnimeSquadronChallengeDone
-        or (type(g.AutoBountyChallengeDone) == "table" and g.AutoBountyChallengeDone or {}),
-    challengeDoneMeta    = type(g.AnimeSquadronChallengeDoneMeta) == "table" and g.AnimeSquadronChallengeDoneMeta
-        or (type(g.AutoBountyChallengeDoneMeta) == "table" and g.AutoBountyChallengeDoneMeta or {}),
-    autoAwakening        = g.AnimeSquadronAutoAwakening == true,
-    awakeningUnit      = type(g.AnimeSquadronAwakeningUnit) == "string" and g.AnimeSquadronAwakeningUnit or "",
-    awakeningDifficulty = g.AnimeSquadronAwakeningDifficulty or g.AutoBountyAwakeningDifficulty or "Normal",
-    awakeningStallRuns = tonumber(g.AnimeSquadronAwakeningStallRuns) or 4,
-}
-CONFIG.enabled = false                                 -- set from the saved session below
+local VERBOSE = g.CombatProbeVerbose == true
+local MAX_LINES = tonumber(g.CombatProbeMaxLines) or 8000
+local LOG_FILE = "CombatProbe_log.txt"
 
--- ============================================================
--- Cross-teleport memory.
--- _G is WIPED on teleport (new place = new Luau VM). We persist the running
--- state and daily farm progress to DISK so it survives lobby <-> battle hops.
--- ============================================================
-local Session = { running = false, dailyFarm = nil, challengeFarm = nil, awakeningFarm = nil }
--- forward declarations (these are referenced earlier than they are defined)
-local saveSession, flushSession
-local saveSettings
-local SESSION_FILE
-local setEnabled, mainLoop
-local armReexec
-local persistMasterToggleImmediate
+local HttpService = game:GetService("HttpService")
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local LP = Players.LocalPlayer
 
-SESSION_FILE = "AnimeSquadron_session.json"
-local LEGACY_SESSION_FILE = "AutoBounty_session.json"
-
-persistMasterToggleImmediate = function()
-    if not canFile() then return end
-    local data = {}
-    local path = SETTINGS_FILE
-    if not isfile(path) and isfile(LEGACY_SETTINGS_FILE) then
-        path = LEGACY_SETTINGS_FILE
-    end
-    if isfile(path) then
-        local ok, raw = pcall(readfile, path)
-        if ok and raw then
-            local ok2, d = pcall(function() return HttpService:JSONDecode(raw) end)
-            if ok2 and type(d) == "table" then data = d end
-        end
-    end
-    data.enabled = CONFIG.enabled == true
-    pcall(function() writefile(SETTINGS_FILE, HttpService:JSONEncode(data)) end)
-end
-
--- ============================================================
--- Cleanup system
--- ============================================================
 local _conns, _threads = {}, {}
-local function addConn(c) table.insert(_conns, c); return c end
-local function addThread(fn)
-    local t = task.spawn(fn)
-    table.insert(_threads, t)
-    return t
-end
-local function cleanupAll()
+local function addConn(c) if c then table.insert(_conns, c) end end
+local function addThread(fn) local t = task.spawn(fn); table.insert(_threads, t); return t end
+local function cleanup()
     for _, c in ipairs(_conns) do pcall(function() c:Disconnect() end) end
     for _, t in ipairs(_threads) do pcall(function() task.cancel(t) end) end
     _conns, _threads = {}, {}
 end
--- kill the previous instance's connections/threads/GUI
-if AS.cleanup then pcall(AS.cleanup) end
+if _G.CombatProbeCleanup then pcall(_G.CombatProbeCleanup) end
+_G.CombatProbeCleanup = function() cleanup() end
 
 -- ============================================================
--- Wait for PlayerGui
+-- Logging
 -- ============================================================
-do
-    local ok = false
-    for _ = 1, 60 do
-        if LP and LP:FindFirstChildOfClass("PlayerGui") then ok = true break end
-        task.wait(0.3)
-    end
-    if not ok then return end
+local lineCount = 0
+local logBuf = {}
+local lastFlush = 0
+
+local function canFile()
+    return writefile and readfile and isfile and appendfile
 end
 
--- ============================================================
--- Remote caching + safe calling
--- ============================================================
-local _remotes = {}
-local function getRemote(folder, name)
-    local key = folder .. "/" .. name
-    local cached = _remotes[key]
-    if cached and cached.Parent then return cached end
-    local f = ReplicatedStorage:FindFirstChild("Remotes")
-    f = f and f:FindFirstChild(folder)
-    local r = f and f:FindFirstChild(name)
-    if r then _remotes[key] = r end
-    return r
-end
-
-local _lastCall = 0
-local function throttle()
-    local dt = tick() - _lastCall
-    if dt < CONFIG.actionCooldown then task.wait(CONFIG.actionCooldown - dt) end
-    _lastCall = tick()
-end
-
--- InvokeServer wrapper that preserves multi-returns: ok, serverSuccess, a, b
-local function invokeR(folder, name, ...)
-    local r = getRemote(folder, name)
-    if not r then return false, "remote_missing" end
-    throttle()
-    local res = table.pack(pcall(function(...) return r:InvokeServer(...) end, ...))
-    if not res[1] then return false, res[2] end
-    return true, res[2], res[3], res[4]
-end
-local function fireR(folder, name, ...)
-    local r = getRemote(folder, name)
-    if not r then return false end
-    throttle()
-    return pcall(function(...) r:FireServer(...) end, ...)
-end
-
--- ============================================================
--- GUI helpers / place detection
--- ============================================================
-local function getMenus()
-    local pg = LP:FindFirstChildOfClass("PlayerGui")
-    return pg and pg:FindFirstChild("Menus")
-end
-local function inBattle()
-    local chars = workspace:FindFirstChild("Characters")
-    if not chars then return false end
-    for _, ch in ipairs(chars:GetChildren()) do
-        if ch:IsA("Model") then return true end
-    end
-    return false
-end
-
-local function cameraInPlayArea()
-    local cam = workspace.CurrentCamera
-    if not cam or cam.CameraType ~= Enum.CameraType.Scriptable then return false end
-    local pa = workspace:FindFirstChild("play_area")
-    return pa ~= nil and pa:FindFirstChild("camera") ~= nil
-end
-
-local function hotbarInLobbyPos()
-    local menus = getMenus()
-    if not menus or not menus.Parent then return false end
-    local hotbar = menus.Parent:FindFirstChild("Hotbar")
-    local bottom = hotbar and hotbar:FindFirstChild("BottomUI")
-    if bottom and bottom:IsA("GuiObject") then
-        return bottom.Position.Y.Scale < 1.05
-    end
-    return true
-end
-
-local function playAreaHasUnits()
-    local pa = workspace:FindFirstChild("play_area")
-    local models = pa and pa:FindFirstChild("models")
-    if not models then return false end
-    for _, c in ipairs(models:GetChildren()) do
-        if c:IsA("Model") then return true end
-    end
-    return false
-end
-
-local function isRewardScreenVisible()
-    local menus = getMenus()
-    local root = menus and menus.Parent
-    if not root then return false end
-    local priority = root:FindFirstChild("Priority")
-    local rs = priority and priority:FindFirstChild("RewardScreen")
-    return rs and rs:IsA("GuiObject") and rs.Visible or false
-end
-
-local function isLoadingScreenVisible()
-    local menus = getMenus()
-    local root = menus and menus.Parent
-    if not root then return false end
-    local loading = root:FindFirstChild("Loading")
-    local ls = loading and loading:FindFirstChild("Loading_Screen")
-    return ls and ls:IsA("GuiObject") and ls.Visible or false
-end
-
-local function isStageMenuVisible()
-    local menus = getMenus()
-    if not menus then return false end
-    for _, name in ipairs({ "Play_Start", "StageInfo" }) do
-        local f = menus:FindFirstChild(name)
-        if f and f:IsA("GuiObject") and f.Visible then return true end
-    end
-    return false
-end
-
--- Still inside the play-area / stage flow (not the real hub lobby)
-local function inPlayArea()
-    if inBattle() then return true end
-    if playAreaHasUnits() then return true end
-    if cameraInPlayArea() then return true end
-    if isStageMenuVisible() then return true end
-    if isLoadingScreenVisible() then return true end
-    if isRewardScreenVisible() then return true end
-    if not hotbarInLobbyPos() then return true end
-    return false
-end
-
--- Real hub lobby — safe to start the next map/challenge
-local function inLobby()
-    if not getMenus() then return false end
-    return not inPlayArea()
-end
-
--- UI handle (set later) + status helpers — must be before leaveStage / daily helpers
-local Win
-local function setStatus(msg)
-    if Win then pcall(function() Win:Status(msg) end) end
-end
-local function notify(title, msg, typ)
-    if Win then pcall(function() Win:Notify(title, msg, 4, typ or "info") end) end
-end
-
--- Stage leave (Settings > Gameplay > Back To Lobby > Teleport during raids)
-local function guiText(node)
-    if not node then return "" end
-    if node:IsA("TextLabel") or node:IsA("TextButton") then return node.Text or "" end
-    return ""
-end
-
-local function guiTextDeep(node)
-    if not node then return "" end
-    local direct = guiText(node)
-    if direct ~= "" then return direct end
-    for _, d in ipairs(node:GetDescendants()) do
-        if d:IsA("TextLabel") or d:IsA("TextButton") then
-            local t = d.Text
-            if t and t ~= "" then return t end
-        end
-    end
-    return ""
-end
-
-local function invokeGui(btn)
-    if not btn or not btn.Parent then return false end
-    local targets = { btn }
-    local rb = btn:FindFirstChild("RealButton")
-    if rb then targets[#targets + 1] = rb end
-    local fired = false
-    if getconnections then
-        for _, t in ipairs(targets) do
-            for _, sig in ipairs({ "Activated", "MouseButton1Click" }) do
-                local ev = t[sig]
-                if ev then
-                    for _, conn in ipairs(getconnections(ev)) do
-                        if conn.Function then
-                            fired = pcall(conn.Function) or fired
-                        end
-                    end
-                end
-            end
-        end
-    end
-    if not fired and firesignal then
-        for _, t in ipairs(targets) do
-            fired = pcall(firesignal, t.Activated) or fired
-            fired = pcall(firesignal, t.MouseButton1Click) or fired
-        end
-    end
-    return fired
-end
-
-local function clickGui(btn)
-    return invokeGui(btn)
-end
-
-local function openGameSettingsGameplay()
-    local menus = getMenus()
-    if not menus then return nil end
-    local settings = menus:FindFirstChild("Settings")
-    if not settings then return nil end
-
-    if not settings.Visible then
-        local openBtn = menus:FindFirstChild("Buttons")
-            and menus.Buttons:FindFirstChild("Buttons2")
-            and menus.Buttons.Buttons2:FindFirstChild("Settings")
-        if openBtn then
-            local rb = openBtn:FindFirstChild("RealButton")
-            invokeGui(rb or openBtn)
-        end
-        task.wait(0.35)
-        if not settings.Visible then settings.Visible = true end
-    end
-
-    local filters = settings:FindFirstChild("Filters")
-    local gameplayTab = filters and filters:FindFirstChild("Gameplay")
-    if gameplayTab then
-        local rb = gameplayTab:FindFirstChild("RealButton")
-        invokeGui(rb or gameplayTab)
-    end
-
-    local sf = settings:FindFirstChild("ScrollingFrame")
-    local gameplay = sf and sf:FindFirstChild("Gameplay")
-    if gameplay then gameplay.Visible = true end
-    task.wait(0.15)
-    return gameplay
-end
-
-local function findBackToLobbyTeleportBtn()
-    local menus = getMenus()
-    local settings = menus and menus:FindFirstChild("Settings")
-    if not settings then return nil end
-    local searchRoots = {}
-    local sf = settings:FindFirstChild("ScrollingFrame")
-    if sf then
-        local gameplay = sf:FindFirstChild("Gameplay")
-        if gameplay then searchRoots[#searchRoots + 1] = gameplay end
-        searchRoots[#searchRoots + 1] = sf
-    end
-    searchRoots[#searchRoots + 1] = settings
-
-    for _, root in ipairs(searchRoots) do
-        for _, key in ipairs({ "back_to_lobby", "return_to_lobby", "to_lobby", "back_to_lobby_button" }) do
-            local row = root:FindFirstChild(key, true)
-            if row then
-                local action = row:FindFirstChild("button") or row:FindFirstChild("action")
-                if action and not action:FindFirstChild("slider") then return action end
-            end
-        end
-    end
-
-    for _, root in ipairs(searchRoots) do
-        for _, row in ipairs(root:GetDescendants()) do
-            if row:IsA("GuiButton") then
-                local nameLbl = row:FindFirstChild("name")
-                if nameLbl and nameLbl:IsA("TextLabel") then
-                    local txt = nameLbl.Text:lower()
-                    if txt:find("back", 1, true) and txt:find("lobby", 1, true) then
-                        for _, ch in ipairs(row:GetDescendants()) do
-                            if (ch:IsA("GuiButton") or ch:IsA("TextButton")) and ch ~= row then
-                                if guiTextDeep(ch):lower():find("teleport", 1, true) then
-                                    return ch
-                                end
-                            end
-                        end
-                        local action = row:FindFirstChild("button")
-                        if action and not action:FindFirstChild("slider") then return action end
-                    end
-                end
-            end
-        end
-        for _, d in ipairs(root:GetDescendants()) do
-            if d:IsA("TextLabel") and guiText(d):lower() == "teleport" then
-                local parent = d.Parent
-                while parent and parent ~= root do
-                    if parent:IsA("GuiButton") or parent:IsA("TextButton") or parent:IsA("ImageButton") then
-                        return parent
-                    end
-                    parent = parent.Parent
-                end
-            end
-        end
-    end
-    return nil
-end
-
-local function clientForceLeave()
+local function flushLog(force)
+    if not canFile() or #logBuf == 0 then return end
+    if not force and (tick() - lastFlush) < 2 then return end
+    local chunk = table.concat(logBuf, "\n") .. "\n"
+    logBuf = {}
+    lastFlush = tick()
     pcall(function()
-        local play = require(LP.PlayerScripts.Client.Play)
-        if play and type(play.leave) == "function" then
-            play.leave(nil, true)
-        end
+        if isfile(LOG_FILE) then appendfile(LOG_FILE, chunk)
+        else writefile(LOG_FILE, chunk) end
     end)
 end
 
-local function clickBackToLobby()
-    local btn = findBackToLobbyTeleportBtn()
-    if not btn then
-        openGameSettingsGameplay()
-        btn = findBackToLobbyTeleportBtn()
-    end
-    if not btn then return false end
-    if not invokeGui(btn) then return false end
-    task.wait(1.2)
-    return inLobby()
+local function log(tag, msg)
+    if lineCount >= MAX_LINES then return end
+    lineCount = lineCount + 1
+    local line = ("[%s] [%s] %s"):format(os.date("%H:%M:%S"), tag, tostring(msg))
+    if VERBOSE then print(line) end
+    logBuf[#logBuf + 1] = line
+    if #logBuf >= 25 then flushLog(true) end
 end
 
-local _lastLeaveAt = 0
-local function leaveStage(force)
-    local now = tick()
-    if not force and now - _lastLeaveAt < 0.8 then return inLobby() end
-    _lastLeaveAt = now
+pcall(function()
+    if canFile() then
+        writefile(LOG_FILE, ("=== Combat Probe v%s started %s ===\n"):format(VERSION, os.date()))
+    end
+end)
 
-    if inLobby() then return true end
-
-    if armReexec then pcall(armReexec) end
-
-    setStatus("Leaving stage (Play.leave + remotes)...")
-
-    clientForceLeave()
-    task.wait(0.8)
-    if inLobby() then return true end
-
-    clickBackToLobby()
-    task.wait(0.8)
-    if inLobby() then return true end
-
-    fireR("Play", "leave")
-    fireR("Matchmaking", "leave")
-    pcall(function() invokeR("Player", "physical_teleport", "play") end)
-
-    pcall(function()
-        local menus = getMenus()
-        if not menus then return end
-        local stage = menus:FindFirstChild("StageInfo")
-        local leaveBtn = stage and stage:FindFirstChild("Buttons") and stage.Buttons:FindFirstChild("Leave")
-        if leaveBtn and leaveBtn.Visible then invokeGui(leaveBtn) end
-    end)
-
-    task.wait(0.6)
-    return inLobby()
+-- ============================================================
+-- Safe serialization (for remote payloads / tables)
+-- ============================================================
+local seen = {}
+local function keyLess(a, b)
+    local ta, tb = typeof(a), typeof(b)
+    if ta == "number" and tb == "number" then return a < b end
+    return tostring(a) < tostring(b)
 end
 
--- ============================================================
--- Matchmaking (start a stage)
--- ============================================================
-local function startMap(world, act, mode, difficulty, rewards)
-    local current = {
-        world        = world,
-        act          = act or 1,
-        mode         = mode or "Story",
-        difficulty   = difficulty or CONFIG.dailyDifficulty,
-        only_friends = CONFIG.soloOnly and true or false,
-    }
-    if type(rewards) == "table" then
-        current.rewards = rewards
+local function ser(v, depth)
+    depth = tonumber(depth) or 0
+    if depth > 10 then return "\"<maxdepth>\"" end
+    local tv = typeof(v)
+    if tv == "nil" then return "null"
+    elseif tv == "boolean" or tv == "number" then return tostring(v)
+    elseif tv == "string" then
+        if #v > 300 then return "\"" .. v:sub(1, 300) .. "…\"" end
+        return "\"" .. v:gsub("[\r\n\"]", " ") .. "\""
+    elseif tv == "Instance" then
+        return "\"@" .. v:GetFullName() .. "\""
+    elseif tv == "Vector3" then
+        return string.format("{\"x\":%.2f,\"y\":%.2f,\"z\":%.2f}", v.X, v.Y, v.Z)
+    elseif tv == "CFrame" then
+        local p = v.Position
+        return string.format("{\"cf\":%.1f,%.1f,%.1f}", p.X, p.Y, p.Z)
+    elseif tv == "EnumItem" then return "\"" .. tostring(v) .. "\""
+    elseif tv == "table" then
+        if seen[v] then return "\"<cycle>\"" end
+        seen[v] = true
+        local keys = {}
+        local n = 0
+        for k in pairs(v) do
+            n = n + 1
+            keys[n] = k
+            if n > 40 then break end
+        end
+        table.sort(keys, keyLess)
+        local parts = {}
+        local arr = true
+        for i = 1, n do if keys[i] ~= i then arr = false break end end
+        if arr then
+            for i = 1, math.min(n, 30) do
+                parts[i] = ser(v[i], depth + 1)
+            end
+            seen[v] = nil
+            return "[" .. table.concat(parts, ",") .. "]"
+        end
+        for _, k in ipairs(keys) do
+            parts[#parts + 1] = ser(k, depth + 1) .. ":" .. ser(v[k], depth + 1)
+        end
+        seen[v] = nil
+        return "{" .. table.concat(parts, ",") .. "}"
     end
-    local okC, sucC, room = invokeR("Play", "create_room", current)
-    if not (okC and sucC) then
-        return false, tostring(room or "create_room failed")
-    end
-    task.wait(0.3)
-    -- prime the re-exec queue RIGHT before we teleport, so the script comes
-    -- back automatically in the battle place (and again on the way to lobby)
-    if armReexec then pcall(armReexec) end
-    local okS, sucS = invokeR("Play", "start")
-    if okS and sucS then return true end
-    -- couldn't start; clean up the room so we don't get stuck
-    pcall(function() leaveStage() end)
-    return false, "start failed"
+    return "\"" .. tv .. "\""
 end
 
--- ============================================================
--- Daily trait farm (capped Trait Shard drops per map)
--- The Play client tracks caps in player data: caps["raid_gt city_4_trait shards"]
--- ============================================================
--- Maps with Trait Shards + daily cap (fallback if runtime discovery fails).
-local TRAIT_DAILY_MAPS = {
-    { world = "GT City",            mode = "Raid",      act = 4, cap = 100 },
-    { world = "Eclipse (Before)",   mode = "Raid",      act = 4, cap = 100 },
-    { world = "Katakara Bridge",    mode = "Challenge", act = 1, cap = 100 },
-    { world = "The Hero Hunter",    mode = "Challenge", act = 1, cap = 30 },
-    { world = "The Lava Continent", mode = "Invasion",  act = 4, cap = 100 },
+local function serArgs(...)
+    seen = {}
+    local n = select("#", ...)
+    local parts = {}
+    for i = 1, n do
+        local ok, s = pcall(ser, select(i, ...), 0)
+        parts[i] = ok and s or "\"<ser err>\""
+    end
+    return table.concat(parts, " | ")
+end
+
+local COMBAT_KEYS = {
+    "damage", "dmg", "dps", "health", "hp", "owner", "attacker", "source",
+    "target", "killer", "deal", "dealt", "hit", "attack", "combat", "unit",
+    "ally", "allies", "enemy", "enemies", "id", "name", "type", "progress",
 }
 
-local WORLD_INDICES = { 1, 2, 3, 4, 5, -1, -2, -3, -4, -5 }
-
-local function discoverTraitMaps()
-    local found, seen = {}, {}
-    local function add(m)
-        if type(m) ~= "table" or not m.world or not m.mode or not m.act then return end
-        local key = m.mode .. "|" .. m.world .. "|" .. tostring(m.act)
-        local cap = tonumber(m.cap) or 100
-        if seen[key] then
-            -- same map can list different caps per difficulty; keep the higher one
-            if cap > seen[key].cap then seen[key].cap = cap end
-            return
-        end
-        local entry = { world = m.world, mode = m.mode, act = m.act, cap = cap }
-        seen[key] = entry
-        found[#found + 1] = entry
+local function scorePayload(s)
+    local lower = string.lower(s)
+    local score = 0
+    for _, k in ipairs(COMBAT_KEYS) do
+        if lower:find(k, 1, true) then score = score + 1 end
     end
-    for _, m in ipairs(TRAIT_DAILY_MAPS) do add(m) end
-    local ok, Worlds = pcall(function() return require(LP.PlayerScripts.Client.Play.Worlds) end)
-    if ok and type(Worlds) == "table" then
-        for _, idx in ipairs(WORLD_INDICES) do
-            local w = Worlds[idx]
-            if type(w) == "table" and w.name and type(w.Rewards) == "table" then
-                for mode, modeData in pairs(w.Rewards) do
-                    if type(modeData) == "table" then
-                        for _, diffData in pairs(modeData) do
-                            if type(diffData) == "table" then
-                                for act, actRewards in ipairs(diffData) do
-                                    local ts = actRewards["Trait Shards"]
-                                    if type(ts) == "table" and ts.cap then
-                                        add({
-                                            world = w.name,
-                                            mode  = mode,
-                                            act   = act,
-                                            cap   = tonumber(ts.cap) or 100,
-                                        })
-                                    end
-                                end
-                            end
-                        end
-                    end
-                end
-            end
-        end
-    end
-    table.sort(found, function(a, b)
-        if a.world ~= b.world then return a.world < b.world end
-        if a.mode ~= b.mode then return a.mode < b.mode end
-        return a.act < b.act
-    end)
-    return #found > 0 and found or TRAIT_DAILY_MAPS
-end
-TRAIT_DAILY_MAPS = discoverTraitMaps()
-
--- Default farm order (top = highest priority). Keys: mode|world|act
-local DEFAULT_DAILY_PRIORITY = {
-    "Raid|Eclipse (Before)|4",
-    "Raid|GT City|4",
-    "Challenge|Katakara Bridge|1",
-    "Challenge|The Hero Hunter|1",
-    "Invasion|The Lava Continent|4",
-}
-
-local function mapTraitKey(m)
-    return ("%s|%s|%s"):format(tostring(m.mode), tostring(m.world), tostring(m.act))
+    return score
 end
 
-local function findTraitMapByKey(key)
-    for _, m in ipairs(TRAIT_DAILY_MAPS) do
-        if mapTraitKey(m) == key then return m end
-    end
-    return nil
-end
-
-local function ensureDailyPriorityConfig()
-    if type(CONFIG.dailyPriorityOrder) ~= "table" then CONFIG.dailyPriorityOrder = {} end
-    if type(CONFIG.dailyPriorityEnabled) ~= "table" then CONFIG.dailyPriorityEnabled = {} end
-    if #CONFIG.dailyPriorityOrder == 0 then
-        for _, key in ipairs(DEFAULT_DAILY_PRIORITY) do
-            CONFIG.dailyPriorityOrder[#CONFIG.dailyPriorityOrder + 1] = key
-        end
-    end
-    for _, m in ipairs(TRAIT_DAILY_MAPS) do
-        local k = mapTraitKey(m)
-        if not table.find(CONFIG.dailyPriorityOrder, k) then
-            CONFIG.dailyPriorityOrder[#CONFIG.dailyPriorityOrder + 1] = k
-        end
-        if CONFIG.dailyPriorityEnabled[k] == nil then
-            CONFIG.dailyPriorityEnabled[k] = true
-        end
-    end
-end
-
--- enabled maps only, in user priority order
-local function getDailyMapQueue()
-    ensureDailyPriorityConfig()
-    local byKey = {}
-    for _, m in ipairs(TRAIT_DAILY_MAPS) do
-        byKey[mapTraitKey(m)] = m
-    end
-    local queue = {}
-    for _, key in ipairs(CONFIG.dailyPriorityOrder) do
-        if CONFIG.dailyPriorityEnabled[key] ~= false then
-            local m = byKey[key]
-            if m then queue[#queue + 1] = m end
-        end
-    end
-    return queue
-end
-
-local function setDailyPriorityNumber(key, wantPri)
-    ensureDailyPriorityConfig()
-    local order = CONFIG.dailyPriorityOrder
-    local idx = table.find(order, key)
-    if not idx then return end
-    local n = #order
-    local pri = math.clamp(math.floor(tonumber(wantPri) or idx), 1, n)
-    if pri == idx then return end
-    table.remove(order, idx)
-    table.insert(order, pri, key)
-    saveSettings()
-end
-
-local function capKey(mode, world, act)
-    local s = ("%s %s %s Trait Shards"):format(tostring(mode), tostring(world), tostring(act))
-    return string.lower(s):gsub(" ", "_")
-end
-
-local function getPlayerData()
-    local client = LP.PlayerScripts:FindFirstChild("Client")
-    local mod = client and client:FindFirstChild("Utility")
-    if mod and inPlayArea() and package and type(package.loaded) == "table" then
-        package.loaded[mod] = nil
-    end
-    local ok, util = pcall(function()
-        if mod then return require(mod) end
-        return require(LP.PlayerScripts.Client.Utility)
-    end)
-    if ok and util and type(util.data) == "table" then
-        AS.playerData = util.data
-        return util.data
-    end
-    return AS.playerData
-end
-
-local function refreshPlayerData()
-    if not inLobby() then
-        return AS.playerData or getPlayerData()
-    end
-    AS._matchPlayerData = nil
-    AS._lastPlayersGet = 0
-    AS._clientDataCache = nil
-    AS._lastClientScan = 0
-    local ok, data = invokeR("Player", "get")
-    if ok and type(data) == "table" then
-        AS.playerData = data
-        AS._lobbyPlayerData = data
-        pcall(function()
-            local util = require(LP.PlayerScripts.Client.Utility)
-            if util then util.data = data end
-        end)
-        return data
-    end
-    return getPlayerData()
-end
-
-local function refreshMatchPlayerData(force)
-    if inLobby() then return refreshPlayerData() end
-    AS._lastPlayersGet = AS._lastPlayersGet or 0
-    if not force and AS._matchPlayerData and tick() - AS._lastPlayersGet < 12 then
-        return AS._matchPlayerData
-    end
-    if not force and tick() - AS._lastPlayersGet < 12 then
-        return AS._matchPlayerData or AS._lobbyPlayerData or AS.playerData or getPlayerData()
-    end
-    AS._lastPlayersGet = tick()
-    local ok, data = invokeR("Player", "get")
-    if ok and type(data) == "table" then
-        -- Match snapshot: session stats only — never overwrite util.data / lobby bank.
-        AS._matchPlayerData = data
-        return data
-    end
-    return AS._matchPlayerData or AS._lobbyPlayerData or AS.playerData or getPlayerData()
-end
-
-local function getTraitCapCount(map)
-    local data = getPlayerData()
-    if not data or type(data.caps) ~= "table" then return 0 end
-    local key = capKey(map.mode, map.world, map.act)
-    local count = tonumber(data.caps[key]) or 0
-    -- fuzzy match if exact key missing (world name spacing variants)
-    if count == 0 then
-        local want = key:gsub("_", "")
-        for k, v in pairs(data.caps) do
-            if type(k) == "string" and k:gsub("_", "") == want then
-                count = tonumber(v) or 0
-                break
-            end
-        end
-    end
-    return count
-end
-
-local function isTraitCapMaxed(map)
-    if not map then return false end
-    local cap = tonumber(map.cap) or 100
-    return getTraitCapCount(map) >= cap
-end
-
-local function advanceDailyMapIdx(fromIdx, cappedMap)
-    local queue = getDailyMapQueue()
-    local n = #queue
-    if n == 0 then return 1 end
-    local cur = tonumber(fromIdx) or 1
-    local df = Session.dailyFarm or {}
-    df.idx = (cur % n) + 1
-    df.world = nil
-    df.mode = nil
-    df.act = nil
-    if cappedMap then
-        AS._lastCapLeaveKey = capKey(cappedMap.mode, cappedMap.world, cappedMap.act)
-        AS._lastCapLeaveAt = tick()
-    end
-    Session.dailyFarm = df
-    saveSession()
-    return df.idx
-end
-
-local function shouldSkipMapAfterCapLeave(map)
-    if not map then return false end
-    local ck = capKey(map.mode, map.world, map.act)
-    return AS._lastCapLeaveKey == ck and (tick() - (AS._lastCapLeaveAt or 0)) < 45
-end
-
-local function countOpenTraitMaps()
-    refreshPlayerData()
-    local open = 0
-    for _, m in ipairs(getDailyMapQueue()) do
-        if not isTraitCapMaxed(m) and not shouldSkipMapAfterCapLeave(m) then open = open + 1 end
-    end
-    return open
-end
-
--- ============================================================
--- DPS meter (live team DPS via leaderstats + theoretical per-unit)
--- CombatProbe confirmed: leaderstats.Damage replicates; no per-unit damage counter.
--- ============================================================
-local function fmtNum(n)
-    n = tonumber(n) or 0
-    if math.abs(n) >= 1e9 then return string.format("%.2fB", n / 1e9)
-    elseif math.abs(n) >= 1e6 then return string.format("%.2fM", n / 1e6)
-    elseif math.abs(n) >= 1e4 then return string.format("%.1fK", n / 1e3)
-    elseif math.abs(n) >= 1e3 then return string.format("%.2fK", n / 1e3)
-    else return string.format("%.0f", n) end
-end
-
-local Dps = { dps = 0, peak = 0, stageBase = nil, lastVal = nil, lastTick = nil, takedowns = nil }
-
-local function resetDpsStage()
-    Dps.stageBase = nil
-    Dps.lastVal = nil
-    Dps.lastTick = nil
-    Dps.peak = 0
-    Dps.dps = 0
-end
-
-local function findLeaderstat(keyword)
-    local ls = LP:FindFirstChild("leaderstats")
-    if not ls then return nil end
-    local exact = ls:FindFirstChild(keyword)
-    if exact and (exact:IsA("IntValue") or exact:IsA("NumberValue")) then return exact end
-    local kw = tostring(keyword):lower()
-    for _, c in ipairs(ls:GetChildren()) do
-        if (c:IsA("IntValue") or c:IsA("NumberValue")) and c.Name:lower():find(kw, 1, true) then
-            return c
-        end
-    end
-    return nil
-end
-
-local function getDamageStat()
-    return findLeaderstat("Damage")
-end
-
-local function getTakedownStat()
-    return findLeaderstat("Takedowns")
-end
-
-local function sampleTeamDps()
-    local d = getDamageStat()
-    if not d then Dps.dps = 0; return end
-    local now = tick()
-    local val = d.Value
-    if Dps.lastVal == nil or Dps.stageBase == nil then
-        Dps.stageBase = val
-        Dps.lastVal = val
-        Dps.lastTick = now
-        return
-    end
-    local dt = now - (Dps.lastTick or now)
-    if dt < 0.4 then return end
-    local delta = val - Dps.lastVal
-    if delta < 0 then
-        Dps.stageBase = val
-        Dps.peak = 0
-        delta = 0
-    end
-    Dps.dps = delta / dt
-    if Dps.dps > Dps.peak then Dps.peak = Dps.dps end
-    Dps.lastVal = val
-    Dps.lastTick = now
-    local tk = getTakedownStat()
-    if tk then Dps.takedowns = tk.Value end
-end
-
-local function getEquippedUnits()
-    local data = getPlayerData()
-    if not data then return {}, data end
-    local list = {}
-    for i = 1, 6 do
-        local unit
-        if type(data.equipped) == "table" and type(data.equipped[i]) == "table" and data.equipped[i].name then
-            unit = data.equipped[i]
-        elseif type(data.characters) == "table" then
-            for _, ch in pairs(data.characters) do
-                if type(ch) == "table" and ch.equipped == true and ch.name and tonumber(ch.index) == i then
-                    unit = ch
+local function summarizeTable(t, label)
+    if type(t) ~= "table" then return end
+    local hits = {}
+    local function walk(tbl, path, d)
+        if d > 4 or type(tbl) ~= "table" then return end
+        for k, v in pairs(tbl) do
+            local kn = string.lower(tostring(k))
+            for _, ck in ipairs(COMBAT_KEYS) do
+                if kn:find(ck, 1, true) then
+                    hits[#hits + 1] = path .. tostring(k) .. "=" .. ser(v, 2)
                     break
                 end
             end
-        end
-        list[i] = unit
-    end
-    return list, data
-end
-
-local _charDataCache = {}
-local _charDataFailed = {}
-local function safeCharData(name)
-    if not name then return nil end
-    if _charDataCache[name] then return _charDataCache[name] end
-    if _charDataFailed[name] then return nil end
-    local ch = ReplicatedStorage:FindFirstChild("Characters")
-    ch = ch and ch:FindFirstChild(name)
-    local dataMod = ch and ch:FindFirstChild("data")
-    if not dataMod then
-        _charDataFailed[name] = true
-        return nil
-    end
-    -- game client may have already required this module — reuse cache, no new require
-    if package and type(package.loaded) == "table" then
-        local cached = package.loaded[dataMod]
-        if type(cached) == "table" then
-            _charDataCache[name] = cached
-            return cached
+            if type(v) == "table" then walk(v, path .. tostring(k) .. ".", d + 1) end
         end
     end
-    local ok, data = pcall(require, dataMod)
-    if ok and type(data) == "table" then
-        _charDataCache[name] = data
-        return data
+    walk(t, "", 0)
+    if #hits > 0 then
+        log("PAYLOAD", label .. " combat fields: " .. table.concat(hits, " ; "))
     end
-    _charDataFailed[name] = true
-    return nil
-end
-
-local function simpleUnitDps(unit, data)
-    local baseDmg = tonumber(data.damage) or 0
-    local baseCd = tonumber(data.cooldown) or 1
-    local level = tonumber(unit.level) or 1
-    local dmg = baseDmg * (1.02 ^ math.max(0, level - 1))
-    local cd = baseCd
-    if cd <= 0.05 then cd = 1 end
-    return dmg / cd, dmg, cd
-end
-
-local function calcUnitDps(unit, playerData)
-    if not unit or not unit.name then return nil, nil, nil end
-    -- Helper.calculate_stat require()s character data modules internally, which
-    -- throws "Cannot require a non-RobloxScript module" from executor scripts.
-    local data = safeCharData(unit.name)
-    if data then
-        return simpleUnitDps(unit, data)
-    end
-    return nil, nil, nil
-end
-
-local function getLiveAllies()
-    local ok, chars = pcall(function() return require(LP.PlayerScripts.Client.Characters) end)
-    if not ok or type(chars) ~= "table" or type(chars.all) ~= "table" then return {} end
-    local list = {}
-    for _, ent in pairs(chars.all) do
-        if type(ent) == "table" and ent.type == "Allies" and ent.owner == LP.Name and ent.name then
-            list[#list + 1] = {
-                name = ent.name,
-                hp = tonumber(ent.health) or 0,
-                maxHp = tonumber(ent.max_health) or tonumber(ent.health) or 0,
-            }
-        end
-    end
-    table.sort(list, function(a, b) return a.name < b.name end)
-    return list
-end
-
--- Must exist before refreshDpsLabels (defined above UI build); locals below are not visible here.
-local statusLabels = {}
-local function setLabel(lbl, text)
-    if not lbl then return end
-    pcall(function()
-        if type(lbl.Set) == "function" then lbl.Set(text)
-        elseif lbl.Text ~= nil then lbl.Text = text end
-    end)
-end
-
-local function refreshDpsLabels()
-    if not CONFIG.dpsMeter then return end
-    local ok, err = pcall(function()
-        sampleTeamDps()
-        local d = getDamageStat()
-        local stageDmg = 0
-        if d and Dps.stageBase then stageDmg = math.max(0, d.Value - Dps.stageBase) end
-
-        setLabel(statusLabels.teamDps, d
-            and ("Team DPS: %s/s  |  peak %s/s"):format(fmtNum(Dps.dps), fmtNum(Dps.peak))
-            or  "Team DPS: - (enter a stage)")
-        local tkStr = Dps.takedowns and ("  |  takedowns %d"):format(Dps.takedowns) or ""
-        setLabel(statusLabels.teamDmg, d
-            and ("Stage damage: %s  |  total %s%s"):format(fmtNum(stageDmg), fmtNum(d.Value), tkStr)
-            or  "Stage damage: -")
-
-        local equipped = getEquippedUnits()
-        for i = 1, 6 do
-            local lbl = statusLabels["unit" .. i]
-            if lbl then
-                local u = equipped[i]
-                if u then
-                    local dps, dmg, cd = calcUnitDps(u)
-                    if dps then
-                        setLabel(lbl, ("Slot %d: %s  —  ~%s/s  (dmg %s / cd %.2fs)")
-                            :format(i, u.name, fmtNum(dps), fmtNum(dmg), cd))
-                    else
-                        setLabel(lbl, ("Slot %d: %s  —  est. n/a (base stats locked)"):format(i, u.name))
-                    end
-                else
-                    setLabel(lbl, ("Slot %d: empty"):format(i))
-                end
-            end
-        end
-
-        local allies = getLiveAllies()
-        if #allies == 0 then
-            setLabel(statusLabels.liveAllies, "Live allies on map: -")
-        else
-            local parts = {}
-            for _, a in ipairs(allies) do
-                parts[#parts + 1] = ("%s %s/%s"):format(a.name, fmtNum(a.hp), fmtNum(a.maxHp))
-            end
-            setLabel(statusLabels.liveAllies, "Live allies: " .. table.concat(parts, "  |  "))
-        end
-    end)
-    if not ok then
-        setLabel(statusLabels.teamDps, "Team DPS: error")
-    end
-end
-
-local function startDpsTracker()
-    local function hookDamage()
-        local d = getDamageStat()
-        if not d or d:GetAttribute("_ab_dps") then return end
-        d:SetAttribute("_ab_dps", true)
-        addConn(d:GetPropertyChangedSignal("Value"):Connect(function()
-            if CONFIG.dpsMeter then sampleTeamDps() end
-        end))
-    end
-    hookDamage()
-    addConn(LP.ChildAdded:Connect(function(c)
-        if c.Name == "leaderstats" then task.defer(hookDamage) end
-    end))
-    local function onCharacters(folder)
-        resetDpsStage()
-        task.defer(hookDamage)
-    end
-    local existing = workspace:FindFirstChild("Characters")
-    if existing then onCharacters(existing) end
-    addConn(workspace.ChildAdded:Connect(function(c)
-        if c.Name == "Characters" then onCharacters(c) end
-    end))
-end
-
-local function nextTraitMap(startIdx)
-    refreshPlayerData()
-    local queue = getDailyMapQueue()
-    local n = #queue
-    if n == 0 then return nil end
-    local idx = startIdx or 1
-    for _ = 1, n do
-        if idx > n then idx = 1 end
-        local m = queue[idx]
-        if m and not isTraitCapMaxed(m) and not shouldSkipMapAfterCapLeave(m) then
-            return m, idx
-        end
-        idx = idx + 1
-    end
-    return nil
-end
-
-local function rememberDailyMap(map, idx)
-    Session.dailyFarm = {
-        world = map.world,
-        mode  = map.mode,
-        act   = map.act,
-        cap   = map.cap,
-        idx   = idx,
-        runs  = (Session.dailyFarm and Session.dailyFarm.runs) or 0,
-        stall = (Session.dailyFarm and Session.dailyFarm.stall) or 0,
-        lastCap = getTraitCapCount(map),
-    }
-    if saveSession then saveSession() end
-end
-
-local function forgetDailyMap()
-    Session.dailyFarm = nil
-    if saveSession then saveSession() end
 end
 
 -- ============================================================
--- Daily trait farm helpers
+-- 1) Remote sniffer — hook every RemoteEvent under ReplicatedStorage.Remotes
 -- ============================================================
-local function findTraitMapEntry(world, mode, act)
-    for _, m in ipairs(TRAIT_DAILY_MAPS) do
-        if m.world == world and m.mode == mode and tonumber(m.act) == tonumber(act) then
-            return m
-        end
-    end
-    return nil
-end
+local hookedRemotes = {}
+local remoteHits = {}
 
-local function getCurrentPlayMap()
-    local ok, play = pcall(function() return require(LP.PlayerScripts.Client.Play) end)
-    if ok and play and type(play.current) == "table" then
-        local c = play.current
-        if c.world and c.mode and c.act then
-            return findTraitMapEntry(c.world, c.mode, c.act) or {
-                world = c.world, mode = c.mode, act = c.act, cap = 100,
-            }
-        end
-    end
-    return nil
-end
-
-local function resolveDailyMap()
-    local df = Session.dailyFarm
-    if df and df.world and df.mode and df.act then
-        return findTraitMapEntry(df.world, df.mode, df.act) or {
-            world = df.world, mode = df.mode, act = df.act, cap = df.cap or 100,
-        }
-    end
-    return getCurrentPlayMap()
-end
-
-local _lastCapLeaveNotify = 0
-local function leaveStageIfCapped(map, reason, fromIdx)
-    refreshPlayerData()
-    if not map then return false end
-    if not isTraitCapMaxed(map) and not shouldSkipMapAfterCapLeave(map) then return false end
-    setStatus(reason or ("Daily cap full on " .. map.world .. " - leaving stage..."))
-    if tick() - _lastCapLeaveNotify > 10 then
-        _lastCapLeaveNotify = tick()
-        notify("Daily Traits", map.world .. " cap reached (" .. getTraitCapCount(map) .. "/" .. map.cap .. ") — next map.", "success")
-    end
-    leaveStage(true)
-    AS._dailyLeftCap = true
-    advanceDailyMapIdx(fromIdx or (Session.dailyFarm and Session.dailyFarm.idx), map)
-    return true
-end
-
-local function waitForLobbyReturn(timeout)
-    local t0 = tick()
-    while alive() and not inLobby() and (tick() - t0) < (timeout or 60) do
-        leaveStage(true)
-        task.wait(2)
-    end
-    if inLobby() then
-        task.wait(1)
-        setStatus("Returned to lobby.")
-        return true
-    end
-    return false
-end
-
--- block until stage ends; leave early the moment this map's daily cap is full
-local function waitForDailyRun(map)
-    local t0 = tick()
-    while alive() and CONFIG.enabled and inLobby() and (tick() - t0) < 12 do
-        task.wait(0.5)
-    end
-    if not alive() or not CONFIG.enabled then return false end
-
-    if inLobby() then
-        setStatus("Daily traits - waiting for stage to start...")
-        local t1 = tick()
-        while alive() and CONFIG.enabled and inLobby() and (tick() - t1) < CONFIG.farmTimeout do
-            task.wait(2)
-        end
-        if inLobby() then return false end
-    end
-
-    setStatus(("Daily traits - fighting %s %s Act %d, watching cap..."):format(map.mode, map.world, map.act))
-    local t2 = tick()
-    while alive() and CONFIG.enabled and (not inLobby() or inBattle()) and (tick() - t2) < CONFIG.farmTimeout do
-        if leaveStageIfCapped(map, nil, Session.dailyFarm and Session.dailyFarm.idx) then
-            waitForLobbyReturn(60)
-            return true
-        end
-        task.wait(1)
-    end
-
-    if inLobby() and not inBattle() then return true end
-    waitForLobbyReturn(30)
-    return true
-end
-
--- ============================================================
--- Rotating challenges (Daily [1d] + Regular [30m], once per reset)
--- ============================================================
-local CHALLENGE_ORDER = { "1d", "30m" }
-local CHALLENGE_NAMES = { ["1d"] = "Daily Challenge", ["30m"] = "Regular Challenge" }
-
-local function getChallengeTimers()
-    local ok, util = pcall(function() return require(LP.PlayerScripts.Client.Utility) end)
-    if ok and util and type(util.timers) == "table" then
-        return tonumber(util.timers.day) or 0, tonumber(util.timers.half_hour) or 0
-    end
-    return 0, 0
-end
-
-local function fmtChallengeTimer(sec)
-    sec = math.max(0, math.floor(tonumber(sec) or 0))
-    local h = math.floor(sec / 3600)
-    local m = math.floor((sec % 3600) / 60)
-    local s = sec % 60
-    if h > 0 then return string.format("%d:%02d:%02d", h, m, s) end
-    return string.format("%02d:%02d", m, s)
-end
-
--- Countdown timers jump back up after a reset; only then should "done" clear.
-local function challengeTimerReset(key)
-    if type(CONFIG.challengeDoneMeta) ~= "table" then
-        local ts = type(CONFIG.challengeDone) == "table" and tonumber(CONFIG.challengeDone[key])
-        if not ts then return false end
-        if key == "1d" then return os.time() - ts > 90000 end
-        return os.time() - ts > 2400
-    end
-    local meta = CONFIG.challengeDoneMeta[key]
-    if type(meta) ~= "table" then
-        local ts = type(CONFIG.challengeDone) == "table" and tonumber(CONFIG.challengeDone[key])
-        if not ts then return false end
-        if key == "1d" then return os.time() - ts > 90000 end
-        return os.time() - ts > 2400
-    end
-    local dayT, halfT = getChallengeTimers()
-    if key == "1d" then
-        local saved = tonumber(meta.dayTimer)
-        if not saved then return false end
-        return dayT > saved + 30
-    end
-    if key == "30m" then
-        local saved = tonumber(meta.halfTimer)
-        if not saved then return false end
-        return halfT > saved + 10
-    end
-    return false
-end
-
-local function getRotatingChallenges()
-    local ok, data = invokeR("Play", "get_challenges")
-    if ok and type(data) == "table" then
-        AS.challengeCache = data
-        return data
-    end
-    return AS.challengeCache or {}
-end
-
-local function syncChallengeDoneFlags(chs)
-    if type(CONFIG.challengeDone) ~= "table" then CONFIG.challengeDone = {} end
-    if type(CONFIG.challengeDoneMeta) ~= "table" then CONFIG.challengeDoneMeta = {} end
-    AS.challengeDoneSession = AS.challengeDoneSession or {}
-
-    for _, key in ipairs(CHALLENGE_ORDER) do
-        if CONFIG.challengeDone[key] and challengeTimerReset(key) then
-            CONFIG.challengeDone[key] = nil
-            CONFIG.challengeDoneMeta[key] = nil
-            AS.challengeDoneSession[key] = nil
-            if AS.challengeProbeCache then
-                for ck in pairs(AS.challengeProbeCache) do
-                    if ck:sub(1, #key + 1) == (key .. "|") then
-                        AS.challengeProbeCache[ck] = nil
-                    end
-                end
-            end
-        elseif CONFIG.challengeDone[key] then
-            AS.challengeDoneSession[key] = true
-        end
-    end
-end
-
-local function isChallengeMarkedDone(key)
-    if AS.challengeDoneSession and AS.challengeDoneSession[key] then return true end
-    if type(CONFIG.challengeDone) ~= "table" or not CONFIG.challengeDone[key] then return false end
-    if challengeTimerReset(key) then return false end
-    AS.challengeDoneSession = AS.challengeDoneSession or {}
-    AS.challengeDoneSession[key] = true
-    return true
-end
-
-local function isChallengeEnabled(key)
-    if key == "1d" then return CONFIG.autoDailyChallenge end
-    if key == "30m" then return CONFIG.autoRegularChallenge end
-    return false
-end
-
-local CHALLENGE_DONE_PATTERNS = {
-    "already completed",
-    "already cleared",
-    "already done",
-    "completed!",
-}
-
-local function textIndicatesChallengeDone(txt)
-    if type(txt) ~= "string" or txt == "" then return false end
-    local lower = txt:lower()
-    for _, pat in ipairs(CHALLENGE_DONE_PATTERNS) do
-        if lower:find(pat, 1, true) then return true end
-    end
-    return lower:find("completed", 1, true) ~= nil and lower:find("already", 1, true) ~= nil
-end
-
-local function challengeCapKey(world, act, itemName)
-    local s = ("Challenge %s %s %s"):format(tostring(world), tostring(act), tostring(itemName))
-    return string.lower(s):gsub(" ", "_")
-end
-
-local function getChallengeCapCount(world, act, itemName)
-    local data = getPlayerData()
-    if not data or type(data.caps) ~= "table" then return 0 end
-    local key = challengeCapKey(world, act, itemName)
-    local count = tonumber(data.caps[key]) or 0
-    if count == 0 then
-        local want = key:gsub("_", "")
-        for k, v in pairs(data.caps) do
-            if type(k) == "string" and k:gsub("_", "") == want then
-                count = tonumber(v) or 0
-                break
-            end
-        end
-    end
-    return count
-end
-
-local function areChallengeRewardsCapped(ch)
-    if type(ch) ~= "table" or type(ch.rewards) ~= "table" then return false end
-    local hasCap = false
-    for itemName, itemData in pairs(ch.rewards) do
-        if type(itemData) == "table" and itemData.cap then
-            hasCap = true
-            local cap = tonumber(itemData.cap) or 0
-            if getChallengeCapCount(ch.world, ch.act, itemName) < cap then
-                return false
-            end
-        end
-    end
-    return hasCap
-end
-
-local function scanChallengeGuiCompleted(key)
-    local menus = getMenus()
-    if not menus then return false end
-    local roots = {
-        menus:FindFirstChild("Play"),
-        menus:FindFirstChild("StageInfo"),
-    }
-    for _, root in ipairs(roots) do
-        if root and (root:IsA("GuiObject") and root.Visible) then
-            for _, d in ipairs(root:GetDescendants()) do
-                if d:IsA("TextLabel") or d:IsA("TextButton") then
-                    local t = d.Text
-                    if textIndicatesChallengeDone(t) then return true end
-                end
-            end
-        end
-    end
-    -- Daily/regular challenge world buttons live under Play.Worlds
-    local play = menus:FindFirstChild("Play")
-    local worlds = play and play:FindFirstChild("Worlds")
-    local btn = worlds and worlds:FindFirstChild(key)
-    if btn then
-        for _, d in ipairs(btn:GetDescendants()) do
-            if d:IsA("TextLabel") then
-                if textIndicatesChallengeDone(d.Text) then return true end
-            end
-        end
-    end
-    return false
-end
-
-local function leaveChallengeRoomQuiet()
-    pcall(function() fireR("Play", "leave") end)
-    pcall(function() invokeR("Matchmaking", "leave") end)
-    pcall(function() invokeR("Player", "physical_teleport", "play") end)
-end
-
-local function probeChallengeBlocked(key, ch)
-    if isChallengeMarkedDone(key) then return true end
-    if type(ch) ~= "table" or not ch.world or not ch.act then return false end
-    AS.challengeProbeCache = AS.challengeProbeCache or {}
-    local cacheKey = ("%s|%s|%s"):format(key, ch.world, ch.act)
-    if AS.challengeProbeCache[cacheKey] ~= nil then
-        return AS.challengeProbeCache[cacheKey]
-    end
-
-    local current = {
-        world        = ch.world,
-        act          = ch.act,
-        mode         = "Challenge",
-        difficulty   = key,
-        only_friends = CONFIG.soloOnly and true or false,
-    }
-    if type(ch.rewards) == "table" then
-        current.rewards = ch.rewards
-    end
-
-    local okC, sucC, res = invokeR("Play", "create_room", current)
-    if okC and sucC then
-        leaveChallengeRoomQuiet()
-        task.wait(0.4)
-        AS.challengeProbeCache[cacheKey] = false
-        return false
-    end
-
-    local blocked = textIndicatesChallengeDone(tostring(res or sucC or ""))
-    AS.challengeProbeCache[cacheKey] = blocked
-    return blocked
-end
-
-local function isChallengeAlreadyCompleted(key, ch)
-    if isChallengeMarkedDone(key) then return true, "saved" end
-    refreshPlayerData()
-    if areChallengeRewardsCapped(ch) then return true, "caps" end
-    if scanChallengeGuiCompleted(key) then return true, "gui" end
-    if probeChallengeBlocked(key, ch) then return true, "probe" end
-    return false
-end
-
-local function shouldRunChallenge(key, ch)
-    if not isChallengeEnabled(key) then return false end
-    if type(ch) ~= "table" or not ch.world or not ch.act then return false end
-    if isChallengeMarkedDone(key) then return false end
-    return true
-end
-
-local function countPendingChallenges()
-    if not CONFIG.autoDailyChallenge and not CONFIG.autoRegularChallenge then return 0 end
-    local chs = getRotatingChallenges()
-    syncChallengeDoneFlags(chs)
-    local n = 0
-    for _, key in ipairs(CHALLENGE_ORDER) do
-        local ch = chs[key]
-        if isChallengeEnabled(key) and type(ch) == "table" and ch.world then
-            if not isChallengeAlreadyCompleted(key, ch) then
-                n = n + 1
-            end
-        end
-    end
-    return n
-end
-
-local function forgetChallenge()
-    Session.challengeFarm = nil
-    saveSession()
-end
-
-local function clearStaleChallengeSession()
-    if not CONFIG.autoDailyChallenge and not CONFIG.autoRegularChallenge then
-        if Session.challengeFarm then forgetChallenge() end
-        return
-    end
-    if Session.challengeFarm and inLobby() and countPendingChallenges() == 0 then
-        forgetChallenge()
-    end
-end
-
-local function challengesTakePriority()
-    clearStaleChallengeSession()
-    if not CONFIG.autoDailyChallenge and not CONFIG.autoRegularChallenge then
-        return false
-    end
-    if Session.challengeFarm then return true end
-    return countPendingChallenges() > 0
-end
-
-local function rememberChallenge(key, ch)
-    Session.challengeFarm = {
-        key   = key,
-        world = ch.world,
-        act   = ch.act,
-    }
-    saveSession()
-end
-
-local function markChallengeDone(key)
-    AS.challengeDoneSession = AS.challengeDoneSession or {}
-    AS.challengeDoneSession[key] = true
-    if type(CONFIG.challengeDone) ~= "table" then CONFIG.challengeDone = {} end
-    if type(CONFIG.challengeDoneMeta) ~= "table" then CONFIG.challengeDoneMeta = {} end
-    CONFIG.challengeDone[key] = os.time()
-    local dayT, halfT = getChallengeTimers()
-    CONFIG.challengeDoneMeta[key] = {
-        dayTimer  = dayT,
-        halfTimer = halfT,
-        ts        = os.time(),
-    }
-    if AS.challengeProbeCache then
-        for ck in pairs(AS.challengeProbeCache) do
-            if ck:sub(1, #key + 1) == (key .. "|") then
-                AS.challengeProbeCache[ck] = true
-            end
-        end
-    end
-    pcall(saveSettings)
-    if canFile() then
+local function hookRemote(r, path)
+    if hookedRemotes[r] then return end
+    hookedRemotes[r] = path
+    if not r:IsA("RemoteEvent") then return end
+    addConn(r.OnClientEvent:Connect(function(...)
         pcall(function()
-            local data = {}
-            local path = SETTINGS_FILE
-            if isfile(path) then
-                local ok, raw = pcall(readfile, path)
-                if ok and raw then
-                    local ok2, d = pcall(function() return HttpService:JSONDecode(raw) end)
-                    if ok2 and type(d) == "table" then data = d end
-                end
+            local payload = serArgs(...)
+            local score = scorePayload(payload)
+            remoteHits[path] = (remoteHits[path] or 0) + 1
+            local deep = path:find("fight_hit", 1, true) or path:find("Characters/update", 1, true)
+            local limit = deep and 4000 or 1200
+            local maxLog = deep and 25 or 5
+            if score >= 2 or remoteHits[path] <= maxLog then
+                log("REMOTE", path .. " #" .. remoteHits[path] .. " score=" .. score .. " :: " .. payload:sub(1, limit))
             end
-            data.challengeDone = CONFIG.challengeDone
-            data.challengeDoneMeta = CONFIG.challengeDoneMeta
-            writefile(SETTINGS_FILE, HttpService:JSONEncode(data))
+            for i = 1, select("#", ...) do
+                local a = select(i, ...)
+                if type(a) == "table" then summarizeTable(a, path) end
+            end
         end)
-    end
-    saveSession()
+    end))
 end
 
-local function waitForChallengeRun(key, ch)
-    local label = CHALLENGE_NAMES[key] or key
-    local t0 = tick()
-    while alive() and CONFIG.enabled and inLobby() and (tick() - t0) < 12 do
-        task.wait(0.5)
-    end
-    if not alive() or not CONFIG.enabled then return false end
-
-    if inLobby() then
-        setStatus(label .. " - waiting for stage to start...")
-        local t1 = tick()
-        while alive() and CONFIG.enabled and inLobby() and (tick() - t1) < CONFIG.farmTimeout do
-            task.wait(2)
+local function scanRemotes(root, prefix)
+    prefix = prefix or ""
+    for _, ch in ipairs(root:GetChildren()) do
+        local p = prefix .. ch.Name
+        if ch:IsA("RemoteEvent") or ch:IsA("RemoteFunction") then
+            hookRemote(ch, p)
         end
-        if inLobby() then return false end
-    end
-
-    setStatus(("%s - fighting %s Act %d..."):format(label, ch.world, ch.act))
-    local t2 = tick()
-    local idleSince = nil
-    while alive() and CONFIG.enabled and not inLobby() and (tick() - t2) < CONFIG.farmTimeout do
-        if inBattle() then
-            idleSince = nil
-        elseif isRewardScreenVisible() then
-            break
-        else
-            idleSince = idleSince or tick()
-            if tick() - idleSince >= 2 then
-                break
-            end
-        end
-        task.wait(0.5)
-    end
-
-    setStatus(label .. " - challenge done, leaving stage...")
-    leaveStage(true)
-    waitForLobbyReturn(45)
-    return true
-end
-
-local function challengeStep()
-    if not CONFIG.autoDailyChallenge and not CONFIG.autoRegularChallenge then
-        if Session.challengeFarm then forgetChallenge() end
-        return
-    end
-
-    if not inLobby() then
-        local cf = Session.challengeFarm
-        if cf then
-            if not inBattle() and (isRewardScreenVisible() or (AS._challengeIdleAt and tick() - AS._challengeIdleAt >= 2)) then
-                setStatus("Challenge complete — leaving stage...")
-                leaveStage(true)
-                waitForLobbyReturn(45)
-                AS._challengeIdleAt = nil
-                return
-            end
-            if not inBattle() then
-                AS._challengeIdleAt = AS._challengeIdleAt or tick()
-            else
-                AS._challengeIdleAt = nil
-            end
-            setStatus(("%s - in %s Act %d, fighting..."):format(
-                CHALLENGE_NAMES[cf.key] or cf.key or "Challenge",
-                cf.world or "?", cf.act or "?"))
-        else
-            if not inBattle() then
-                AS._challengeIdleAt = AS._challengeIdleAt or tick()
-                if tick() - AS._challengeIdleAt >= 3 then
-                    setStatus("Challenge - leaving finished stage...")
-                    leaveStage(true)
-                    waitForLobbyReturn(45)
-                    AS._challengeIdleAt = nil
-                end
-            else
-                AS._challengeIdleAt = nil
-            end
-            setStatus("Challenge - in stage, waiting to return...")
-        end
-        return
-    end
-    AS._challengeIdleAt = nil
-
-    local chs = getRotatingChallenges()
-    syncChallengeDoneFlags(chs)
-
-    for _, key in ipairs(CHALLENGE_ORDER) do
-        local ch = chs[key]
-        if not isChallengeEnabled(key) or type(ch) ~= "table" or not ch.world then
-            continue
-        end
-
-        local already, reason = isChallengeAlreadyCompleted(key, ch)
-        if already then
-            if not isChallengeMarkedDone(key) then
-                markChallengeDone(key)
-                notify("Challenges", (CHALLENGE_NAMES[key] or key) .. " already completed — skipping.", "info")
-            end
-        else
-            local label = CHALLENGE_NAMES[key] or key
-            rememberChallenge(key, ch)
-            setStatus(("%s: %s Act %d — starting..."):format(label, ch.world, ch.act))
-
-            local ok, err = startMap(ch.world, ch.act, "Challenge", key, ch.rewards)
-            if not ok then
-                forgetChallenge()
-                if textIndicatesChallengeDone(tostring(err)) then
-                    markChallengeDone(key)
-                    notify("Challenges", label .. " already completed.", "info")
-                else
-                    setStatus("Challenge launch failed: " .. tostring(err))
-                    task.wait(2)
-                    return
-                end
-            else
-                local cleared = waitForChallengeRun(key, ch)
-                forgetChallenge()
-                if cleared then
-                    markChallengeDone(key)
-                    notify("Challenges", label .. " cleared — " .. ch.world, "success")
-                end
-                return
-            end
-        end
+        scanRemotes(ch, p .. "/")
     end
 end
 
--- ============================================================
--- Auto awakening (farm materials + special quests, then awaken)
--- Priority: challenges > awakening > daily traits
--- (IIFE: keeps main chunk under Luau's 200 local register limit)
--- ============================================================
-local awakeningStep, awakeningTakesPriority
-local getOwnedAwakenableUnits, findOwnedUnitByName
-local getMissingAwakeningReqs, getAwakeningFarmPreview, updateAwakenItemCacheFromData
-local AWAKENABLE_NAMES
-
-local function restoreAwakenItemCache()
-    AS.awakenItemCache = AS.awakenItemCache or {}
-    if Session.awakenItemCache and type(Session.awakenItemCache) == "table" then
-        for item, count in pairs(Session.awakenItemCache) do
-            AS.awakenItemCache[item] = tonumber(count) or 0
+local remotesFolder = RS:FindFirstChild("Remotes")
+if remotesFolder then
+    scanRemotes(remotesFolder)
+    log("INIT", "Hooked RemoteEvents under ReplicatedStorage.Remotes")
+    addConn(remotesFolder.DescendantAdded:Connect(function(d)
+        if d:IsA("RemoteEvent") then
+            local path = d:GetFullName():gsub("ReplicatedStorage%.Remotes%.", ""):gsub("%.", "/")
+            hookRemote(d, path)
+            log("INIT", "New remote: " .. path)
         end
-    end
+    end))
+else
+    log("WARN", "ReplicatedStorage.Remotes not found")
 end
 
-local function restoreAwakenUnitCache()
-    AS.awakenUnitByName = AS.awakenUnitByName or {}
-    if Session.awakenUnitCache and type(Session.awakenUnitCache.byName) == "table" then
-        for name, u in pairs(Session.awakenUnitCache.byName) do
-            if type(u) == "table" and u.name then
-                AS.awakenUnitByName[name] = u
-            end
-        end
-    end
-end
-
-local _awakenMod = (function()
-local ITEM_LOC_CACHE = {}
-local SPECIAL_QUEST_ITEM = {
-    ["Beast Core"] = "Furious Beast",
-    ["Fusion Core"] = "Strongest Fusion",
-    ["Primal Core"] = "Primal Fusion",
+-- Priority watchlist (known combat-adjacent from dump)
+local WATCH = {
+    "Characters/passive_visual",
+    "Characters/move_models",
+    "Characters/update_stats",
+    "Ultimates/visual",
+    "Visuals/start_stranger",
+    "Play/setup_players",
+    "Play/leave",
+    "General/animate",
+    "General/animate_id",
 }
 
-local function stripHtml(s)
-    if type(s) ~= "string" then return "" end
-    s = s:gsub("<[^>]+>", ""):gsub("&nbsp;", " "):gsub("%s+", " ")
-    return (s:match("^%s*(.-)%s*$") or s)
+-- ============================================================
+-- 2) workspace.Characters model probe
+-- ============================================================
+local modelSnap = {}
+local function modelKey(m)
+    return m:GetFullName()
 end
 
-local function coerceItemValue(raw)
-    if raw == nil then return nil end
-    local n = tonumber(raw)
-    if n then return n end
-    if type(raw) == "table" then
-        n = tonumber(raw.amount or raw.count or raw.qty or raw.quantity or raw.n)
-        if n then return n end
-    end
-    return nil
-end
-
-local function normalizeItemKey(name)
-    if type(name) ~= "string" then return "" end
-    return name:lower():gsub("%s+", "")
-end
-
-local function lookupExactInTable(tbl, key)
-    if type(tbl) ~= "table" or type(key) ~= "string" then return nil end
-    local keys = { key, string.lower(key) }
-    for _, k in ipairs(keys) do
-        if tbl[k] ~= nil then
-            local n = coerceItemValue(tbl[k])
-            return n ~= nil and n or 0
+local function dumpModel(m)
+    local attrs = {}
+    pcall(function()
+        for name, val in pairs(m:GetAttributes()) do
+            attrs[#attrs + 1] = name .. "=" .. tostring(val)
+        end
+    end)
+    table.sort(attrs)
+    local parts = {}
+    for _, d in ipairs(m:GetDescendants()) do
+        if d:IsA("ValueBase") then
+            parts[#parts + 1] = d.Name .. "=" .. tostring(d.Value)
+        elseif d:IsA("TextLabel") and d.Visible and d.Text ~= "" then
+            parts[#parts + 1] = "TL:" .. d.Name .. "=" .. d.Text:sub(1, 40)
         end
     end
-    return nil
+    return {
+        name = m.Name,
+        class = m.ClassName,
+        attrs = table.concat(attrs, ", "),
+        values = table.concat(parts, ", "),
+    }
 end
 
-local function parseCompactNumber(text)
-    if type(text) ~= "string" or text == "" then return nil end
-    local s = stripHtml(text):gsub(",", ""):gsub("%s+", "")
-    local n = tonumber(s)
-    if n then return math.floor(n) end
-    local num, suffix = s:match("^([%d%.]+)([kKmMbB])$")
-    num = tonumber(num)
-    if not num then return nil end
-    suffix = suffix:lower()
-    if suffix == "k" then num = num * 1e3
-    elseif suffix == "m" then num = num * 1e6
-    elseif suffix == "b" then num = num * 1e9 end
-    return math.floor(num)
-end
-
--- Game hover/tooltip: items first, then stats (total owned vs session stat)
-local function readItemsOnlyCount(data, itemName)
-    if type(data) ~= "table" or type(itemName) ~= "string" or itemName == "" then return nil end
-    local items = type(data.items) == "table" and data.items or nil
-    if not items then return nil end
-    local n = lookupExactInTable(items, itemName)
-    if n ~= nil then return n end
-    local want = normalizeItemKey(itemName)
-    for k, v in pairs(items) do
-        if type(k) == "string" and normalizeItemKey(k) == want then
-            local num = coerceItemValue(v)
-            return num ~= nil and num or 0
-        end
-    end
-    return nil
-end
-
-local function readStatsOnlyCount(data, itemName)
-    if type(data) ~= "table" or type(itemName) ~= "string" or itemName == "" then return nil end
-    local stats = type(data.stats) == "table" and data.stats or nil
-    if not stats then return nil end
-    local n = lookupExactInTable(stats, itemName)
-    if n ~= nil then return n end
-    local want = normalizeItemKey(itemName)
-    for k, v in pairs(stats) do
-        if type(k) == "string" and normalizeItemKey(k) == want then
-            local num = coerceItemValue(v)
-            return num ~= nil and num or 0
-        end
-    end
-    return nil
-end
-
-local function mergeItemsBankCache(items)
-    if type(items) ~= "table" then return end
-    AS._itemsBankCache = AS._itemsBankCache or {}
-    for k, v in pairs(items) do
-        if type(k) == "string" then
-            local n = coerceItemValue(v)
-            if n ~= nil then
-                local nk = normalizeItemKey(k)
-                local prev = AS._itemsBankCache[nk]
-                if not prev or n > prev.count then
-                    AS._itemsBankCache[nk] = { count = n, name = k }
-                end
+local function scanCharactersFolder(folder)
+    if not folder then return end
+    for _, m in ipairs(folder:GetChildren()) do
+        if m:IsA("Model") then
+            local key = modelKey(m)
+            local snap = dumpModel(m)
+            local sig = snap.attrs .. "|" .. snap.values
+            local prev = modelSnap[key]
+            if not prev then
+                modelSnap[key] = sig
+                log("MODEL+ ", ("%s type-attrs=[%s] vals=[%s]"):format(key, snap.attrs, snap.values))
+            elseif prev ~= sig then
+                modelSnap[key] = sig
+                log("MODELΔ ", ("%s now attrs=[%s] vals=[%s]"):format(key, snap.attrs, snap.values))
             end
         end
     end
 end
 
-local function readItemsBankCache(itemName)
-    local cache = AS._itemsBankCache and AS._itemsBankCache[normalizeItemKey(itemName)]
-    if cache then return tonumber(cache.count) end
-    return nil
+local function bindCharacters(container)
+    scanCharactersFolder(container)
+    addConn(container.ChildAdded:Connect(function(m)
+        if m:IsA("Model") then
+            task.defer(function()
+                local snap = dumpModel(m)
+                log("MODEL+ ", ("ADD %s [%s] vals=[%s]"):format(m:GetFullName(), snap.attrs, snap.values))
+                modelSnap[modelKey(m)] = snap.attrs .. "|" .. snap.values
+            end)
+        end
+    end))
+    addConn(container.ChildRemoved:Connect(function(m)
+        if m:IsA("Model") then
+            local t = "?"
+            pcall(function() t = tostring(m:GetAttribute("type") or "?") end)
+            log("MODEL-", "REMOVED " .. m.Name .. " type=" .. t)
+            modelSnap[modelKey(m)] = nil
+        end
+    end))
 end
 
-local function readBestItemsBankCount(itemName)
-    local best = nil
-    local function take(n)
-        n = tonumber(n)
-        if n ~= nil and (not best or n > best) then best = n end
+local chars = workspace:FindFirstChild("Characters")
+if chars then bindCharacters(chars) end
+addConn(workspace.ChildAdded:Connect(function(c)
+    if c.Name == "Characters" then
+        log("WORLD", "workspace.Characters appeared")
+        bindCharacters(c)
     end
-    take(readItemsBankCache(itemName))
-    if AS._lobbyPlayerData then take(readItemsOnlyCount(AS._lobbyPlayerData, itemName)) end
-    if AS.playerData and AS.playerData ~= AS._matchPlayerData then
-        take(readItemsOnlyCount(AS.playerData, itemName))
-    end
-    return best
-end
+end))
 
--- Hover semantics: items bank first, stats fallback (matches game tooltip)
-local function readInventoryItemCount(data, itemName)
-    if type(data) ~= "table" or type(itemName) ~= "string" or itemName == "" then return nil end
-    local bank = readItemsOnlyCount(data, itemName)
-    if bank ~= nil then return bank end
-    return readStatsOnlyCount(data, itemName)
-end
+-- ============================================================
+-- 3) leaderstats / player combat stats
+-- ============================================================
+local lastDamage = {}
 
-local function lookupGameStyleCount(data, itemName, firstTbl, secondTbl)
-    if type(data) ~= "table" or type(itemName) ~= "string" or itemName == "" then return nil end
-    local items = type(data.items) == "table" and data.items or nil
-    local stats = type(data.stats) == "table" and data.stats or nil
-    local a = firstTbl == "items" and lookupExactInTable(items, itemName) or lookupExactInTable(stats, itemName)
-    if a ~= nil then return a end
-    local b = secondTbl == "items" and lookupExactInTable(items, itemName) or lookupExactInTable(stats, itemName)
-    if b ~= nil then return b end
-
-    local want = normalizeItemKey(itemName)
-    local best = nil
-    for _, tbl in ipairs({ items, stats }) do
-        if type(tbl) == "table" then
-            for k, v in pairs(tbl) do
-                if type(k) == "string" and normalizeItemKey(k) == want and tbl[k] ~= nil then
-                    local n = coerceItemValue(v)
-                    n = n ~= nil and n or 0
-                    if not best or n > best then best = n end
-                end
+local function scanLeaderstats(plr)
+    local ls = plr:FindFirstChild("leaderstats")
+    if not ls then return end
+    for _, v in ipairs(ls:GetChildren()) do
+        if v:IsA("IntValue") or v:IsA("NumberValue") then
+            local key = plr.Name .. "/" .. v.Name
+            local cur = v.Value
+            local prev = lastDamage[key]
+            if prev == nil then
+                lastDamage[key] = cur
+                log("STAT+", ("%s = %s"):format(key, tostring(cur)))
+            elseif cur ~= prev then
+                local delta = cur - prev
+                lastDamage[key] = cur
+                log("STATΔ", ("%s %s -> %s (+%s)"):format(key, tostring(prev), tostring(cur), tostring(delta)))
             end
-        end
-    end
-    return best
-end
-
-local function lookupItemCountInData(data, itemName)
-    if type(data) ~= "table" or type(itemName) ~= "string" or itemName == "" then return nil end
-    local bank = readItemsOnlyCount(data, itemName)
-    if bank ~= nil then return bank end
-    local best = nil
-    local function consider(n)
-        if n ~= nil and (not best or n > best) then best = n end
-    end
-    consider(readItemsBankCache(itemName))
-    consider(readInventoryItemCount(data, itemName))
-    if type(data.all_items) == "table" then
-        consider(lookupExactInTable(data.all_items, itemName))
-    end
-    if best ~= nil then return best end
-    return readStatsOnlyCount(data, itemName)
-end
-
-local function readLiveItemCount(itemName, data)
-    data = data or getPlayerData()
-    local n = readInventoryItemCount(data, itemName)
-    if n == nil then n = lookupItemCountInData(data, itemName) end
-    return n ~= nil and n or 0
-end
-
-local function titleMatchesItem(titleText, itemName)
-    local t = normalizeItemKey(titleText or "")
-    local want = normalizeItemKey(itemName)
-    if t == "" or want == "" then return false end
-    if t == want then return true end
-    return t:find(want, 1, true) ~= nil
-end
-
-local function gameExactItemCount(data, itemName)
-    if type(data) ~= "table" or type(itemName) ~= "string" or itemName == "" then return nil end
-    local items = type(data.items) == "table" and data.items or nil
-    local stats = type(data.stats) == "table" and data.stats or nil
-    local keys = { itemName, string.lower(itemName) }
-    for _, key in ipairs(keys) do
-        local raw = items and items[key]
-        if raw == nil and stats then raw = stats[key] end
-        if raw ~= nil then
-            local n = coerceItemValue(raw)
-            return n ~= nil and n or 0
-        end
-    end
-    return nil
-end
-
-local DEEP_SCAN_SKIP = {
-    characters = true, units = true, traits = true, settings = true,
-    caps = true, equipped = true, equipped_skins = true, perks = true,
-    ingame = true, game_data = true,
-}
-
-local function deepScanItemCount(data, itemName, depth, seen)
-    if depth > 4 or type(data) ~= "table" then return nil end
-    seen = seen or {}
-    if seen[data] then return nil end
-    seen[data] = true
-    local direct = gameExactItemCount(data, itemName)
-    if direct == nil then direct = lookupItemCountInData(data, itemName) end
-    if direct ~= nil then return direct end
-    for k, v in pairs(data) do
-        if type(v) == "table" and not DEEP_SCAN_SKIP[k] then
-            local n = deepScanItemCount(v, itemName, depth + 1, seen)
-            if n ~= nil then return n end
-        end
-    end
-    return nil
-end
-
-local function clearModuleCache(mod)
-    if mod and package and type(package.loaded) == "table" then
-        package.loaded[mod] = nil
-    end
-end
-
-local function requireUtilityFresh()
-    local client = LP.PlayerScripts:FindFirstChild("Client")
-    local mod = client and client:FindFirstChild("Utility")
-    if not mod then return nil end
-    clearModuleCache(mod)
-    local ok, util = pcall(require, mod)
-    if ok and type(util) == "table" then return util end
-    return nil
-end
-
-local function invalidateMatchCountCaches()
-    AS._clientDataCache = nil
-    AS._lastClientScan = 0
-    AS._matchPlayerData = nil
-    AS._lastPlayersGet = 0
-end
-
-local function getLiveUtilityData()
-    local util = requireUtilityFresh()
-    if util and type(util.data) == "table" then
-        return util.data, util
-    end
-    return nil, util
-end
-
-local function collectAllClientDataTables()
-    AS._lastClientScan = AS._lastClientScan or 0
-    if AS._clientDataCache and tick() - AS._lastClientScan < 2.5 then
-        return AS._clientDataCache
-    end
-    AS._lastClientScan = tick()
-    local sources = {}
-    local seen = {}
-    local function add(data)
-        if type(data) == "table" and not seen[data] then
-            seen[data] = true
-            sources[#sources + 1] = data
-        end
-    end
-    local data = getLiveUtilityData()
-    if data then add(data) end
-    AS._clientDataCache = sources
-    return sources
-end
-
-local function collectHoverInfoFrames()
-    local out = {}
-    local pg = LP:FindFirstChildOfClass("PlayerGui")
-    if not pg then return out end
-    for _, desc in ipairs(pg:GetDescendants()) do
-        if desc.Name == "hover_info" and desc:FindFirstChild("own") then
-            out[#out + 1] = desc
-        end
-    end
-    return out
-end
-
-local function findHoverInfoGui()
-    local pg = LP:FindFirstChildOfClass("PlayerGui")
-    if not pg then return nil end
-    for _, path in ipairs({ "Priority", "Menus" }) do
-        local parent = pg:FindFirstChild(path)
-        if parent then
-            local hi = parent:FindFirstChild("hover_info")
-            if hi then return hi end
-        end
-    end
-    return pg:FindFirstChild("hover_info", true)
-end
-
-local function parseOwnCountText(text)
-    if type(text) ~= "string" or text == "" then return nil end
-    local plain = text:gsub("<[^>]+>", "")
-    local num = parseCompactNumber(plain:match("x%s*([%d%.%,]+[kKmMbB]?)"))
-        or parseCompactNumber(plain:match("([%d%.%,]+[kKmMbB]?)"))
-    return num
-end
-
-local function rememberHoverCount(itemName, count)
-    if type(itemName) ~= "string" or itemName == "" or count == nil then return end
-    AS.hoverCountCache = AS.hoverCountCache or {}
-    AS.hoverCountCache[normalizeItemKey(itemName)] = { count = count, at = tick(), name = itemName }
-    AS._itemsBankCache = AS._itemsBankCache or {}
-    local nk = normalizeItemKey(itemName)
-    local prev = AS._itemsBankCache[nk]
-    if not prev or count > prev.count then
-        AS._itemsBankCache[nk] = { count = count, name = itemName }
-    end
-end
-
-local function readCachedHoverCount(itemName)
-    local cache = AS.hoverCountCache and AS.hoverCountCache[normalizeItemKey(itemName)]
-    if cache and tick() - (cache.at or 0) < 120 then
-        return tonumber(cache.count)
-    end
-    return nil
-end
-
-local function setupHoverCountWatcher()
-    if AS._hoverWatcherOn then return end
-    AS._hoverWatcherOn = true
-    addThread(function()
-        local hooked = {}
-        while alive() do
-            for _, hi in ipairs(collectHoverInfoFrames()) do
-                if not hooked[hi] then
-                    hooked[hi] = true
-                    local own = hi:FindFirstChild("own")
-                    local title = hi:FindFirstChild("title") or hi:FindFirstChild("name")
-                    if own and title and own:IsA("TextLabel") and title:IsA("TextLabel") then
-                        local function capture()
-                            if not hi.Visible then return end
-                            local item = stripHtml(title.Text or "")
-                            local count = parseOwnCountText(own.Text or "")
-                            if item ~= "" and count then rememberHoverCount(item, count) end
-                        end
-                        addConn(own:GetPropertyChangedSignal("Text"):Connect(capture))
-                        addConn(title:GetPropertyChangedSignal("Text"):Connect(capture))
-                        addConn(hi:GetPropertyChangedSignal("Visible"):Connect(capture))
+            if not v:GetAttribute("_cp_hook") then
+                v:SetAttribute("_cp_hook", true)
+                addConn(v:GetPropertyChangedSignal("Value"):Connect(function()
+                    local p = lastDamage[key] or 0
+                    local n = v.Value
+                    if n ~= p then
+                        lastDamage[key] = n
+                        log("STATΔ", ("%s LIVE %s -> %s (+%s)"):format(key, tostring(p), tostring(n), tostring(n - p)))
                     end
-                end
-            end
-            task.wait(1)
-        end
-    end)
-end
-
-local function readHoverInfoOwnCount(itemName)
-    if type(itemName) ~= "string" or itemName == "" then return nil end
-    local cached = readCachedHoverCount(itemName)
-    if cached ~= nil then return cached end
-    local ok, count = pcall(function()
-        for _, hi in ipairs(collectHoverInfoFrames()) do
-            if hi.Visible then
-                local title = hi:FindFirstChild("title") or hi:FindFirstChild("name")
-                local own = hi:FindFirstChild("own")
-                if title and own and title:IsA("TextLabel") and own:IsA("TextLabel") then
-                    if titleMatchesItem(title.Text, itemName) then
-                        local n = parseOwnCountText(own.Text or "")
-                        if n then
-                            rememberHoverCount(itemName, n)
-                            return n
-                        end
-                    end
-                end
-            end
-        end
-        return nil
-    end)
-    if ok and count ~= nil then return count end
-    return nil
-end
-
-local function readMatchItemCount(itemName)
-    if AS._countPlayArea ~= inPlayArea() then
-        AS._countPlayArea = inPlayArea()
-        if AS._countPlayArea then
-            invalidateMatchCountCaches()
-        end
-    end
-
-    setupHoverCountWatcher()
-
-    local best = nil
-    local function take(n)
-        n = tonumber(n)
-        if n ~= nil and (not best or n > best) then best = n end
-    end
-
-    -- 1. Hover tooltip (game "You Own" — highest authority)
-    take(readCachedHoverCount(itemName))
-    local okHover, hoverNow = pcall(function()
-        for _, hi in ipairs(collectHoverInfoFrames()) do
-            if hi.Visible then
-                local title = hi:FindFirstChild("title") or hi:FindFirstChild("name")
-                local own = hi:FindFirstChild("own")
-                if title and own and title:IsA("TextLabel") and own:IsA("TextLabel") then
-                    if titleMatchesItem(title.Text, itemName) then
-                        local n = parseOwnCountText(own.Text or "")
-                        if n then
-                            rememberHoverCount(itemName, n)
-                            return n
-                        end
-                    end
-                end
-            end
-        end
-        return nil
-    end)
-    if okHover then take(hoverNow) end
-
-    -- 2. Items bank (util.data + lobby snapshot + bank cache) — never session stats
-    local utilData = getLiveUtilityData()
-    if utilData then
-        take(readItemsOnlyCount(utilData, itemName))
-        mergeItemsBankCache(utilData.items)
-    end
-    take(readBestItemsBankCount(itemName))
-    if AS.awakenItemCache and AS.awakenItemCache[itemName] ~= nil then
-        take(AS.awakenItemCache[itemName])
-    end
-    if Session.awakenItemCache and Session.awakenItemCache[itemName] ~= nil then
-        take(Session.awakenItemCache[itemName])
-    end
-
-    -- 3. Stats fallback only when no bank/hover count found (session drops)
-    if best == nil then
-        local matchData = AS._matchPlayerData
-        if matchData then take(readStatsOnlyCount(matchData, itemName)) end
-        if utilData then take(readStatsOnlyCount(utilData, itemName)) end
-        local fresh = refreshMatchPlayerData(false)
-        if fresh then take(readStatsOnlyCount(fresh, itemName)) end
-    end
-
-    return best
-end
-
-local function getCharacterData(unitName)
-    local folder = ReplicatedStorage.Characters:FindFirstChild(unitName)
-    if not folder then return nil end
-    local dataMod = folder:FindFirstChild("data")
-    if not dataMod then return nil end
-    local ok, data = pcall(function() return require(dataMod) end)
-    if ok and type(data) == "table" then return data end
-    return nil
-end
-
-local function getAwakeningCost(unitName)
-    local data = getCharacterData(unitName)
-    if data and type(data.awakening) == "table" and type(data.awakening.cost) == "table" then
-        return data.awakening.cost, data.awakening.object
-    end
-    return nil
-end
-
-local function getAwakenCountUnitName()
-    local af = Session.awakeningFarm
-    if af and type(af.unitName) == "string" and af.unitName ~= "" then
-        return af.unitName
-    end
-    return CONFIG.awakeningUnit
-end
-
-local function isAwakeningCostItem(itemName, unitName)
-    unitName = unitName or getAwakenCountUnitName()
-    if type(unitName) ~= "string" or unitName == "" then return false end
-    local cost = getAwakeningCost(unitName)
-    return type(cost) == "table" and (tonumber(cost[itemName]) or 0) > 0
-end
-
-local function updateAwakenItemCacheFromData(data, unitName)
-    if type(data) ~= "table" then return end
-    mergeItemsBankCache(data.items)
-    local cost = unitName and getAwakeningCost(unitName)
-    if not cost then return end
-    AS.awakenItemCache = AS.awakenItemCache or {}
-    Session.awakenItemCache = Session.awakenItemCache or {}
-    for item in pairs(cost) do
-        local n = readItemsOnlyCount(data, item)
-        if n == nil then n = readBestItemsBankCount(item) end
-        if n == nil then n = readInventoryItemCount(data, item) end
-        if n == nil then n = readLiveItemCount(item, data) end
-        AS.awakenItemCache[item] = n
-        Session.awakenItemCache[item] = n
-    end
-    saveSession()
-end
-
-local function bumpAwakenItemCache(itemName, amount)
-    if type(itemName) ~= "string" or itemName == "" then return end
-    amount = tonumber(amount) or 0
-    restoreAwakenItemCache()
-    AS.awakenItemCache = AS.awakenItemCache or {}
-    Session.awakenItemCache = Session.awakenItemCache or {}
-    local prev = tonumber(AS.awakenItemCache[itemName]) or 0
-    if amount > prev then
-        AS.awakenItemCache[itemName] = amount
-        Session.awakenItemCache[itemName] = amount
-        saveSession()
-    end
-end
-
-local function getFarmItemNeed(itemName)
-    local af = Session.awakeningFarm
-    if not af or type(af.reqSnapshot) ~= "table" then return nil end
-    for _, m in ipairs(af.reqSnapshot) do
-        if m.item == itemName then return tonumber(m.need) end
-    end
-    return nil
-end
-
-local function syncReqSnapshotHave(itemName, have)
-    local af = Session.awakeningFarm
-    if not af then return end
-    have = tonumber(have) or 0
-    for _, list in ipairs({ af.reqSnapshot, af.reqSnapshotFull }) do
-        if type(list) == "table" then
-            for _, m in ipairs(list) do
-                if m.item == itemName then
-                    m.have = have
-                    m.deficit = math.max(0, (tonumber(m.need) or 0) - have)
-                end
+                end))
             end
         end
     end
 end
 
-local function syncAwakenItemCount(itemName, live)
-    live = tonumber(live)
-    if live == nil then return nil end
-    restoreAwakenItemCache()
-    local hover = readCachedHoverCount(itemName)
-    if hover and hover > live then live = hover end
-    local bank = readBestItemsBankCount(itemName)
-    if bank and bank > live then live = bank end
-    local utilData = getLiveUtilityData()
-    if utilData then
-        local utilBank = readItemsOnlyCount(utilData, itemName)
-        if utilBank and utilBank > live then live = utilBank end
-    end
-    local prev = tonumber(AS.awakenItemCache and AS.awakenItemCache[itemName])
-        or tonumber(Session.awakenItemCache and Session.awakenItemCache[itemName])
-    if prev and prev > live then live = prev end
-    if not prev or live ~= prev then
-        bumpAwakenItemCache(itemName, live)
-    end
-    syncReqSnapshotHave(itemName, live)
-    return live
-end
+for _, p in ipairs(Players:GetPlayers()) do scanLeaderstats(p) end
+addConn(Players.PlayerAdded:Connect(scanLeaderstats))
+addConn(LP.ChildAdded:Connect(function(c)
+    if c.Name == "leaderstats" then task.defer(function() scanLeaderstats(LP) end) end
+end))
 
-local function getItemCount(itemName)
-    restoreAwakenItemCache()
-    if inPlayArea() then
-        local live = readMatchItemCount(itemName)
-        if live ~= nil then
-            return syncAwakenItemCount(itemName, live)
-        end
-        local hover = readCachedHoverCount(itemName)
-        if hover ~= nil then
-            return syncAwakenItemCount(itemName, hover)
-        end
-        local bank = readBestItemsBankCount(itemName)
-        if bank ~= nil then
-            return syncAwakenItemCount(itemName, bank)
-        end
-        local utilData = getLiveUtilityData()
-        if utilData then
-            live = readItemsOnlyCount(utilData, itemName)
-            if live ~= nil then
-                return syncAwakenItemCount(itemName, live)
+-- ============================================================
+-- 4) Module / getgc scan for Characters.all and combat tables
+-- ============================================================
+local function probeModuleTable(tbl, label)
+    if type(tbl) ~= "table" then return false end
+    local found = false
+    if type(tbl.all) == "table" then
+        found = true
+        local n = 0
+        for id, ent in pairs(tbl.all) do
+            n = n + 1
+            if n <= 8 and type(ent) == "table" then
+                log("GC", label .. ".all[" .. tostring(id) .. "] name=" .. tostring(ent.name)
+                    .. " type=" .. tostring(ent.type) .. " owner=" .. tostring(ent.owner)
+                    .. " hp=" .. tostring(ent.health) .. "/" .. tostring(ent.max_health)
+                    .. " dmg=" .. tostring(ent.damage))
             end
         end
-        if AS.awakenItemCache and AS.awakenItemCache[itemName] ~= nil then
-            return syncAwakenItemCount(itemName, AS.awakenItemCache[itemName])
-        end
-        if Session.awakenItemCache and Session.awakenItemCache[itemName] ~= nil then
-            return syncAwakenItemCount(itemName, Session.awakenItemCache[itemName])
-        end
-        local matchData = AS._matchPlayerData
-        if matchData then
-            live = readStatsOnlyCount(matchData, itemName)
-            if live ~= nil then
-                return syncAwakenItemCount(itemName, live)
-            end
-        end
-        return nil
+        log("GC", label .. ".all has " .. n .. " entries")
     end
-    local live = readLiveItemCount(itemName)
-    if inLobby() then
-        AS.awakenItemCache = AS.awakenItemCache or {}
-        Session.awakenItemCache = Session.awakenItemCache or {}
-        AS.awakenItemCache[itemName] = live
-        Session.awakenItemCache[itemName] = live
-        saveSession()
-    end
-    return live
-end
-
-local function scanAwakenableCharacterNames()
-    if AWAKENABLE_NAMES then return AWAKENABLE_NAMES end
-    local map = {}
-    local chars = ReplicatedStorage:FindFirstChild("Characters")
-    if chars then
-        for _, child in ipairs(chars:GetChildren()) do
-            local dataMod = child:FindFirstChild("data")
-            if dataMod then
-                local ok, data = pcall(function() return require(dataMod) end)
-                if ok and type(data) == "table"
-                    and type(data.awakening) == "table"
-                    and type(data.awakening.cost) == "table" then
-                    map[child.Name] = true
-                end
-            end
+    for k, v in pairs(tbl) do
+        if type(k) == "string" and (k:lower():find("damage") or k:lower():find("combat") or k:lower():find("dps")) then
+            log("GC", label .. "." .. k .. " = " .. ser(v, 1))
+            found = true
         end
     end
-    AWAKENABLE_NAMES = map
-    return map
-end
-
-local function isAwakenableUnitName(unitName)
-    if type(unitName) ~= "string" or unitName == "" then return false, nil end
-    local awakenable = scanAwakenableCharacterNames()
-    if awakenable[unitName] then return true, unitName end
-    local folder = ReplicatedStorage.Characters:FindFirstChild(unitName)
-    if folder then
-        local data = getCharacterData(unitName)
-        if data and type(data.awakening) == "table" and type(data.awakening.cost) == "table" then
-            return true, unitName
-        end
-    end
-    return false, nil
-end
-
-local function discoverUnitsFromCharactersGui(seen)
-    local list = {}
-    seen = seen or {}
-    local menus = getMenus()
-    local charsFrame = menus and menus:FindFirstChild("Characters")
-    local scroll = charsFrame and charsFrame:FindFirstChild("ScrollingFrame")
-    local awakenable = scanAwakenableCharacterNames()
-    if not scroll then return list end
-
-    for _, child in ipairs(scroll:GetChildren()) do
-        if child:IsA("GuiButton") then
-            local modelName = nil
-            local vp = child:FindFirstChild("ViewportFrame")
-            local wm = vp and vp:FindFirstChildOfClass("WorldModel")
-            if wm then modelName = wm.Name end
-            if not modelName and child:FindFirstChild("UnitName") then
-                modelName = child.UnitName.Text
-            end
-            if modelName and awakenable[modelName] and not seen[modelName] then
-                seen[modelName] = true
-                list[#list + 1] = {
-                    id = child.Name,
-                    name = modelName,
-                    index = tonumber(child.Name),
-                    level = nil,
-                }
-            end
-        end
-    end
-    return list
-end
-
-local function countAwakenUnitCache()
-    local n = 0
-    if AS.awakenUnitByName then
-        for _ in pairs(AS.awakenUnitByName) do n = n + 1 end
-    end
-    return n
-end
-
-local function mergeAwakenUnitEntry(list, seen, entry)
-    if type(entry) ~= "table" or type(entry.name) ~= "string" or entry.name == "" then return end
-    if seen[entry.name] then return end
-    seen[entry.name] = true
-    list[#list + 1] = entry
-end
-
-local function updateAwakenUnitsCache(units)
-    if type(units) ~= "table" or #units == 0 then return end
-    AS.awakenUnitByName = AS.awakenUnitByName or {}
-    Session.awakenUnitCache = Session.awakenUnitCache or { byName = {} }
-    local byName = Session.awakenUnitCache.byName or {}
-    local before = countAwakenUnitCache()
-    for _, u in ipairs(units) do
-        if u.name then
-            local prev = byName[u.name] or AS.awakenUnitByName[u.name]
-            local merged = {
-                id    = u.id or (prev and prev.id),
-                name  = u.name,
-                index = u.index or (prev and prev.index),
-                level = u.level or (prev and prev.level),
-            }
-            byName[u.name] = merged
-            AS.awakenUnitByName[u.name] = merged
-        end
-    end
-    local after = countAwakenUnitCache()
-    if after > before or (inLobby() and after > 0) then
-        Session.awakenUnitCache.byName = byName
-        saveSession()
-    end
-end
-
-local function getOwnedAwakenableUnits()
-    restoreAwakenUnitCache()
-    local list, seen = {}, {}
-
-    if AS.awakenUnitByName then
-        local cached = {}
-        for _, u in pairs(AS.awakenUnitByName) do cached[#cached + 1] = u end
-        table.sort(cached, function(a, b) return tostring(a.name) < tostring(b.name) end)
-        for _, u in ipairs(cached) do
-            mergeAwakenUnitEntry(list, seen, u)
-        end
-    end
-
-    if inLobby() then
-        refreshPlayerData()
-    end
-    local data = getPlayerData()
-    if data and type(data.characters) == "table" then
-        for id, ch in pairs(data.characters) do
-            if type(ch) == "table" and type(ch.name) == "string" and ch.name ~= "" then
-                local ok, folderName = isAwakenableUnitName(ch.name)
-                if ok and folderName then
-                    mergeAwakenUnitEntry(list, seen, {
-                        id = ch.id or id,
-                        name = folderName,
-                        index = ch.index,
-                        level = ch.level,
-                    })
-                end
-            end
-        end
-    end
-
-    if inLobby() then
-        for _, u in ipairs(discoverUnitsFromCharactersGui(seen)) do
-            mergeAwakenUnitEntry(list, seen, u)
-        end
-    end
-
-    table.sort(list, function(a, b) return tostring(a.name) < tostring(b.name) end)
-    if #list > 0 then
-        updateAwakenUnitsCache(list)
-    end
-    return list
-end
-
-local function findOwnedUnitByName(unitName)
-    if type(unitName) ~= "string" or unitName == "" then return nil end
-    restoreAwakenUnitCache()
-    if AS.awakenUnitByName and AS.awakenUnitByName[unitName] then
-        return AS.awakenUnitByName[unitName]
-    end
-    if not inLobby() then
-        return nil
-    end
-    refreshPlayerData()
-    local data = getPlayerData()
-    if data and type(data.characters) == "table" then
-        for id, ch in pairs(data.characters) do
-            if type(ch) == "table" and ch.name then
-                local ok, folderName = isAwakenableUnitName(ch.name)
-                if ok and folderName == unitName then
-                    local unit = {
-                        id = ch.id or id,
-                        name = folderName,
-                        index = ch.index,
-                        level = ch.level,
-                    }
-                    updateAwakenUnitsCache({ unit })
-                    return unit
-                end
-            end
-        end
-    end
-    for _, u in ipairs(getOwnedAwakenableUnits()) do
-        if u.name == unitName then return u end
-    end
-    return nil
-end
-
-local function copyMissingSnapshot(list)
-    if type(list) ~= "table" then return nil end
-    local out = {}
-    for i, m in ipairs(list) do
-        if type(m) == "table" and m.item then
-            out[i] = {
-                item = m.item,
-                need = tonumber(m.need) or 0,
-                have = tonumber(m.have) or 0,
-                deficit = tonumber(m.deficit) or 0,
-            }
-        end
-    end
-    return out
-end
-
-local function copyFullReqSnapshot(entries)
-    if type(entries) ~= "table" then return nil end
-    local out = {}
-    for i, m in ipairs(entries) do
-        if type(m) == "table" and m.item then
-            out[i] = {
-                item = m.item,
-                need = tonumber(m.need) or 0,
-                have = tonumber(m.have) or 0,
-                deficit = tonumber(m.deficit) or 0,
-            }
-        end
-    end
-    return out
-end
-
-local function resolveAwakenItemCount(itemName, snapByItem)
-    if type(itemName) ~= "string" or itemName == "" then return nil end
-    local have = getItemCount(itemName)
-    if have ~= nil then return have end
-    have = readBestItemsBankCount(itemName)
-    if have ~= nil then return have end
-    have = tonumber(AS.awakenItemCache and AS.awakenItemCache[itemName])
-        or tonumber(Session.awakenItemCache and Session.awakenItemCache[itemName])
-    if have ~= nil then return have end
-    local data = AS._lobbyPlayerData or AS.playerData or getPlayerData()
-    if data then
-        have = readItemsOnlyCount(data, itemName)
-        if have ~= nil then return have end
-        have = readInventoryItemCount(data, itemName)
-        if have ~= nil then return have end
-    end
-    if inPlayArea() then
-        local utilData = getLiveUtilityData()
-        if utilData then
-            have = readItemsOnlyCount(utilData, itemName)
-            if have ~= nil then return have end
-        end
-        data = AS._matchPlayerData
-        if data then
-            have = readStatsOnlyCount(data, itemName)
-            if have ~= nil then return have end
-        end
-    end
-    return nil
-end
-
-local function getMissingAwakeningReqs(unitName)
-    local cost = getAwakeningCost(unitName)
-    if type(cost) ~= "table" or next(cost) == nil then return nil end
-
-    if inLobby() then
-        refreshPlayerData()
-        updateAwakenItemCacheFromData(getPlayerData(), unitName)
-    end
-
-    local snapByItem = {}
-    local af = Session.awakeningFarm
-    if af and af.unitName == unitName then
-        if type(af.reqSnapshotFull) == "table" then
-            for _, m in ipairs(af.reqSnapshotFull) do snapByItem[m.item] = m end
-        elseif type(af.reqSnapshot) == "table" then
-            for _, m in ipairs(af.reqSnapshot) do snapByItem[m.item] = m end
-        end
-    end
-
-    local missing = {}
-    local full = {}
-    for item, need in pairs(cost) do
-        need = tonumber(need) or 0
-        if need > 0 then
-            local have = resolveAwakenItemCount(item, snapByItem)
-            if have == nil then return nil end
-            local entry = {
-                item = item,
-                need = need,
-                have = have,
-                deficit = math.max(0, need - have),
-            }
-            full[#full + 1] = entry
-            if have < need then
-                missing[#missing + 1] = entry
-            end
-        end
-    end
-    table.sort(missing, function(a, b)
-        if a.deficit ~= b.deficit then return a.deficit > b.deficit end
-        return a.item < b.item
-    end)
-    table.sort(full, function(a, b)
-        if a.deficit ~= b.deficit then return a.deficit > b.deficit end
-        return a.item < b.item
-    end)
-
-    if af and af.unitName == unitName then
-        af.reqSnapshot = copyMissingSnapshot(missing)
-        af.reqSnapshotFull = copyFullReqSnapshot(full)
-    end
-    return missing
-end
-
-local function parseItemDescriptionLocation(itemName)
-    if ITEM_LOC_CACHE[itemName] then return ITEM_LOC_CACHE[itemName] end
-    local folder = ReplicatedStorage.Items:FindFirstChild(itemName)
-    if not folder then return nil end
-    local ok, data = pcall(function() return require(folder.data) end)
-    if not ok or type(data) ~= "table" then return nil end
-    local desc = stripHtml(tostring(data.description or ""))
-    local loc = desc:match("Obtainable in%s*→%s*(.+)$")
-        or desc:match("Obtainable in%s+(.+)$")
-    loc = loc and loc:gsub("%.$", ""):gsub("%s+", " ") or nil
-    if not loc or loc == "" then return nil end
-
-    if loc:find("Special Quest", 1, true) then
-        local quest = loc:match("Special Quest%s+(.+)")
-        local parsed = { type = "special", quest = quest and quest:gsub("%.$", "") or loc }
-        ITEM_LOC_CACHE[itemName] = parsed
-        return parsed
-    end
-    if loc:find("Crafting", 1, true) then
-        local parsed = { type = "crafting" }
-        ITEM_LOC_CACHE[itemName] = parsed
-        return parsed
-    end
-
-    local world, act1, act2 = loc:match("^(.-) Story Act (%d+)%s*,%s*(%d+)")
-    if world then
-        local parsed = {
-            type = "map", world = world:match("^%s*(.-)%s*$"), mode = "Story",
-            acts = { tonumber(act1), tonumber(act2) }, difficulty = "Normal",
-        }
-        ITEM_LOC_CACHE[itemName] = parsed
-        return parsed
-    end
-
-    world, act1 = loc:match("^(.-) Story Act (%d+)")
-    if world then
-        local parsed = {
-            type = "map", world = world:match("^%s*(.-)%s*$"), mode = "Story",
-            acts = { tonumber(act1) }, difficulty = "Normal",
-        }
-        ITEM_LOC_CACHE[itemName] = parsed
-        return parsed
-    end
-
-    world, act1 = loc:match("^(.-) Act (%d+)%s+Squadron")
-    if world then
-        local parsed = {
-            type = "map", world = world:match("^%s*(.-)%s*$"), mode = "Squadron",
-            acts = { tonumber(act1) }, difficulty = "Normal",
-        }
-        ITEM_LOC_CACHE[itemName] = parsed
-        return parsed
-    end
-
-    world, act1 = loc:match("^(.-) Squadron Act (%d+)")
-    if world then
-        local parsed = {
-            type = "map", world = world, mode = "Squadron",
-            acts = { tonumber(act1) }, difficulty = "Normal",
-        }
-        ITEM_LOC_CACHE[itemName] = parsed
-        return parsed
-    end
-
-    world, act1 = loc:match("^(.-) Act (%d+) Squadron")
-    if world then
-        local parsed = {
-            type = "map", world = world, mode = "Squadron",
-            acts = { tonumber(act1) }, difficulty = "Normal",
-        }
-        ITEM_LOC_CACHE[itemName] = parsed
-        return parsed
-    end
-
-    world, act1, difficulty = loc:match("^(.-) Squadron Act (%d+)%s*(Hard)")
-    if world then
-        local parsed = {
-            type = "map", world = world:match("^%s*(.-)%s*$"), mode = "Squadron",
-            acts = { tonumber(act1) }, difficulty = "Hard",
-        }
-        ITEM_LOC_CACHE[itemName] = parsed
-        return parsed
-    end
-
-    world, act1 = loc:match("^(.-) Act (%d+) Raid")
-    if world then
-        local parsed = {
-            type = "map", world = world:match("^%s*(.-)%s*$"), mode = "Raid",
-            acts = { tonumber(act1) }, difficulty = "Normal",
-        }
-        ITEM_LOC_CACHE[itemName] = parsed
-        return parsed
-    end
-
-    world = loc:match("^(.-) Invasion")
-    if world then
-        local parsed = {
-            type = "map", world = world, mode = "Invasion",
-            acts = { 1 }, difficulty = "Normal",
-        }
-        ITEM_LOC_CACHE[itemName] = parsed
-        return parsed
-    end
-
-    return nil
-end
-
-local function discoverItemDropMaps(itemName)
-    local found, seen = {}, {}
-    local ok, Worlds = pcall(function() return require(LP.PlayerScripts.Client.Play.Worlds) end)
-    if ok and type(Worlds) == "table" then
-        for _, idx in ipairs(WORLD_INDICES) do
-            local w = Worlds[idx]
-            if type(w) == "table" and w.name and type(w.Rewards) == "table" then
-                for mode, modeData in pairs(w.Rewards) do
-                    if type(modeData) == "table" then
-                        for diff, diffData in pairs(modeData) do
-                            if type(diffData) == "table" then
-                                for act, actRewards in ipairs(diffData) do
-                                    if type(actRewards) == "table" and actRewards[itemName] then
-                                        local key = mode .. "|" .. w.name .. "|" .. act .. "|" .. diff
-                                        if not seen[key] then
-                                            seen[key] = true
-                                            found[#found + 1] = {
-                                                world = w.name,
-                                                mode = mode,
-                                                act = act,
-                                                difficulty = (diff == "Hard") and "Hard" or "Normal",
-                                            }
-                                        end
-                                    end
-                                end
-                            end
-                        end
-                    end
-                end
-            end
-        end
-    end
-    table.sort(found, function(a, b)
-        if a.mode ~= b.mode then return a.mode < b.mode end
-        if a.world ~= b.world then return a.world < b.world end
-        return a.act < b.act
-    end)
     return found
 end
 
-local function normalizeAwakeningDifficulty(itemDifficulty)
-    if itemDifficulty == "Hard" then return "Hard" end
-    return (CONFIG.awakeningDifficulty == "Hard") and "Hard" or "Normal"
-end
-
-local function filterTargetsByDifficulty(targets)
-    if type(targets) ~= "table" or #targets == 0 then return targets end
-    local want = normalizeAwakeningDifficulty()
-    local filtered = {}
-    for _, t in ipairs(targets) do
-        if normalizeAwakeningDifficulty(t.difficulty) == want then
-            filtered[#filtered + 1] = t
-        end
-    end
-    if #filtered > 0 then return filtered end
-    if want == "Hard" then
-        for _, t in ipairs(targets) do
-            if normalizeAwakeningDifficulty(t.difficulty) == "Normal" then
-                filtered[#filtered + 1] = t
-            end
-        end
-    end
-    return #filtered > 0 and filtered or targets
-end
-
-local function buildFarmTargetsForItem(itemName)
-    local targets = {}
-    local seen = {}
-    local function addTarget(t)
-        if type(t) ~= "table" or not t.world or not t.mode or not t.act then return end
-        local key = t.mode .. "|" .. t.world .. "|" .. t.act .. "|" .. (t.difficulty or "Normal")
-        if seen[key] then return end
-        seen[key] = true
-        targets[#targets + 1] = t
-    end
-
-    for _, m in ipairs(discoverItemDropMaps(itemName)) do addTarget(m) end
-
-    local parsed = parseItemDescriptionLocation(itemName)
-    if parsed and parsed.type == "map" then
-        for _, act in ipairs(parsed.acts or {}) do
-            addTarget({
-                world = parsed.world,
-                mode = parsed.mode,
-                act = act,
-                difficulty = parsed.difficulty or CONFIG.awakeningDifficulty,
-            })
-        end
-    elseif parsed and parsed.type == "special" then
-        return { special = parsed.quest or SPECIAL_QUEST_ITEM[itemName] }
-    elseif parsed and parsed.type == "crafting" then
-        return { crafting = true }
-    elseif SPECIAL_QUEST_ITEM[itemName] then
-        return { special = SPECIAL_QUEST_ITEM[itemName] }
-    end
-
-    if #targets == 0 and parsed and parsed.type == "map" and parsed.world then
-        addTarget({
-            world = parsed.world,
-            mode = parsed.mode or "Story",
-            act = (parsed.acts and parsed.acts[1]) or 1,
-            difficulty = parsed.difficulty or CONFIG.awakeningDifficulty,
-        })
-    end
-
-    if type(targets) == "table" and #targets > 0 then
-        for _, t in ipairs(targets) do
-            t.difficulty = normalizeAwakeningDifficulty(t.difficulty)
-        end
-        targets = filterTargetsByDifficulty(targets)
-    end
-
-    return targets
-end
-
-local function getSpecialQuestCatalog()
-    local ok, data = invokeR("Quests", "get_specials")
-    if ok and type(data) == "table" then
-        AS.specialQuestCache = data
-        return data
-    end
-    return AS.specialQuestCache or {}
-end
-
-local function claimReadySpecialTasks(questName)
-    refreshPlayerData()
-    local data = getPlayerData()
-    local catalog = getSpecialQuestCatalog()
-    local questDef = catalog[questName]
-    local playerQuest = data and data.specials and data.specials[questName]
-    if not questDef or not playerQuest then return false end
-    local claimed = false
-    for idx, taskDef in pairs(questDef.quests or {}) do
-        if type(taskDef) == "table" then
-            local prog = playerQuest.quests and playerQuest.quests[tostring(idx)]
-            if prog and not prog.claimed and tonumber(prog.progress) >= tonumber(taskDef.required) then
-                local ok, suc, newData = invokeR("Quests", "claim_special", questName, tostring(idx))
-                if ok and suc then
-                    claimed = true
-                    if type(newData) == "table" then
-                        AS.playerData = newData
-                        pcall(function()
-                            local util = require(LP.PlayerScripts.Client.Utility)
-                            if util then util.data = newData end
-                        end)
-                    end
-                end
-            end
-        end
-    end
-    refreshPlayerData()
-    return claimed
-end
-
-local function parseTaskFarmTarget(taskDesc)
-    if type(taskDesc) ~= "string" then return nil end
-    local desc = stripHtml(taskDesc):lower()
-    local solo = desc:find("solo", 1, true) ~= nil
-
-    local world, mode, act
-    if desc:find("invasion", 1, true) then
-        mode = "Invasion"
-        if desc:find("bralu", 1, true) or desc:find("lava", 1, true) then
-            world = "The Lava Continent"
-        elseif desc:find("ice", 1, true) then
-            world = "The Ice Continent"
-        end
-        act = 1
-    elseif desc:find("infinite", 1, true) then
-        mode = "Infinite"
-        world = "The Lava Continent"
-        act = 1
-    elseif desc:find("raid", 1, true) then
-        mode = "Raid"
-        world = desc:match("(%w[%w%s%(%)%-]+) raid") or world
-        act = tonumber(desc:match("act (%d+)")) or 1
-    elseif desc:find("squadron", 1, true) or desc:find("stage", 1, true) then
-        mode = "Squadron"
-        world = desc:match("(%w[%w%s%(%)%-]+) invasion")
-            or desc:match("(%w[%w%s%(%)%-]+) squadron")
-            or world
-        act = tonumber(desc:match("act (%d+)")) or 1
-    end
-
-    if not world or not mode then return nil end
-    return { world = world, mode = mode, act = act, difficulty = CONFIG.awakeningDifficulty, solo = solo }
-end
-
-local function pickSpecialQuestFarmTarget(questName, itemName)
-    claimReadySpecialTasks(questName)
-    if getItemCount(itemName) > 0 then return nil end
-
-    local data = getPlayerData()
-    local catalog = getSpecialQuestCatalog()
-    local questDef = catalog[questName]
-    local playerQuest = data and data.specials and data.specials[questName]
-    if not questDef or not playerQuest then return nil end
-
-    local best
-    for idx, taskDef in pairs(questDef.quests or {}) do
-        if type(taskDef) == "table" then
-            local prog = playerQuest.quests and playerQuest.quests[tostring(idx)]
-            local progress = prog and tonumber(prog.progress) or 0
-            local required = tonumber(taskDef.required) or 0
-            if not (prog and prog.claimed) and progress < required then
-                local target = parseTaskFarmTarget(taskDef.desc or taskDef.name or "")
-                if target then
-                    target.quest = questName
-                    target.taskIndex = tostring(idx)
-                    target.taskName = taskDef.name or ("Task " .. tostring(idx))
-                    target.progress = progress
-                    target.required = required
-                    if not best or (required - progress) > (best.required - best.progress) then
-                        best = target
-                    end
-                end
-            end
-        end
-    end
-    return best
-end
-
-local function pickNextAwakeningFarmTarget(unitName, focusItem)
-    local missing = getMissingAwakeningReqs(unitName)
-    if type(missing) ~= "table" then return nil, "unknown" end
-    if #missing == 0 then return nil, "ready" end
-
-    local tryOrder = {}
-    if focusItem then
-        for _, m in ipairs(missing) do
-            if m.item == focusItem then tryOrder[#tryOrder + 1] = m end
-        end
-    end
-    for _, m in ipairs(missing) do
-        if m.item ~= focusItem then tryOrder[#tryOrder + 1] = m end
-    end
-
-    local lastUnknown, lastCrafting, lastSpecial
-    for _, itemEntry in ipairs(tryOrder) do
-        local itemName = itemEntry.item
-        local targets = buildFarmTargetsForItem(itemName)
-        if type(targets) == "table" and targets.special then
-            local sq = pickSpecialQuestFarmTarget(targets.special, itemName)
-            if sq then return sq, itemName end
-            lastSpecial = {
-                type = "special_wait",
-                quest = targets.special,
-                item = itemName,
-            }
-        elseif type(targets) == "table" and targets.crafting then
-            lastCrafting = { type = "crafting", item = itemName }
-        elseif type(targets) == "table" and #targets > 0 then
-            local af = Session.awakeningFarm
-            local startIdx = 1
-            if af and af.item == itemName and af.targetIdx then
-                startIdx = af.targetIdx
-            end
-            for i = 0, #targets - 1 do
-                local idx = ((startIdx - 1 + i) % #targets) + 1
-                local t = targets[idx]
-                return {
-                    world = t.world,
-                    mode = t.mode,
-                    act = t.act,
-                    difficulty = t.difficulty or CONFIG.awakeningDifficulty,
-                    item = itemName,
-                    targetIdx = idx,
-                    targetCount = #targets,
-                }, itemName
-            end
-        else
-            lastUnknown = { type = "unknown", item = itemName }
-        end
-    end
-
-    if lastSpecial then return lastSpecial, lastSpecial.item end
-    if lastCrafting then return lastCrafting, lastCrafting.item end
-    if lastUnknown then return lastUnknown, lastUnknown.item end
-    return nil, "ready"
-end
-
-local function awakeningHasWork()
-    if not CONFIG.autoAwakening then return false end
-    local unit = findOwnedUnitByName(CONFIG.awakeningUnit)
-    if not unit then return false end
-    if Session.awakeningFarm then return true end
-    local missing = getMissingAwakeningReqs(unit.name)
-    return type(missing) == "table" and #missing > 0
-end
-
-local function getAwakeningFarmPreview(unitName)
-    local target = pickNextAwakeningFarmTarget(unitName, Session.awakeningFarm and Session.awakeningFarm.item)
-    if not target then return "ready to awaken" end
-    if target.type == "crafting" then
-        return "need " .. target.item .. " (Crafting — manual)"
-    end
-    if target.type == "unknown" then
-        return "no route for " .. target.item
-    end
-    if target.type == "special_wait" then
-        return "special quest: " .. tostring(target.quest)
-    end
-    if target.world and target.mode then
-        return ("next: %s %s Act %d (%s) for %s"):format(
-            target.mode, target.world, target.act or 0, target.difficulty or CONFIG.awakeningDifficulty, target.item or "?")
-    end
-    return "planning route..."
-end
-
-local function awakeningTakesPriority()
-    if Session.awakeningFarm then return true end
-    return awakeningHasWork()
-end
-
-local function rememberAwakeningFarm(target, unitName)
-    Session.awakeningFarm = Session.awakeningFarm or {}
-    local af = Session.awakeningFarm
-    af.unitName = unitName
-    af.item = target.item or af.item
-    af.world = target.world
-    af.mode = target.mode
-    af.act = target.act
-    af.difficulty = target.difficulty
-    af.quest = target.quest
-    af.taskName = target.taskName
-    af.targetIdx = target.targetIdx
-    af.targetCount = target.targetCount
-    af.runs = af.runs or 0
-    af.stall = af.stall or 0
-    af.lastCount = getItemCount(af.item or "") or 0
-    af.unitName = unitName
-    if unitName and inLobby() then
-        invalidateMatchCountCaches()
-        updateAwakenItemCacheFromData(getPlayerData(), unitName)
-        local snap = getMissingAwakeningReqs(unitName)
-        if type(snap) == "table" then
-            af.reqSnapshot = copyMissingSnapshot(snap)
-            if type(af.reqSnapshotFull) ~= "table" then
-                local cost = getAwakeningCost(unitName)
-                if type(cost) == "table" then
-                    local full = {}
-                    for item, need in pairs(cost) do
-                        need = tonumber(need) or 0
-                        if need > 0 then
-                            local have = resolveAwakenItemCount(item)
-                            if have ~= nil then
-                                full[#full + 1] = {
-                                    item = item, need = need, have = have,
-                                    deficit = math.max(0, need - have),
-                                }
-                            end
-                        end
-                    end
-                    if #full > 0 then
-                        af.reqSnapshotFull = copyFullReqSnapshot(full)
-                    end
-                end
-            end
-        end
-        if flushSession then pcall(flushSession) end
-    end
-    saveSession()
-end
-
-local function forgetAwakeningFarm()
-    Session.awakeningFarm = nil
-    saveSession()
-end
-
-local function tryAwakenUnit(unit)
-    if not unit or not unit.id then return false, "no_unit" end
-    setStatus("Awakening " .. tostring(unit.name) .. "...")
-    local ok, suc, newName, newData = invokeR("Awakening", "awaken", unit.id)
-    if ok and suc then
-        if type(newData) == "table" then
-            AS.playerData = newData
-            pcall(function()
-                local util = require(LP.PlayerScripts.Client.Utility)
-                if util then util.data = newData end
-            end)
-        end
-        forgetAwakeningFarm()
-        notify("Awakening", (unit.name or "Unit") .. " awakened → " .. tostring(newName or "?"), "success")
-        return true
-    end
-    return false, tostring(newName or suc or "awaken_failed")
-end
-
-local function waitForAwakeningRun(target)
-    local t0 = tick()
-    while alive() and CONFIG.enabled and inLobby() and (tick() - t0) < 12 do
-        task.wait(0.5)
-    end
-    if not alive() or not CONFIG.enabled then return false end
-
-    if inLobby() then
-        setStatus("Awakening farm - waiting for stage to start...")
-        local t1 = tick()
-        while alive() and CONFIG.enabled and inLobby() and (tick() - t1) < CONFIG.farmTimeout do
-            task.wait(2)
-        end
-        if inLobby() then return false end
-    end
-
-    local label = target.quest and ("Special: " .. target.quest) or "Awakening"
-    setStatus(("%s - farming %s %s Act %d for %s..."):format(
-        label, target.mode or "?", target.world or "?", target.act or 0, target.item or "?"))
-
-    local af = Session.awakeningFarm
-    local farmItem = af and af.item
-    local farmNeed = farmItem and getFarmItemNeed(farmItem)
-
-    local t2 = tick()
-    local idleSince = nil
-    while alive() and CONFIG.enabled and not inLobby() and (tick() - t2) < CONFIG.farmTimeout do
-        local unitName = af and af.unitName
-        if unitName and unitName ~= "" then
-            local costTbl = getAwakeningCost(unitName)
-            if type(costTbl) == "table" then
-                for item in pairs(costTbl) do
-                    if (tonumber(costTbl[item]) or 0) > 0 then
-                        getItemCount(item)
-                    end
-                end
-            end
-        end
-        if farmItem then
-            local have = getItemCount(farmItem)
-            if farmNeed and have and have >= farmNeed then
-                setStatus(("Enough %s (%d/%d) — leaving stage..."):format(farmItem, have, farmNeed))
-                break
-            end
-            if unitName and unitName ~= "" then
-                local missing = getMissingAwakeningReqs(unitName)
-                if type(missing) == "table" and #missing == 0 then
-                    setStatus("All awakening materials met — leaving stage...")
-                    break
-                end
-            end
-        end
-        if inBattle() then
-            idleSince = nil
-        elseif isRewardScreenVisible() then
-            break
-        else
-            idleSince = idleSince or tick()
-            if tick() - idleSince >= 2 then
-                break
-            end
-        end
-        task.wait(0.5)
-    end
-
-    leaveStage(true)
-    waitForLobbyReturn(45)
-    if inLobby() then
-        refreshPlayerData()
-        local af2 = Session.awakeningFarm
-        if af2 and af2.unitName then
-            updateAwakenItemCacheFromData(getPlayerData(), af2.unitName)
-        end
-    end
-    return true
-end
-
-local function awakeningStep()
-    if not CONFIG.autoAwakening then return end
-
-    local unit = findOwnedUnitByName(CONFIG.awakeningUnit)
-    if not unit then
-        setStatus("Awakening - select an owned awakenable unit.")
-        return
-    end
-
-    if not inLobby() then
-        local af = Session.awakeningFarm
-        if af then
-            setStatus(("Awakening - in %s %s Act %d for %s..."):format(
-                af.mode or "?", af.world or "?", af.act or 0, af.item or unit.name))
-        else
-            setStatus("Awakening - in stage, waiting to return...")
-        end
-        return
-    end
-
-    refreshPlayerData()
-    updateAwakenItemCacheFromData(getPlayerData(), unit.name)
-    local af = Session.awakeningFarm
-    if af and af.quest then pcall(claimReadySpecialTasks, af.quest) end
-    claimReadySpecialTasks(SPECIAL_QUEST_ITEM[Session.awakeningFarm and Session.awakeningFarm.item or ""] or "")
-
-    local missing = getMissingAwakeningReqs(unit.name)
-    if missing == nil then
-        refreshPlayerData()
-        updateAwakenItemCacheFromData(getPlayerData(), unit.name)
-        missing = getMissingAwakeningReqs(unit.name)
-    end
-    if missing == nil then
-        setStatus("Awakening - refresh material counts in lobby.")
-        task.wait(2)
-        return
-    end
-    if #missing == 0 then
-        local ok, err = tryAwakenUnit(unit)
-        if ok then
-            setStatus("Awakening complete for " .. unit.name)
-            return "done"
-        end
-        setStatus("Awaken failed: " .. tostring(err))
-        task.wait(2)
-        return
-    end
-
-    local focusItem = Session.awakeningFarm and Session.awakeningFarm.item
-    local target, itemName = pickNextAwakeningFarmTarget(unit.name, focusItem)
-
-    if not target then
-        setStatus("Awakening - no farm route for missing items.")
-        return
-    end
-
-    if target.type == "ready" then
-        tryAwakenUnit(unit)
-        return
-    end
-    if target.type == "crafting" then
-        setStatus("Need " .. target.item .. " from Crafting (manual).")
-        notify("Awakening", target.item .. " requires Crafting — farm manually.", "error")
-        task.wait(5)
-        return
-    end
-    if target.type == "unknown" then
-        setStatus("No farm location for " .. target.item)
-        notify("Awakening", "Can't find farm map for " .. target.item, "error")
-        task.wait(5)
-        return
-    end
-    if target.type == "special_wait" then
-        setStatus("Special quest " .. target.quest .. " — claim tasks / check progress.")
-        claimReadySpecialTasks(target.quest)
-        task.wait(3)
-        return
-    end
-
-    local before = getItemCount(itemName) or 0
-    refreshPlayerData()
-    updateAwakenItemCacheFromData(getPlayerData(), unit.name)
-    rememberAwakeningFarm(target, unit.name)
-    local af = Session.awakeningFarm
-    af.runs = (af.runs or 0) + 1
-    local snap = getMissingAwakeningReqs(unit.name)
-    if type(snap) == "table" then
-        af.reqSnapshot = copyMissingSnapshot(snap)
-        af.unitName = unit.name
-    else
-        setStatus("Awakening - material counts unknown, not launching stage.")
-        notify("Awakening", "Refresh in lobby before farming — counts unknown.", "error")
-        forgetAwakeningFarm()
-        task.wait(3)
-        return
-    end
-    if flushSession then pcall(flushSession) end
-
-    local soloNote = (target.solo and CONFIG.soloOnly) and " solo" or ""
-    local needAmt = before
-    local costTbl = getAwakeningCost(unit.name)
-    if costTbl and costTbl[itemName] then
-        needAmt = tonumber(costTbl[itemName]) or needAmt
-    end
-    for _, m in ipairs(snap or {}) do
-        if m.item == itemName then needAmt = m.need break end
-    end
-    setStatus(("Awakening: need %s (%d/%d) — %s %s Act %d%s run #%d"):format(
-        itemName, before, needAmt,
-        target.mode, target.world, target.act, soloNote, af.runs))
-
-    local prevSolo = CONFIG.soloOnly
-    if target.solo then CONFIG.soloOnly = true end
-    local ok, err = startMap(target.world, target.act, target.mode, target.difficulty or CONFIG.awakeningDifficulty)
-    if target.solo then CONFIG.soloOnly = prevSolo end
-
-    if not ok then
-        setStatus("Awakening launch failed: " .. tostring(err))
-        if af.targetIdx and af.targetCount and af.targetCount > 1 then
-            af.targetIdx = (af.targetIdx % af.targetCount) + 1
-            saveSession()
-        end
-        task.wait(2)
-        return
-    end
-
-    waitForAwakeningRun(target)
-    if inLobby() then
-        refreshPlayerData()
-        updateAwakenItemCacheFromData(getPlayerData(), unit.name)
-        local snap = getMissingAwakeningReqs(unit.name)
-        if type(snap) == "table" then
-            af.reqSnapshot = copyMissingSnapshot(snap)
-            af.unitName = unit.name
-        end
-    end
-    if target.quest then claimReadySpecialTasks(target.quest) end
-
-    local after = getItemCount(itemName) or before
-    if after > before then
-        af.stall = 0
-        af.lastCount = after
-        notify("Awakening", itemName .. " " .. after .. " (+" .. (after - before) .. ")", "success")
-    else
-        af.stall = (af.stall or 0) + 1
-        if af.targetIdx and af.targetCount and af.stall >= CONFIG.awakeningStallRuns then
-            af.targetIdx = (af.targetIdx % af.targetCount) + 1
-            af.stall = 0
-            setStatus(itemName .. " stalled — trying next map...")
-        end
-    end
-    saveSession()
-end
-
-setupHoverCountWatcher()
-
-return {
-    step = awakeningStep,
-    takesPriority = awakeningTakesPriority,
-    getUnits = getOwnedAwakenableUnits,
-    findUnit = findOwnedUnitByName,
-    getMissing = getMissingAwakeningReqs,
-    getPreview = getAwakeningFarmPreview,
-    updateItemCache = updateAwakenItemCacheFromData,
-}
-end)()
-
-awakeningStep = _awakenMod.step
-awakeningTakesPriority = _awakenMod.takesPriority
-getOwnedAwakenableUnits = _awakenMod.getUnits
-findOwnedUnitByName = _awakenMod.findUnit
-getMissingAwakeningReqs = _awakenMod.getMissing
-getAwakeningFarmPreview = _awakenMod.getPreview
-updateAwakenItemCacheFromData = _awakenMod.updateItemCache
-
--- ============================================================
--- Core loop logic
--- ============================================================
--- one decision step for daily trait caps; returns "done" when all maps are maxed
-local function dailyTraitStep()
-    if not CONFIG.dailyTraitFarm then return end
-    if challengesTakePriority() then
-        local pending = countPendingChallenges()
-        if pending > 0 then
-            setStatus(("Challenges first — %d available this reset"):format(pending))
-        end
-        return
-    end
-    if awakeningTakesPriority() then
-        setStatus("Awakening farm active — daily traits paused.")
-        return
-    end
-
-    refreshPlayerData()
-
-    if not inLobby() then
-        local map = resolveDailyMap()
-        if map then
-            local curIdx = Session.dailyFarm and Session.dailyFarm.idx
-            if leaveStageIfCapped(map, nil, curIdx) then
-                waitForLobbyReturn(45)
-                return
-            end
-            setStatus(("Daily traits - in %s %s Act %d  %d/%d"):format(
-                map.mode, map.world, map.act, getTraitCapCount(map), map.cap))
-        else
-            setStatus("Daily traits - in stage, watching cap...")
-        end
-        return
-    end
-
-    local open = countOpenTraitMaps()
-    if open == 0 then
-        setStatus("All daily trait caps filled!")
-        if CONFIG.dailyStopWhenDone then
-            notify("Daily Traits", "Every map's daily Trait Shard cap is full.", "success")
-            return "done"
-        end
-        task.wait(3)
-        return
-    end
-
-    local startIdx = 1
-    if Session.dailyFarm and Session.dailyFarm.idx then
-        startIdx = Session.dailyFarm.idx
-    end
-    local map, idx = nextTraitMap(startIdx)
-    if not map then
-        setStatus("All daily trait caps filled!")
-        return "done"
-    end
-
-    local beforeCap = getTraitCapCount(map)
-    if isTraitCapMaxed(map) or shouldSkipMapAfterCapLeave(map) then
-        advanceDailyMapIdx(idx, map)
-        setStatus(map.world .. " capped — rotating to next map")
-        return
-    end
-
-    rememberDailyMap(map, idx)
-    local df = Session.dailyFarm
-    df.runs = (df.runs or 0) + 1
-
-    setStatus(("Daily traits: %s %s Act %d  %d/%d  (run #%d, %d maps left)")
-        :format(map.mode, map.world, map.act, beforeCap, map.cap, df.runs, open))
-
-    local ok, err = startMap(map.world, map.act, map.mode, CONFIG.dailyDifficulty)
-    if not ok then
-        setStatus("Daily launch failed: " .. tostring(err))
-        advanceDailyMapIdx(idx, nil)
-        df.stall = (df.stall or 0) + 1
-        saveSession()
-        local qn = #getDailyMapQueue()
-        if qn > 0 and df.stall >= qn then
-            notify("Daily Traits", "Couldn't enter any daily-trait map. Stopped.", "error")
-            return "done"
-        end
-        task.wait(2)
-        return
-    end
-
-    waitForDailyRun(map)
-
-    refreshPlayerData()
-    local afterCap = getTraitCapCount(map)
-    if afterCap > beforeCap then
-        df.stall = 0
-        df.lastCap = afterCap
-    else
-        df.stall = (df.stall or 0) + 1
-    end
-    saveSession()
-
-    if isTraitCapMaxed(map) or shouldSkipMapAfterCapLeave(map) then
-        if not AS._dailyLeftCap then
-            notify("Daily Traits", map.world .. " cap reached (" .. map.cap .. ") — next map.", "success")
-        end
-        AS._dailyLeftCap = nil
-        advanceDailyMapIdx(idx, map)
-        return
-    end
-    if df.stall >= CONFIG.dailyStallRuns then
-        setStatus(map.world .. " cap stalled - moving to next map")
-        notify("Daily Traits", map.world .. " cap not increasing - skipping.", "info")
-        advanceDailyMapIdx(idx, map)
-        df.stall = 0
-        saveSession()
-    end
-end
-
-local _looping = false
-local _inSetEnabled = false
-mainLoop = function()
-    if _looping then return end
-    _looping = true
-    setStatus("Anime Squadron started.")
-    while alive() and CONFIG.enabled do
-        if CONFIG.autoDailyChallenge or CONFIG.autoRegularChallenge then
-            local okC, errC = pcall(challengeStep)
-            if not okC then
-                setStatus("Challenge error: " .. tostring(errC))
-            end
-        end
-
-        if CONFIG.autoAwakening then
-            if challengesTakePriority() then
-                local pending = countPendingChallenges()
-                if Session.challengeFarm then
-                    setStatus("Challenge session clearing — awakening next...")
-                elseif pending > 0 then
-                    setStatus(("Challenges first (%d pending) — awakening queued"):format(pending))
-                end
-            else
-                local okA, resA = pcall(awakeningStep)
-                if not okA then
-                    setStatus("Awakening error: " .. tostring(resA))
-                elseif resA == "done" then
-                    setStatus("Awakening complete.")
-                end
-            end
-        end
-
-        if CONFIG.dailyTraitFarm and not challengesTakePriority() and not awakeningTakesPriority() then
-            local ok, res = pcall(dailyTraitStep)
-            if not ok then
-                setStatus("Daily error: " .. tostring(res))
-            elseif res == "done" then
-                if CONFIG.dailyStopWhenDone then
-                    setStatus("All daily trait caps filled - stopped.")
-                    notify("Anime Squadron", "Every daily trait cap is full. Done.", "success")
-                    setEnabled(false)
-                    break
-                end
-            end
-        elseif not (CONFIG.autoDailyChallenge or CONFIG.autoRegularChallenge or CONFIG.autoAwakening) then
-            setStatus("Enable Challenges, Awakening, and/or Daily Trait Farm to start.")
-            task.wait(2)
-        end
-        task.wait(CONFIG.loopDelay)
-    end
-    _looping = false
-    setStatus("Stopped.")
-end
-
-setEnabled = function(on)
-    on = on and true or false
-    if _inSetEnabled then return end
-    if CONFIG.enabled == on then
-        Session.running = on
-        AS.enabled = on
-        return
-    end
-    _inSetEnabled = true
-    CONFIG.enabled = on
-    AS.enabled = CONFIG.enabled
-    Session.running = CONFIG.enabled
-    pcall(persistMasterToggleImmediate)
-    pcall(saveSettings)
-    if canFile() then
-        pcall(function() writefile(SESSION_FILE, HttpService:JSONEncode(Session)) end)
-    end
-    if CONFIG.enabled then addThread(mainLoop) end
-    _inSetEnabled = false
-end
-
--- ============================================================
--- Settings persistence (JSON, debounced)
--- ============================================================
-local _saveQueued = false
-local function saveSettings()
-    if not canFile() then return end
-    if _saveQueued then return end
-    _saveQueued = true
-    addThread(function()
-        task.wait(0.6)
-        _saveQueued = false
-        local data = {
-            enabled          = CONFIG.enabled,
-            soloOnly         = CONFIG.soloOnly,
-            scriptUrl        = CONFIG.scriptUrl,
-            autoExecute      = CONFIG.autoExecute,
-            autoexecInstall  = CONFIG.autoexecInstall,
-            antiAfk          = CONFIG.antiAfk,
-            dailyTraitFarm   = CONFIG.dailyTraitFarm,
-            dailyDifficulty  = CONFIG.dailyDifficulty,
-            dailyStopWhenDone = CONFIG.dailyStopWhenDone,
-            dailyPriorityOrder   = CONFIG.dailyPriorityOrder,
-            dailyPriorityEnabled = CONFIG.dailyPriorityEnabled,
-            dpsMeter          = CONFIG.dpsMeter,
-            autoDailyChallenge   = CONFIG.autoDailyChallenge,
-            autoRegularChallenge = CONFIG.autoRegularChallenge,
-            challengeDone        = CONFIG.challengeDone,
-            challengeDoneMeta    = CONFIG.challengeDoneMeta,
-            autoAwakening        = CONFIG.autoAwakening,
-            awakeningUnit        = CONFIG.awakeningUnit,
-            awakeningDifficulty  = CONFIG.awakeningDifficulty,
-            awakeningStallRuns   = CONFIG.awakeningStallRuns,
-        }
-        pcall(function() writefile(SETTINGS_FILE, HttpService:JSONEncode(data)) end)
-    end)
-end
-local function loadSettings()
-    if not canFile() then return end
-    local path = SETTINGS_FILE
-    if not isfile(path) and isfile(LEGACY_SETTINGS_FILE) then
-        path = LEGACY_SETTINGS_FILE
-    end
-    if not isfile(path) then return end
-    local ok, raw = pcall(readfile, path)
-    if not ok or not raw then return end
-    local ok2, data = pcall(function() return HttpService:JSONDecode(raw) end)
-    if not ok2 or type(data) ~= "table" then return end
-    if data.enabled ~= nil then CONFIG.enabled = data.enabled == true end
-    if data.soloOnly ~= nil then CONFIG.soloOnly = data.soloOnly == true end
-    if data.autoExecute ~= nil then CONFIG.autoExecute = data.autoExecute == true end
-    if data.autoexecInstall ~= nil then CONFIG.autoexecInstall = data.autoexecInstall == true end
-    if data.antiAfk ~= nil then CONFIG.antiAfk = data.antiAfk == true end
-    if data.dailyTraitFarm ~= nil then CONFIG.dailyTraitFarm = data.dailyTraitFarm == true end
-    if data.dailyDifficulty == "Normal" or data.dailyDifficulty == "Hard" then
-        CONFIG.dailyDifficulty = data.dailyDifficulty
-    end
-    if data.dailyStopWhenDone ~= nil then CONFIG.dailyStopWhenDone = data.dailyStopWhenDone == true end
-    if type(data.dailyPriorityOrder) == "table" then CONFIG.dailyPriorityOrder = data.dailyPriorityOrder end
-    if type(data.dailyPriorityEnabled) == "table" then
-        for k, v in pairs(data.dailyPriorityEnabled) do
-            CONFIG.dailyPriorityEnabled[k] = v == true
-        end
-    end
-    if data.dpsMeter ~= nil then CONFIG.dpsMeter = data.dpsMeter == true end
-    if data.autoDailyChallenge ~= nil then CONFIG.autoDailyChallenge = data.autoDailyChallenge == true end
-    if data.autoRegularChallenge ~= nil then CONFIG.autoRegularChallenge = data.autoRegularChallenge == true end
-    if type(data.challengeDone) == "table" then
-        CONFIG.challengeDone = {}
-        for k, v in pairs(data.challengeDone) do
-            CONFIG.challengeDone[k] = tonumber(v)
-        end
-    end
-    if type(data.challengeDoneMeta) == "table" then
-        CONFIG.challengeDoneMeta = {}
-        for k, v in pairs(data.challengeDoneMeta) do
-            if type(v) == "table" then
-                CONFIG.challengeDoneMeta[k] = {
-                    dayTimer  = tonumber(v.dayTimer),
-                    halfTimer = tonumber(v.halfTimer),
-                    ts        = tonumber(v.ts),
-                }
-            end
-        end
-    end
-    if data.autoAwakening ~= nil then CONFIG.autoAwakening = data.autoAwakening == true end
-    if type(data.awakeningUnit) == "string" then CONFIG.awakeningUnit = data.awakeningUnit end
-    if data.awakeningDifficulty == "Normal" or data.awakeningDifficulty == "Hard" then
-        CONFIG.awakeningDifficulty = data.awakeningDifficulty
-    end
-    if data.awakeningStallRuns ~= nil then
-        CONFIG.awakeningStallRuns = math.clamp(tonumber(data.awakeningStallRuns) or 4, 1, 20)
-    end
-    if type(data.scriptUrl) == "string" and data.scriptUrl ~= "" then CONFIG.scriptUrl = data.scriptUrl end
-end
-loadSettings()
-ensureDailyPriorityConfig()
-
--- ----- session memory (survives teleports) -----
-local _sessionSaveQueued = false
-flushSession = function()
-    if not canFile() then return end
-    _sessionSaveQueued = false
-    pcall(function() writefile(SESSION_FILE, HttpService:JSONEncode(Session)) end)
-end
-saveSession = function()
-    if not canFile() then return end
-    if _sessionSaveQueued then return end
-    _sessionSaveQueued = true
-    addThread(function()
-        task.wait(0.3)
-        _sessionSaveQueued = false
-        pcall(function() writefile(SESSION_FILE, HttpService:JSONEncode(Session)) end)
-    end)
-end
-local function loadSession()
-    if not canFile() then return end
-    local path = SESSION_FILE
-    if not isfile(path) and isfile(LEGACY_SESSION_FILE) then
-        path = LEGACY_SESSION_FILE
-    end
-    if not isfile(path) then return end
-    local ok, raw = pcall(readfile, path)
-    if not ok or not raw then return end
-    local ok2, data = pcall(function() return HttpService:JSONDecode(raw) end)
-    if ok2 and type(data) == "table" then
-        if type(data.dailyFarm) == "table" then
-            Session.dailyFarm = data.dailyFarm
-        end
-        if type(data.challengeFarm) == "table" then
-            Session.challengeFarm = data.challengeFarm
-        end
-        if type(data.awakeningFarm) == "table" then
-            Session.awakeningFarm = data.awakeningFarm
-        end
-        if type(data.awakenUnitCache) == "table" then
-            Session.awakenUnitCache = data.awakenUnitCache
-        end
-        if type(data.awakenItemCache) == "table" then
-            Session.awakenItemCache = data.awakenItemCache
-        end
-    end
-end
-loadSession()
-restoreAwakenUnitCache()
-restoreAwakenItemCache()
-syncChallengeDoneFlags()
-if not CONFIG.autoDailyChallenge and not CONFIG.autoRegularChallenge then
-    Session.challengeFarm = nil
-end
--- Master toggle comes ONLY from settings (not session.running / AS.enabled OR chain)
-Session.running = CONFIG.enabled == true
-AS.enabled = CONFIG.enabled == true
-
--- ============================================================
--- Teleport + reconnect persistence
--- queue_on_teleport = in-game teleports (lobby <-> raid)
--- autoexec loader   = full disconnect / Roblox reconnect button
--- ============================================================
-local QUEUE_ARM_FILE = "AnimeSquadron_queue_arm.json"
-local LEGACY_QUEUE_ARM_FILE = "AutoBounty_queue_arm.json"
-local LOCAL_SCRIPT = "AnimeSquadron.lua"
-local LEGACY_LOCAL_SCRIPT = "AutoBounty.lua"
-
-local LOCAL_LOAD_SNIPPET = [[
-    local function loadLocalScript()
-        local names = { "AnimeSquadron.lua", "AutoBounty.lua" }
-        if readfile and isfile then
-            for _, name in ipairs(names) do
-                if isfile(name) then
-                    local ok, loc = pcall(readfile, name)
-                    if ok and loc and #loc > 1000 then return loc end
-                end
-            end
-        end
-    end
-]]
-
-local function getQueueFn()
-    return (syn and syn.queue_on_teleport)
-        or (fluxus and fluxus.queue_on_teleport)
-        or queue_on_teleport
-        or queueonteleport
-        or (getgenv and (getgenv().queue_on_teleport or getgenv().queueonteleport))
-        or (potassium and potassium.queue_on_teleport)
-end
-
-local function shouldInstallReconnect()
-    return CONFIG.autoExecute or CONFIG.autoexecInstall
-end
-
-local function markQueueArmed()
-    if not canFile() then return end
-    pcall(function()
-        writefile(QUEUE_ARM_FILE, HttpService:JSONEncode({
-            ts    = os.time(),
-            job   = game.JobId,
-            place = game.PlaceId,
-        }))
-    end)
-end
-
-local function buildQueuePayload(url)
-    return ([[
--- Anime Squadron teleport loader
-if _G.AS_TP_BOOT and (tick() - _G.AS_TP_BOOT) < 8 then return end
-_G.AS_TP_BOOT = tick()
-local _u = %q
-local function asGet(u)
-    local ok, s = pcall(function() return game:HttpGet(u) end)
-    if ok and s and #s > 500 then return s end
-    local req = (syn and syn.request) or request or http_request or (http and http.request)
-    if req then
-        local ok2, r = pcall(function() return req({Url=u, Method="GET"}).Body end)
-        if ok2 and r and #r > 500 then return r end
-    end
-end
-%s
-task.defer(function()
-    if not game:IsLoaded() then pcall(function() game.Loaded:Wait() end) end
-    task.wait(0.6)
-    local src = loadLocalScript()
-    if not src then src = asGet(_u) end
-    if src then pcall(function() loadstring(src)() end) end
-end)
-]]):format(url, LOCAL_LOAD_SNIPPET)
-end
-
-local function buildReconnectLoader(url)
-    local gid = tostring(game.GameId)
-    return ([[
--- Anime Squadron reconnect loader (auto-generated)
-if tostring(game.GameId) ~= %q then return end
-if _G.AS_TP_BOOT and (tick() - _G.AS_TP_BOOT) < 8 then return end
-local _u = %q
-local function asGet(u)
-    local ok, s = pcall(function() return game:HttpGet(u) end)
-    if ok and s and #s > 500 then return s end
-    local req = (syn and syn.request) or request or http_request or (http and http.request)
-    if req then
-        local ok2, r = pcall(function() return req({Url=u, Method="GET"}).Body end)
-        if ok2 and r and #r > 500 then return r end
-    end
-end
-%s
-task.defer(function()
-    if not game:IsLoaded() then pcall(function() game.Loaded:Wait() end) end
-    task.wait(0.8)
-    if _G.AS_TP_BOOT and (tick() - _G.AS_TP_BOOT) < 8 then return end
-    if _G.AS_BootAt and (tick() - _G.AS_BootAt) < 5 then return end
-    local HS = game:GetService("HttpService")
-    for _, arm in ipairs({ "AnimeSquadron_queue_arm.json", "AutoBounty_queue_arm.json" }) do
-        if readfile and isfile and isfile(arm) then
-            local ok, r = pcall(readfile, arm)
-            if ok and r and r ~= "" then
-                local ok2, d = pcall(function() return HS:JSONDecode(r) end)
-                if ok2 and d and d.job == game.JobId and os.time() - (tonumber(d.ts) or 0) < 20 then
-                    return
-                end
-            end
-        end
-    end
-    _G.AS_TP_BOOT = tick()
-    local src = loadLocalScript()
-    if not src then src = asGet(_u) end
-    if src then pcall(function() loadstring(src)() end) end
-end)
-]]):format(gid, url, LOCAL_LOAD_SNIPPET)
-end
-
-local function installReconnectLoader()
-    if not shouldInstallReconnect() then return false end
-    local url = CONFIG.scriptUrl
-    if type(url) ~= "string" or url == "" then return false end
-    if type(writefile) ~= "function" then return false end
-    local loader = buildReconnectLoader(url)
-    local targets = {
-        "autoexec/AnimeSquadron.lua",
-        "autoexec/animesquadron.lua",
-        "../autoexec/AnimeSquadron.lua",
-        "../autoexec/animesquadron.lua",
-        "auto_exec/AnimeSquadron.lua",
-        "Autoexec/AnimeSquadron.lua",
-        "autoexec/AutoBounty.lua",
-        "../autoexec/AutoBounty.lua",
-    }
-    local wrote = false
-    for _, path in ipairs(targets) do
-        local ok = pcall(function()
-            if type(makefolder) == "function" then
-                local dir = path:match("^(.*)/")
-                if dir and type(isfolder) == "function" and not isfolder(dir) then
-                    pcall(makefolder, dir)
-                end
-            end
-            writefile(path, loader)
-        end)
-        if ok then wrote = true end
-    end
-    AS._autoexecPaths = targets
-    return wrote
-end
-
-local function uninstallReconnectLoader()
-    if type(delfile) ~= "function" then return false end
-    local any = false
-    for _, path in ipairs(AS._autoexecPaths or {
-        "autoexec/AnimeSquadron.lua", "autoexec/animesquadron.lua",
-        "../autoexec/AnimeSquadron.lua", "../autoexec/animesquadron.lua",
-        "auto_exec/AnimeSquadron.lua", "Autoexec/AnimeSquadron.lua",
-        "autoexec/AutoBounty.lua", "../autoexec/AutoBounty.lua",
-    }) do
-        pcall(function()
-            if type(isfile) == "function" and isfile(path) then
-                delfile(path)
-                any = true
-            end
-        end)
-    end
-    return any
-end
-
-armReexec = function()
-    if not CONFIG.autoExecute then return false end
-    local url = CONFIG.scriptUrl
-    if type(url) ~= "string" or url == "" then return false end
-    local q = getQueueFn()
-    if not q then
-        if not AS._queueWarned then
-            AS._queueWarned = true
-            warn("[Anime Squadron] queue_on_teleport missing — enable reconnect loader or use Misc > Re-arm")
-        end
-        return false
-    end
-    local now = tick()
-    if AS._lastQueue and (now - AS._lastQueue) < 1.5 then return true end
-    AS._lastQueue = now
-    markQueueArmed()
-    pcall(q, buildQueuePayload(url))
-    return true
-end
-
--- Re-arm on teleport (lobby <-> raid, server hop, reconnect-via-teleport)
-addConn(LP.OnTeleport:Connect(function(_)
-    if CONFIG.autoExecute then pcall(armReexec) end
-end))
-
--- Arm before Roblox closes the client (disconnect / reconnect flow)
-pcall(function()
-    game:BindToClose(function()
-        if CONFIG.autoExecute then pcall(armReexec) end
-        if shouldInstallReconnect() then pcall(installReconnectLoader) end
-    end)
-end)
-
-pcall(armReexec)
-if shouldInstallReconnect() then pcall(installReconnectLoader) end
-
-addThread(function()
-    local lastInstall = 0
-    while alive() do
-        task.wait(3)
-        if CONFIG.autoExecute then pcall(armReexec) end
-        if shouldInstallReconnect() and tick() - lastInstall > 60 then
-            lastInstall = tick()
-            pcall(installReconnectLoader)
-        end
-    end
-end)
-
--- ============================================================
--- Anti-AFK (Roblox idle kick + block game's AFK Chamber popup)
--- ============================================================
-local function blockGameAFK()
-    local hooked = {}
-
-    local function neuterYes(btn)
-        if not btn or not btn:IsA("GuiButton") then return end
-        pcall(function()
-            btn.Active = false
-            btn.AutoButtonColor = false
-        end)
-        if hooked[btn] then return end
-        hooked[btn] = true
-        addConn(btn.Activated:Connect(function() end))
-        addConn(btn.MouseButton1Click:Connect(function() end))
-    end
-
-    local function hideAfkGui(gui)
-        if not gui then return end
-        pcall(function() gui.Visible = false end)
-        if not hooked[gui] then
-            hooked[gui] = true
-            if gui:IsA("GuiObject") then
-                addConn(gui:GetPropertyChangedSignal("Visible"):Connect(function()
-                    if CONFIG.antiAfk and gui.Visible then
-                        pcall(function() gui.Visible = false end)
-                    end
-                end))
-            end
-        end
-        for _, d in ipairs(gui:GetDescendants()) do
-            if d.Name == "Yes" and d:IsA("GuiButton") then neuterYes(d) end
-        end
-    end
-
-    local function scanMenus(menus)
-        if not menus then return end
-        hideAfkGui(menus:FindFirstChild("AFK Chamber"))
-        local prompts = menus:FindFirstChild("Prompts")
-        if prompts then
-            hideAfkGui(prompts:FindFirstChild("AFK Chamber"))
-            if not hooked[prompts] then
-                hooked[prompts] = true
-                addConn(prompts.ChildAdded:Connect(function(c)
-                    if CONFIG.antiAfk and c.Name == "AFK Chamber" then hideAfkGui(c) end
-                end))
-            end
-        end
-    end
-
-    scanMenus(getMenus())
-    addConn(LP.ChildAdded:Connect(function(c)
-        if c.Name == "PlayerGui" then
-            task.defer(function() scanMenus(c:FindFirstChild("Menus")) end)
-        end
-    end))
-
-    -- stop the game's own teleport_afk_chamber handler from firing
-    pcall(function()
-        local pm = require(LP.PlayerScripts.Client.Players)
-        if type(pm) == "table" then
-            pm.teleport_afk_chamber = function() end
-        end
-    end)
-end
-
-local function startAntiAFK()
-    local VirtualUser = game:GetService("VirtualUser")
-    local VIM = nil
-    pcall(function() VIM = game:GetService("VirtualInputManager") end)
-
-    blockGameAFK()
-
-    -- 1) definitive backstop: reset idle the instant Roblox fires Idled
-    addConn(LP.Idled:Connect(function()
-        if not CONFIG.antiAfk then return end
-        pcall(function()
-            VirtualUser:CaptureController()
-            VirtualUser:Button2Down(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
-            task.wait(0.2)
-            VirtualUser:Button2Up(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
-        end)
-    end))
-
-    -- disable any built-in AFK / idle LocalScript (and watch for re-injection)
-    local function disableAfkScripts(root)
-        if not root then return end
-        for _, d in ipairs(root:GetDescendants()) do
-            if d:IsA("LocalScript") then
-                local n = d.Name:lower()
-                if n:find("afk") or n:find("idle") or n:find("kick") then
-                    pcall(function() d.Disabled = true end)
-                end
-            end
-        end
-    end
+local function scanRequiredModules()
     local ps = LP:FindFirstChild("PlayerScripts")
-    if ps then
-        addConn(ps.ChildAdded:Connect(function(c)
-            if CONFIG.antiAfk and c:IsA("LocalScript") then
-                local n = c.Name:lower()
-                if n:find("afk") or n:find("idle") or n:find("kick") then
-                    pcall(function() c.Disabled = true end)
-                end
+    if not ps then return end
+    local targets = {
+        "Client.Utility",
+        "Client.Play",
+        "Client.Characters",
+        "Client.Gui",
+    }
+    for _, path in ipairs(targets) do
+        local ok, mod = pcall(function()
+            local cur = ps
+            for part in string.gmatch(path, "[^%.]+") do
+                cur = cur:WaitForChild(part, 2)
             end
-        end))
+            return require(cur)
+        end)
+        if ok and type(mod) == "table" then
+            log("MODULE", "Required " .. path)
+            if mod.data then
+                log("MODULE", path .. ".data keys sample: " .. ser(mod.data, 0):sub(1, 400))
+            end
+            probeModuleTable(mod, path)
+        end
     end
-
-    -- 2) proactive keep-alive + re-block game AFK UI if it reappears
-    addThread(function()
-        while alive() do
-            if CONFIG.antiAfk then
-                blockGameAFK()
-                disableAfkScripts(LP:FindFirstChild("PlayerScripts"))
-                disableAfkScripts(LP:FindFirstChildOfClass("PlayerGui"))
-                if VIM then
-                    pcall(function()
-                        local cam = workspace.CurrentCamera
-                        local vp = cam and cam.ViewportSize or Vector2.new(200, 200)
-                        local x, y = math.floor(vp.X * 0.5), math.floor(vp.Y * 0.5)
-                        VIM:SendMouseMoveEvent(x, y, game)
-                    end)
-                end
-            end
-            task.wait(CONFIG.antiAfkInterval)
+    pcall(function()
+        local Helper = require(RS:WaitForChild("Shared"):WaitForChild("Helper"))
+        if type(Helper.calculate_stat) == "function" then
+            log("MODULE", "Shared.Helper.calculate_stat available (theoretical DPS only)")
         end
     end)
 end
-startAntiAFK()
-startDpsTracker()
 
--- independent cap watcher — leaves mid-raid even if main loop is blocked
-local function startDailyCapWatcher()
-    addThread(function()
-        local lastTry = 0
-        while alive() do
-            if CONFIG.enabled and CONFIG.dailyTraitFarm and inBattle() and not Session.challengeFarm and not Session.awakeningFarm then
-                refreshPlayerData()
-                local map = resolveDailyMap()
-                if map and (isTraitCapMaxed(map) or shouldSkipMapAfterCapLeave(map)) then
-                    local now = tick()
-                    if now - lastTry >= 2 then
-                        lastTry = now
-                        leaveStageIfCapped(map, ("Cap full %s %d/%d — leaving stage...")
-                            :format(map.world, getTraitCapCount(map), map.cap),
-                            Session.dailyFarm and Session.dailyFarm.idx)
+local function scanGetGC()
+    if not getgc then
+        log("GC", "getgc() not available on this executor — skip memory scan")
+        return
+    end
+    local ok, objs = pcall(getgc, true)
+    if not ok or type(objs) ~= "table" then
+        log("GC", "getgc failed")
+        return
+    end
+    local found = 0
+    for _, obj in ipairs(objs) do
+        if type(obj) == "table" then
+            if rawget(obj, "all") and type(rawget(obj, "all")) == "table" then
+                local sample = rawget(obj, "all")
+                local hasCombat = false
+                for _, ent in pairs(sample) do
+                    if type(ent) == "table" and (ent.health or ent.damage or ent.owner) then
+                        hasCombat = true
+                        break
                     end
                 end
-            end
-            task.wait(0.5)
-        end
-    end)
-end
-startDailyCapWatcher()
-
--- ============================================================
--- UI
--- ============================================================
-local Lib
-do
-    local ok, lib = pcall(function() return loadstring(game:HttpGet(NEXUSLIB_URL))() end)
-    if ok then Lib = lib end
-end
-
-local refreshDailyCapLabels, refreshAwakeningLabels, refreshAwakenUnitDropdown, refreshChallengeLabels
-
-local _uiMod = (function()
-local awakenUnitInput = nil
-
-local function refreshDailyCapLabels()
-    local df = Session.dailyFarm
-    if df then
-        setLabel(statusLabels.dailyMap, ("Current map: %s %s Act %d")
-            :format(df.mode or "?", df.world or "?", df.act or "?"))
-    else
-        setLabel(statusLabels.dailyMap, "Current map: none")
-    end
-    local parts = {}
-    local queue = getDailyMapQueue()
-    for i, m in ipairs(queue) do
-        local cur = getTraitCapCount(m)
-        local mark = cur >= m.cap and " OK" or ""
-        parts[#parts + 1] = ("#%d %s %d/%d%s"):format(i, m.world, cur, m.cap, mark)
-    end
-    if #parts == 0 then
-        setLabel(statusLabels.dailyCaps, "Caps: no priority maps enabled")
-    else
-        setLabel(statusLabels.dailyCaps, "Priority caps: " .. table.concat(parts, " | "))
-    end
-end
-
-local function refreshAwakeningLabels()
-    local unitName = CONFIG.awakeningUnit
-    if unitName == "" then
-        setLabel(statusLabels.awakenUnit, "Unit: none selected")
-        setLabel(statusLabels.awakenReqs, "Requirements: -")
-        setLabel(statusLabels.awakenFarm, "Farm target: -")
-        return
-    end
-    local unit = findOwnedUnitByName(unitName)
-    if not unit then
-        setLabel(statusLabels.awakenUnit, "Unit: " .. unitName .. " (not owned)")
-        setLabel(statusLabels.awakenReqs, "Requirements: -")
-        setLabel(statusLabels.awakenFarm, "Farm target: -")
-        return
-    end
-    setLabel(statusLabels.awakenUnit, "Unit: " .. unit.name .. " (id " .. tostring(unit.id) .. ")")
-    local missing = getMissingAwakeningReqs(unit.name)
-    local af = Session.awakeningFarm
-    if missing == nil then
-        if inPlayArea() and af and af.unitName == unit.name and type(af.reqSnapshotFull) == "table" then
-            missing = {}
-            for _, m in ipairs(af.reqSnapshotFull) do
-                if (tonumber(m.deficit) or 0) > 0 then
-                    missing[#missing + 1] = m
+                if hasCombat then
+                    found = found + 1
+                    probeModuleTable(obj, "getgc#"..found)
                 end
             end
-        elseif inPlayArea() and af and af.unitName == unit.name and type(af.reqSnapshot) == "table" then
-            missing = af.reqSnapshot
-        elseif inLobby() then
-            refreshPlayerData()
-            updateAwakenItemCacheFromData(getPlayerData(), unit.name)
-            missing = getMissingAwakeningReqs(unit.name)
         end
     end
-    if missing == nil then
-        setLabel(statusLabels.awakenReqs, "Requirements: unknown — refresh in lobby")
-    elseif #missing == 0 then
-        local full = af and af.unitName == unit.name and af.reqSnapshotFull
-        if full and #full > 0 then
-            local parts = {}
-            for _, m in ipairs(full) do
-                parts[#parts + 1] = m.item .. " " .. m.have .. "/" .. m.need
-            end
-            local suffix = inPlayArea() and " (in-match)" or ""
-            setLabel(statusLabels.awakenReqs, "Requirements" .. suffix .. ": ALL MET — " .. table.concat(parts, " | "))
-        elseif inPlayArea() then
-            setLabel(statusLabels.awakenReqs, "Requirements: ALL MET (verify in lobby)")
-        else
-            setLabel(statusLabels.awakenReqs, "Requirements: ALL MET — ready to awaken")
-        end
-    else
-        local suffix = inPlayArea() and " (in-match)" or ""
-        local parts = {}
-        local full = af and af.unitName == unit.name and af.reqSnapshotFull
-        if full and #full > 0 then
-            for _, m in ipairs(full) do
-                parts[#parts + 1] = m.item .. " " .. m.have .. "/" .. m.need
-            end
-            setLabel(statusLabels.awakenReqs, "Requirements" .. suffix .. ": " .. table.concat(parts, " | "))
-        else
-            for _, m in ipairs(missing) do
-                parts[#parts + 1] = m.item .. " " .. m.have .. "/" .. m.need
-            end
-            setLabel(statusLabels.awakenReqs, "Missing" .. suffix .. ": " .. table.concat(parts, " | "))
-        end
-    end
-    af = Session.awakeningFarm
-    if af and af.world and af.mode then
-        local leaveHint = inPlayArea() and " · leaves on clear or enough mats" or ""
-        setLabel(statusLabels.awakenFarm, ("Farming: %s %s Act %d (%s) for %s%s"):format(
-            af.mode, af.world, af.act or 0, af.difficulty or CONFIG.awakeningDifficulty, af.item or "?", leaveHint))
-    elseif af and af.quest then
-        setLabel(statusLabels.awakenFarm, "Special quest: " .. tostring(af.quest))
-    elseif not CONFIG.autoAwakening then
-        setLabel(statusLabels.awakenFarm, "Farm target: auto awakening OFF")
-    elseif challengesTakePriority() and countPendingChallenges() > 0 then
-        setLabel(statusLabels.awakenFarm, ("Waiting: %d challenge(s) first"):format(countPendingChallenges()))
-    elseif challengesTakePriority() and Session.challengeFarm then
-        setLabel(statusLabels.awakenFarm, "Waiting: stale challenge session clearing...")
-    elseif type(missing) == "table" and #missing > 0 then
-        setLabel(statusLabels.awakenFarm, getAwakeningFarmPreview(unit.name))
-    else
-        setLabel(statusLabels.awakenFarm, "Farm target: ready to awaken")
-    end
-    local n = #getOwnedAwakenableUnits()
-    if statusLabels.awakenCount then
-        setLabel(statusLabels.awakenCount, ("Awakenable units found: %d%s"):format(
-            n, (not inLobby() and n > 0) and " (cached)" or ""))
-    end
+    log("GC", "getgc scan done, combat tables found: " .. found)
 end
 
-local function cycleAwakenUnit(dir)
-    local units = getOwnedAwakenableUnits()
-    if #units == 0 then return end
-    local names = {}
-    for _, u in ipairs(units) do names[#names + 1] = u.name end
-    local cur = table.find(names, CONFIG.awakeningUnit) or 1
-    cur = cur + (dir or 1)
-    if cur < 1 then cur = #names end
-    if cur > #names then cur = 1 end
-    CONFIG.awakeningUnit = names[cur]
-    saveSettings()
-    if awakenUnitInput then pcall(function() awakenUnitInput.Set(CONFIG.awakeningUnit) end) end
-    pcall(refreshAwakeningLabels)
-end
-
-local function refreshAwakenUnitDropdown()
-    local units = getOwnedAwakenableUnits()
-    local names = {}
-    for _, u in ipairs(units) do names[#names + 1] = u.name end
-
-    if #names == 0 then
-        setLabel(statusLabels.awakenList, "Available: none (open Characters menu in lobby, then Refresh)")
-    else
-        if CONFIG.awakeningUnit == "" then
-            CONFIG.awakeningUnit = names[1]
-            saveSettings()
-        end
-        local selectedOk = table.find(names, CONFIG.awakeningUnit) ~= nil
-            or (AS.awakenUnitByName and AS.awakenUnitByName[CONFIG.awakeningUnit] ~= nil)
-        local listText = "Available: " .. table.concat(names, ", ")
-        if not selectedOk and CONFIG.awakeningUnit ~= "" then
-            listText = listText .. " | Selected: " .. CONFIG.awakeningUnit .. " (cached)"
-        end
-        setLabel(statusLabels.awakenList, listText)
-        if awakenUnitInput then
-            pcall(function() awakenUnitInput.Set(CONFIG.awakeningUnit) end)
-        end
-    end
-    pcall(refreshAwakeningLabels)
-    return #units
-end
-
-local function refreshChallengeLabels()
-    local dayT, halfT = getChallengeTimers()
-    setLabel(statusLabels.chTimers, ("Reset timers: Daily %s | Regular %s")
-        :format(fmtChallengeTimer(dayT), fmtChallengeTimer(halfT)))
-
-    local chs = getRotatingChallenges()
-    syncChallengeDoneFlags(chs)
-
-    for _, key in ipairs(CHALLENGE_ORDER) do
-        local lbl = (key == "1d") and statusLabels.chDaily or statusLabels.chRegular
-        if lbl then
-        local name = CHALLENGE_NAMES[key] or key
-        local ch = chs[key]
-        local enabled = isChallengeEnabled(key)
-        if not enabled then
-            setLabel(lbl, name .. ": disabled")
-        elseif type(ch) == "table" and ch.world then
-            local done = isChallengeMarkedDone(key) or scanChallengeGuiCompleted(key)
-            setLabel(lbl, name .. ": " .. ch.world .. " Act " .. tostring(ch.act)
-                .. (done and " (already completed)" or " (ready)"))
-        else
-            setLabel(lbl, name .. ": done / on cooldown")
-        end
-        end
-    end
-end
-
-local function buildUI()
-    if not Lib then return end
-    Win = Lib:Window({ title = "Anime Squadron  v" .. VERSION })
-
-    -- ----- Main tab -----
-    local Main = Win:Tab("🏠", "Main")
-    Main:Section("Automation")
-
-    Main:Toggle("Enable (master)",
-        "Master on/off for all automation", CONFIG.enabled, function(on)
-            setEnabled(on)
-        end)
-
-    Main:Toggle("Auto Daily Trait Farm",
-        "Farm priority maps with daily Trait Shard caps until maxed", CONFIG.dailyTraitFarm, function(on)
-            CONFIG.dailyTraitFarm = on; saveSettings()
-        end)
-
-    Main:Toggle("Solo room (friends only)",
-        "Run stages alone (traits + challenges)", CONFIG.soloOnly, function(on)
-            CONFIG.soloOnly = on; saveSettings()
-        end)
-
-    -- ----- Challenges tab -----
-    local Ch = Win:Tab("⚔️", "Challenges")
-    Ch:Section("Rotating challenges (once per reset)")
-    Ch:Toggle("Auto Daily Challenge [1d]",
-        "Clear the daily challenge once before it resets", CONFIG.autoDailyChallenge, function(on)
-            CONFIG.autoDailyChallenge = on; saveSettings()
-        end)
-    Ch:Toggle("Auto Regular Challenge [30m]",
-        "Clear the regular challenge once before it resets", CONFIG.autoRegularChallenge, function(on)
-            CONFIG.autoRegularChallenge = on; saveSettings()
-        end)
-    Ch:Label("Challenges run before daily trait farming until both are cleared.")
-    Ch:Section("Live status")
-    statusLabels.chDaily   = Ch:Label("Daily [1d]: -")
-    statusLabels.chRegular = Ch:Label("Regular [30m]: -")
-    statusLabels.chTimers  = Ch:Label("Reset timers: -")
-
-    task.defer(refreshChallengeLabels)
-
-    -- ----- Awakening tab -----
-    local Aw = Win:Tab("✨", "Awakening")
-    Aw:Section("Auto farm awakening materials")
-    Aw:Toggle("Auto Awakening",
-        "Farm missing materials and awaken the selected unit", CONFIG.autoAwakening, function(on)
-            CONFIG.autoAwakening = on; saveSettings()
-        end)
-    Aw:Label("Priority: challenges → awakening → daily traits.")
-
-    local startUnit = CONFIG.awakeningUnit
-    if startUnit == "" then startUnit = "Beby" end
-    awakenUnitInput = Aw:Input("Target unit", "Unit to awaken — use ◀ ▶ to cycle", startUnit, startUnit, function(txt)
-        if type(txt) == "string" and txt ~= "" then
-            CONFIG.awakeningUnit = txt
-            saveSettings()
-            pcall(refreshAwakeningLabels)
-        end
-    end)
-
-    Aw:Button("◀", "Previous unit", "Select previous awakenable unit", nil, function()
-        cycleAwakenUnit(-1)
-    end)
-    Aw:Button("▶", "Next unit", "Select next awakenable unit", nil, function()
-        cycleAwakenUnit(1)
-    end)
-
-    Aw:Section("Difficulty")
-    local awakenDiffLabel = Aw:Label("Map difficulty: " .. CONFIG.awakeningDifficulty)
-    Aw:Toggle("Hard mode (awakening)",
-        "Off = Normal, On = Hard for awakening material farms", CONFIG.awakeningDifficulty == "Hard", function(on)
-            CONFIG.awakeningDifficulty = on and "Hard" or "Normal"
-            saveSettings()
-            pcall(function() awakenDiffLabel.Set("Map difficulty: " .. CONFIG.awakeningDifficulty) end)
-            pcall(refreshAwakeningLabels)
-        end)
-    Aw:Button("Normal", "Set Normal", "Farm awakening maps on Normal difficulty", nil, function()
-        CONFIG.awakeningDifficulty = "Normal"
-        saveSettings()
-        pcall(function() awakenDiffLabel.Set("Map difficulty: Normal") end)
-        pcall(refreshAwakeningLabels)
-    end)
-    Aw:Button("Hard", "Set Hard", "Farm awakening maps on Hard difficulty", nil, function()
-        CONFIG.awakeningDifficulty = "Hard"
-        saveSettings()
-        pcall(function() awakenDiffLabel.Set("Map difficulty: Hard") end)
-        pcall(refreshAwakeningLabels)
-    end)
-
-    Aw:Section("Actions")
-    Aw:Button("↺", "Refresh units", "Rescan player data + Characters menu for awakenable units", nil, function()
-        AWAKENABLE_NAMES = nil
-    if inLobby() then
-        refreshPlayerData()
-        updateAwakenItemCacheFromData(getPlayerData(), CONFIG.awakeningUnit)
-    end
-    local n = refreshAwakenUnitDropdown()
-        notify("Awakening", n > 0 and ("Found " .. n .. " awakenable unit(s).") or "No awakenable units — open Characters menu in lobby, then refresh.", n > 0 and "success" or "error")
-    end)
-
-    Aw:Section("Live status")
-    statusLabels.awakenList  = Aw:Label("Available: scanning...")
-    statusLabels.awakenCount = Aw:Label("Awakenable units found: -")
-    statusLabels.awakenUnit = Aw:Label("Unit: -")
-    statusLabels.awakenReqs = Aw:Label("Requirements: -")
-    statusLabels.awakenFarm = Aw:Label("Farm target: -")
-    task.defer(refreshAwakenUnitDropdown)
-    addThread(function()
-        for _ = 1, 30 do
-            if not alive() then break end
-            if refreshAwakenUnitDropdown() > 0 then break end
-            task.wait(1)
-        end
-    end)
-
-    -- ----- Daily Traits tab -----
-    local Daily = Win:Tab("🌀", "Daily Traits")
-    Daily:Section("All trait maps (auto-detected)")
-    for _, m in ipairs(TRAIT_DAILY_MAPS) do
-        Daily:Label(("%s %s Act %d  (cap %d)"):format(m.mode, m.world, m.act, m.cap))
-    end
-
-    Daily:Section("Priority farm order (1 = farmed first)")
-    local priInputs = {}
-    local priRefreshing = false
-    local function refreshPriorityInputs()
-        ensureDailyPriorityConfig()
-        priRefreshing = true
-        for i, key in ipairs(CONFIG.dailyPriorityOrder) do
-            local inp = priInputs[key]
-            if inp then
-                pcall(function() inp.Set(tostring(i)) end)
+-- ============================================================
+-- 5) Billboard / floating damage text in workspace
+-- ============================================================
+local function scanFloatingText()
+    local n = 0
+    for _, d in ipairs(workspace:GetDescendants()) do
+        if d:IsA("TextLabel") or d:IsA("TextButton") then
+            local t = d.Text or ""
+            if t ~= "" and t:match("^%-?%d") and #t <= 12 then
+                n = n + 1
+                if n <= 15 then
+                    log("FLOAT", d:GetFullName() .. " = " .. t)
+                end
             end
         end
-        priRefreshing = false
     end
-    ensureDailyPriorityConfig()
-    for _, key in ipairs(CONFIG.dailyPriorityOrder) do
-        local m = findTraitMapByKey(key)
-        if m then
-            local startPri = table.find(CONFIG.dailyPriorityOrder, key) or 1
-            priInputs[key] = Daily:Input(
-                ("%s %s Act %d"):format(m.mode, m.world, m.act),
-                ("Cap %d — set priority number (1 = farm first)"):format(m.cap),
-                "1", tostring(startPri),
-                function(txt)
-                    if priRefreshing then return end
-                    setDailyPriorityNumber(key, txt)
-                    refreshPriorityInputs()
-                    pcall(refreshDailyCapLabels)
-                end)
-            Daily:Toggle(("Farm: %s"):format(m.world),
-                "Include this map in the daily trait rotation",
-                CONFIG.dailyPriorityEnabled[key] ~= false, function(on)
-                    CONFIG.dailyPriorityEnabled[key] = on
-                    saveSettings()
-                    pcall(refreshDailyCapLabels)
-                end)
-        end
-    end
-    Daily:Button("↺", "Reset priority order", "Restore default farm order", nil, function()
-        CONFIG.dailyPriorityOrder = {}
-        for _, k in ipairs(DEFAULT_DAILY_PRIORITY) do
-            CONFIG.dailyPriorityOrder[#CONFIG.dailyPriorityOrder + 1] = k
-        end
-        for _, m in ipairs(TRAIT_DAILY_MAPS) do
-            local k = mapTraitKey(m)
-            if not table.find(CONFIG.dailyPriorityOrder, k) then
-                CONFIG.dailyPriorityOrder[#CONFIG.dailyPriorityOrder + 1] = k
-            end
-        end
-        saveSettings()
-        refreshPriorityInputs()
-        pcall(refreshDailyCapLabels)
-        notify("Daily Traits", "Priority order reset.", "info")
-    end)
-    task.defer(refreshPriorityInputs)
-
-    Daily:Section("Settings")
-    local dailyDiffLabel = Daily:Label("Map difficulty: " .. CONFIG.dailyDifficulty)
-    Daily:Toggle("Hard mode (daily traits)",
-        "Off = Normal, On = Hard for daily trait farm maps", CONFIG.dailyDifficulty == "Hard", function(on)
-            CONFIG.dailyDifficulty = on and "Hard" or "Normal"
-            saveSettings()
-            pcall(function() dailyDiffLabel.Set("Map difficulty: " .. CONFIG.dailyDifficulty) end)
-        end)
-    Daily:Button("Normal", "Set Normal", "Farm daily trait maps on Normal difficulty", nil, function()
-        CONFIG.dailyDifficulty = "Normal"
-        saveSettings()
-        pcall(function() dailyDiffLabel.Set("Map difficulty: Normal") end)
-    end)
-    Daily:Button("Hard", "Set Hard", "Farm daily trait maps on Hard difficulty", nil, function()
-        CONFIG.dailyDifficulty = "Hard"
-        saveSettings()
-        pcall(function() dailyDiffLabel.Set("Map difficulty: Hard") end)
-    end)
-    Daily:Toggle("Auto-stop when all caps full",
-        "Stop once every map's daily trait cap is reached", CONFIG.dailyStopWhenDone, function(on)
-            CONFIG.dailyStopWhenDone = on; saveSettings()
-        end)
-    Daily:Section("Live caps (from player data)")
-    statusLabels.dailyMap  = Daily:Label("Current map: -")
-    statusLabels.dailyCaps = Daily:Label("Caps: -")
-    task.defer(refreshDailyCapLabels)
-
-    -- ----- Status tab -----
-    local St = Win:Tab("📊", "Status")
-    St:Label("Version: v" .. VERSION)
-    St:Section("Live")
-    statusLabels.place = St:Label("Place: -")
-    statusLabels.automation = St:Label("Automation: -")
-
-    -- ----- DPS tab -----
-    local DpsTab = Win:Tab("📈", "DPS")
-    DpsTab:Section("Live team (leaderstats.Damage)")
-    statusLabels.teamDps = DpsTab:Label("Team DPS: -")
-    statusLabels.teamDmg = DpsTab:Label("Stage damage: -")
-    DpsTab:Label("Updates in-stage from your leaderstats Damage stat.")
-    DpsTab:Section("Equipped team (theoretical DPS = dmg / cd)")
-    for i = 1, 6 do
-        statusLabels["unit" .. i] = DpsTab:Label(("Slot %d: -"):format(i))
-    end
-    DpsTab:Section("Live allies on map")
-    statusLabels.liveAllies = DpsTab:Label("Live allies on map: -")
-    DpsTab:Section("Settings")
-    DpsTab:Toggle("Enable DPS meter",
-        "Live team DPS + theoretical per-slot DPS readout", CONFIG.dpsMeter, function(on)
-            CONFIG.dpsMeter = on; saveSettings()
-            if on then task.defer(refreshDpsLabels) end
-        end)
-    DpsTab:Button("🔄", "Reset stage DPS", "Clear peak/session baseline", nil, function()
-        resetDpsStage(); refreshDpsLabels(); notify("DPS", "Stage baseline reset.", "info")
-    end)
-    task.defer(refreshDpsLabels)
-
-    -- ----- Misc tab -----
-    local Misc = Win:Tab("⚙️", "Misc")
-
-    Misc:Section("Session")
-    Misc:Toggle("Anti-AFK",
-        "Block Roblox idle kick + game's AFK Chamber popup", CONFIG.antiAfk, function(on)
-            CONFIG.antiAfk = on; saveSettings()
-            if on then pcall(blockGameAFK) end
-        end)
-    Misc:Toggle("Auto Execute (on teleport)",
-        "Re-run after lobby/raid teleports + installs reconnect loader", CONFIG.autoExecute, function(on)
-            CONFIG.autoExecute = on; saveSettings()
-            if on then
-                armReexec()
-                local ok = installReconnectLoader()
-                notify("Auto Execute", ok and "Armed queue + reconnect loader installed."
-                    or "Queue armed (reconnect file install failed).", ok and "success" or "info")
-            elseif not CONFIG.autoexecInstall then
-                uninstallReconnectLoader()
-            end
-        end)
-    Misc:Label((getQueueFn() ~= nil)
-        and "Teleport re-exec: supported ✓ (queue kept armed + OnTeleport)"
-        or  "Teleport re-exec: NOT supported (queue_on_teleport missing) ✗")
-    Misc:Toggle("Auto-exec on rejoin (autoexec file)",
-        "Extra: keep reconnect loader even if teleport toggle is off", CONFIG.autoexecInstall, function(on)
-            CONFIG.autoexecInstall = on; saveSettings()
-            if on then
-                local ok = installReconnectLoader()
-                notify("Auto-exec", ok and "Reconnect loader installed (Potassium/autoexec + workspace)."
-                    or "Install failed (executor lacks writefile).", ok and "success" or "error")
-            elseif not CONFIG.autoExecute then
-                uninstallReconnectLoader()
-                notify("Auto-exec", "Removed reconnect loader.", "info")
-            end
-        end)
-    Misc:Label((type(writefile) == "function")
-        and "Reconnect: loads AnimeSquadron.lua / AutoBounty.lua, then Script URL"
-        or  "Reconnect: unavailable (no writefile) ✗")
-
-    Misc:Section("Actions")
-    Misc:Button("💾", "Save Settings", "Write settings to file", nil, function()
-        saveSettings(); notify("Settings", "Saved.", "success")
-    end)
-    Misc:Button("🛑", "Stop All Loops", "Emergency stop", nil, function()
-        setEnabled(false)
-    end)
-    Misc:Button("🔁", "Re-arm teleport persist", "queue + reconnect loader", nil, function()
-        local q = armReexec()
-        local f = installReconnectLoader()
-        notify("Persist", (q and "Queue armed. " or "Queue failed. ")
-            .. (f and "Reconnect loader OK." or "Reconnect loader failed."), (q or f) and "success" or "error")
-    end)
-
-    Misc:Section("Teleport persistence")
-    Misc:Input("Script URL", "Raw URL of this script (for queue_on_teleport)",
-        "https://...", CONFIG.scriptUrl, function(txt)
-            CONFIG.scriptUrl = txt or ""; saveSettings()
-        end)
-
-    Misc:Section("Links")
-    Misc:Button("💬", "Discord", "Copy invite", nil, function()
-        if setclipboard then pcall(setclipboard, "https://discord.gg/") end
-        notify("Discord", "Invite copied (edit link in script).", "info")
-    end)
+    if n > 0 then log("FLOAT", "numeric text labels this sweep: " .. n) end
 end
 
-buildUI()
+-- ============================================================
+-- Main loops
+-- ============================================================
+scanRequiredModules()
 
 addThread(function()
     while alive() do
-        if next(statusLabels) then
-            local lobby = inLobby()
-            pcall(function() statusLabels.place.Set("Place: " .. (lobby and "Lobby" or "Battle/Loading")) end)
-            pcall(function()
-                local parts = {}
-                if CONFIG.enabled then parts[#parts + 1] = "master ON" end
-                if CONFIG.dailyTraitFarm then parts[#parts + 1] = "daily traits ON" end
-                if CONFIG.autoDailyChallenge then parts[#parts + 1] = "daily challenge ON" end
-                if CONFIG.autoRegularChallenge then parts[#parts + 1] = "regular challenge ON" end
-                if CONFIG.autoAwakening then parts[#parts + 1] = "awakening ON" end
-                if #parts == 0 then parts[1] = "idle" end
-                statusLabels.automation.Set("Automation: " .. table.concat(parts, ", "))
-            end)
-            pcall(refreshDailyCapLabels)
-            pcall(refreshChallengeLabels)
-            if inLobby() or not AS._awakenUnitsFound then
-                local n = refreshAwakenUnitDropdown()
-                if n > 0 then AS._awakenUnitsFound = true end
-            else
-                pcall(refreshAwakeningLabels)
-            end
-            pcall(refreshDpsLabels)
-        end
-        task.wait(1)
+        scanCharactersFolder(workspace:FindFirstChild("Characters"))
+        for _, p in ipairs(Players:GetPlayers()) do scanLeaderstats(p) end
+        task.wait(3)
     end
 end)
 
-return {
-    refreshDaily = refreshDailyCapLabels,
-    refreshAwaken = refreshAwakeningLabels,
-    refreshAwakenDropdown = refreshAwakenUnitDropdown,
-    refreshChallenge = refreshChallengeLabels,
-}
-end)()
+addThread(function()
+    task.wait(10)
+    while alive() do
+        scanGetGC()
+        scanFloatingText()
+        task.wait(30)
+    end
+end)
 
-refreshDailyCapLabels = _uiMod.refreshDaily
-refreshAwakeningLabels = _uiMod.refreshAwaken
-refreshAwakenUnitDropdown = _uiMod.refreshAwakenDropdown
-refreshChallengeLabels = _uiMod.refreshChallenge
+addThread(function()
+    while alive() do
+        flushLog(false)
+        task.wait(2)
+    end
+end)
 
--- ============================================================
--- Register cleanup for the next re-execution, then resume if needed
--- ============================================================
-AS.cleanup = function()
-    pcall(cleanupAll)
-    if Win then pcall(function() Win:Destroy() end) end
+-- Summary helper
+local function printSummary()
+    log("SUMMARY", "=== top remote hits ===")
+    local sorted = {}
+    for path, n in pairs(remoteHits) do sorted[#sorted + 1] = { path = path, n = n } end
+    table.sort(sorted, function(a, b) return a.n > b.n end)
+    for i = 1, math.min(15, #sorted) do
+        log("SUMMARY", sorted[i].n .. "x " .. sorted[i].path)
+    end
+    flushLog(true)
 end
 
-if CONFIG.enabled then
-    addThread(function()
-        task.wait(0.5)
-        if not _looping then addThread(mainLoop) end
-    end)
-end
+addThread(function()
+    task.wait(120)
+    while alive() do
+        printSummary()
+        task.wait(120)
+    end
+end)
 
-if CONFIG.enabled then
-    setStatus(("v%s resumed — master ON, daily trait farm running."):format(VERSION))
-    notify("Anime Squadron", "Resumed v" .. VERSION .. " (master ON)", "success")
-else
-    setStatus(("v%s loaded. Toggle 'Enable (master)' to start."):format(VERSION))
-    notify("Anime Squadron", "Loaded v" .. VERSION, "success")
-end
-print("[Anime Squadron] loaded v" .. VERSION .. (CONFIG.enabled and " (resumed)" or ""))
+log("INIT", "Combat Probe v" .. VERSION .. " running. Enter a stage and fight!")
+log("INIT", "Log file: " .. LOG_FILE .. " | Verbose=" .. tostring(VERBOSE))
+log("INIT", "Watch these remotes first: " .. table.concat(WATCH, ", "))
+print("[Combat Probe] Loaded. Fight in a stage — check " .. LOG_FILE)
