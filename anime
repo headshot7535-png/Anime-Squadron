@@ -38,7 +38,7 @@
       data + world rewards), handle special-quest items, then invoke awaken.
 --------------------------------------------------------------------------]]
 
-local VERSION = "2.4.8"   -- bump this each upload so you can confirm the live build
+local VERSION = "2.4.9"   -- bump this each upload so you can confirm the live build
 local NEXUSLIB_URL = "https://raw.githubusercontent.com/headshot7535-png/Nexuslib/main/Nexuslib"
 
 -- ============================================================
@@ -516,6 +516,83 @@ local function clientForceLeave()
     end)
 end
 
+local function leavePlayRoomQuiet()
+    clientForceLeave()
+    pcall(function() fireR("Play", "leave") end)
+    pcall(function() fireR("Matchmaking", "leave") end)
+    pcall(function() invokeR("Matchmaking", "leave") end)
+    pcall(function() invokeR("Player", "physical_teleport", "play") end)
+    pcall(function()
+        local menus = getMenus()
+        if not menus then return end
+        local stage = menus:FindFirstChild("StageInfo")
+        local leaveBtn = stage and stage:FindFirstChild("Buttons") and stage.Buttons:FindFirstChild("Leave")
+        if leaveBtn and leaveBtn.Visible then invokeGui(leaveBtn) end
+        local ps = menus:FindFirstChild("Play_Start")
+        if ps and ps:IsA("GuiObject") then ps.Visible = false end
+    end)
+end
+
+local function formatInvokeErr(ok, ...)
+    local n = select("#", ...)
+    local parts = {}
+    if not ok then
+        for i = 1, n do
+            local v = select(i, ...)
+            if v ~= nil and v ~= false and v ~= true then
+                parts[#parts + 1] = tostring(v)
+            end
+        end
+        return #parts > 0 and table.concat(parts, " | ") or "invoke failed"
+    end
+    local suc = (...)
+    if suc == false then
+        for i = 2, n do
+            local v = select(i, ...)
+            if v ~= nil and v ~= false and v ~= true and type(v) ~= "table" then
+                parts[#parts + 1] = tostring(v)
+            end
+        end
+        return #parts > 0 and table.concat(parts, " | ") or "request rejected"
+    end
+    return nil
+end
+
+local function ensureLobbyForLaunch(timeout)
+    local t0 = tick()
+    while alive() and tick() - t0 < (timeout or 30) do
+        if not inLobby() then
+            leaveStage(true)
+            task.wait(0.8)
+        elseif isStageMenuVisible() then
+            leavePlayRoomQuiet()
+            task.wait(0.5)
+        else
+            return true
+        end
+        task.wait(0.35)
+    end
+    return inLobby() and not isStageMenuVisible()
+end
+
+local function syncPlayClientCurrent(current)
+    pcall(function()
+        local play = require(LP.PlayerScripts.Client.Play)
+        if play then
+            play.current = play.current or {}
+            for k, v in pairs(current) do
+                play.current[k] = v
+            end
+        end
+    end)
+end
+
+local function stageLaunchLooksSuccessful()
+    if inBattle() or isLoadingScreenVisible() then return true end
+    if isStageMenuVisible() then return true end
+    return not inLobby()
+end
+
 local function clickBackToLobby()
     local btn = findBackToLobbyTeleportBtn()
     if not btn then
@@ -584,9 +661,16 @@ end
 -- Matchmaking (start a stage)
 -- ============================================================
 local function startMap(world, act, mode, difficulty, rewards)
+    if not ensureLobbyForLaunch(25) then
+        return false, "not in lobby (still in stage/play room UI)"
+    end
+
+    leavePlayRoomQuiet()
+    task.wait(0.35)
+
     local current = {
         world        = world,
-        act          = act or 1,
+        act          = tonumber(act) or 1,
         mode         = mode or "Story",
         difficulty   = difficulty or CONFIG.dailyDifficulty,
         only_friends = CONFIG.soloOnly and true or false,
@@ -594,19 +678,45 @@ local function startMap(world, act, mode, difficulty, rewards)
     if type(rewards) == "table" then
         current.rewards = rewards
     end
-    local okC, sucC, room = invokeR("Play", "create_room", current)
-    if not (okC and sucC) then
-        return false, tostring(room or "create_room failed")
+    syncPlayClientCurrent(current)
+
+    local lastErr = "create_room failed"
+    for attempt = 1, 3 do
+        if attempt > 1 then
+            leavePlayRoomQuiet()
+            task.wait(0.6 + attempt * 0.35)
+            syncPlayClientCurrent(current)
+        end
+
+        local okC, sucC, resA, resB = invokeR("Play", "create_room", current)
+        if okC and sucC then
+            task.wait(0.3)
+            if armReexec then pcall(armReexec) end
+            local okS, sucS, errS, errS2 = invokeR("Play", "start")
+            if okS and sucS then return true end
+            lastErr = "start failed: " .. (formatInvokeErr(okS, sucS, errS, errS2) or "unknown")
+            pcall(function() leaveStage() end)
+            leavePlayRoomQuiet()
+        else
+            lastErr = "create_room failed: " .. (formatInvokeErr(okC, sucC, resA, resB) or "unknown")
+            task.wait(0.8)
+            if stageLaunchLooksSuccessful() then
+                if armReexec then pcall(armReexec) end
+                local okS, sucS = invokeR("Play", "start")
+                if okS and sucS then return true end
+                if stageLaunchLooksSuccessful() then return true end
+            end
+            if isStageMenuVisible() then
+                local okS, sucS, errS = invokeR("Play", "start")
+                if okS and sucS then return true end
+                if okS and not sucS then
+                    lastErr = "start failed: " .. (formatInvokeErr(okS, sucS, errS) or "unknown")
+                end
+                leavePlayRoomQuiet()
+            end
+        end
     end
-    task.wait(0.3)
-    -- prime the re-exec queue RIGHT before we teleport, so the script comes
-    -- back automatically in the battle place (and again on the way to lobby)
-    if armReexec then pcall(armReexec) end
-    local okS, sucS = invokeR("Play", "start")
-    if okS and sucS then return true end
-    -- couldn't start; clean up the room so we don't get stuck
-    pcall(function() leaveStage() end)
-    return false, "start failed"
+    return false, lastErr
 end
 
 -- ============================================================
@@ -1428,9 +1538,7 @@ local function scanChallengeGuiCompleted(key)
 end
 
 local function leaveChallengeRoomQuiet()
-    pcall(function() fireR("Play", "leave") end)
-    pcall(function() invokeR("Matchmaking", "leave") end)
-    pcall(function() invokeR("Player", "physical_teleport", "play") end)
+    leavePlayRoomQuiet()
 end
 
 local function probeChallengeBlocked(key, ch)
@@ -2812,6 +2920,23 @@ local function discoverItemDropMaps(itemName)
     return found
 end
 
+local function getMapActCount(world, mode, difficulty)
+    local ok, Worlds = pcall(function() return require(LP.PlayerScripts.Client.Play.Worlds) end)
+    if not ok or type(Worlds) ~= "table" then return nil end
+    difficulty = difficulty or "Normal"
+    for _, idx in ipairs(WORLD_INDICES) do
+        local w = Worlds[idx]
+        if type(w) == "table" and w.name == world and type(w.Rewards) == "table" then
+            local modeData = w.Rewards[mode]
+            if type(modeData) == "table" then
+                local diffData = modeData[difficulty] or modeData.Normal
+                if type(diffData) == "table" then return #diffData end
+            end
+        end
+    end
+    return nil
+end
+
 local function normalizeAwakeningDifficulty(itemDifficulty)
     if itemDifficulty == "Hard" then return "Hard" end
     return (CONFIG.awakeningDifficulty == "Hard") and "Hard" or "Normal"
@@ -2842,13 +2967,15 @@ local function buildFarmTargetsForItem(itemName)
     local seen = {}
     local function addTarget(t)
         if type(t) ~= "table" or not t.world or not t.mode or not t.act then return end
+        t.act = tonumber(t.act)
+        if not t.act then return end
+        local maxAct = getMapActCount(t.world, t.mode, t.difficulty or CONFIG.awakeningDifficulty)
+        if maxAct and t.act > maxAct then return end
         local key = t.mode .. "|" .. t.world .. "|" .. t.act .. "|" .. (t.difficulty or "Normal")
         if seen[key] then return end
         seen[key] = true
         targets[#targets + 1] = t
     end
-
-    for _, m in ipairs(discoverItemDropMaps(itemName)) do addTarget(m) end
 
     local parsed = parseItemDescriptionLocation(itemName)
     if parsed and parsed.type == "map" then
@@ -2858,6 +2985,7 @@ local function buildFarmTargetsForItem(itemName)
                 mode = parsed.mode,
                 act = act,
                 difficulty = parsed.difficulty or CONFIG.awakeningDifficulty,
+                fromDescription = true,
             })
         end
     elseif parsed and parsed.type == "special" then
@@ -2867,6 +2995,8 @@ local function buildFarmTargetsForItem(itemName)
     elseif SPECIAL_QUEST_ITEM[itemName] then
         return { special = SPECIAL_QUEST_ITEM[itemName] }
     end
+
+    for _, m in ipairs(discoverItemDropMaps(itemName)) do addTarget(m) end
 
     if #targets == 0 and parsed and parsed.type == "map" and parsed.world then
         addTarget({
@@ -2881,6 +3011,14 @@ local function buildFarmTargetsForItem(itemName)
         for _, t in ipairs(targets) do
             t.difficulty = normalizeAwakeningDifficulty(t.difficulty)
         end
+        table.sort(targets, function(a, b)
+            local pa = a.fromDescription and 0 or 1
+            local pb = b.fromDescription and 0 or 1
+            if pa ~= pb then return pa < pb end
+            if a.mode ~= b.mode then return a.mode < b.mode end
+            if a.world ~= b.world then return a.world < b.world end
+            return a.act < b.act
+        end)
         targets = filterTargetsByDifficulty(targets)
     end
 
@@ -2994,10 +3132,37 @@ local function pickSpecialQuestFarmTarget(questName, itemName)
     return best
 end
 
+local function isActUnlocked(world, act, mode)
+    act = tonumber(act)
+    if not act or not world then return true end
+    mode = mode or "Story"
+    if mode == "Raid" or mode == "Invasion" or mode == "Challenge" or mode == "Infinite" or mode == "Event" then
+        return true
+    end
+    refreshPlayerData()
+    local data = getPlayerData()
+    if not data or type(data.worlds) ~= "table" then return true end
+    for _, w in pairs(data.worlds) do
+        if type(w) == "table" and w.name == world and type(w.acts) == "table" then
+            local cleared = tonumber(w.acts[string.lower(mode)]) or 0
+            return cleared + 1 >= act
+        end
+    end
+    return true
+end
+
 local function pickNextAwakeningFarmTarget(unitName, focusItem)
     local missing = getMissingAwakeningReqs(unitName)
     if type(missing) ~= "table" then return nil, "unknown" end
     if #missing == 0 then return nil, "ready" end
+
+    if focusItem then
+        local stillNeed = false
+        for _, m in ipairs(missing) do
+            if m.item == focusItem then stillNeed = true break end
+        end
+        if not stillNeed then focusItem = nil end
+    end
 
     local tryOrder = {}
     if focusItem then
@@ -3357,6 +3522,20 @@ local function awakeningStep()
     end
 
     local focusItem = Session.awakeningFarm and Session.awakeningFarm.item
+    if focusItem then
+        local stillMissing = false
+        for _, m in ipairs(missing) do
+            if m.item == focusItem then stillMissing = true break end
+        end
+        if not stillMissing then
+            if Session.awakeningFarm then
+                Session.awakeningFarm.item = nil
+                Session.awakeningFarm.targetIdx = nil
+                Session.awakeningFarm.stall = 0
+            end
+            focusItem = nil
+        end
+    end
     local target, itemName = pickNextAwakeningFarmTarget(unit.name, focusItem)
 
     if not target then
@@ -3422,12 +3601,31 @@ local function awakeningStep()
         itemName, before, needAmt,
         target.mode, target.world, target.act, soloNote, af.runs))
 
+    if not isActUnlocked(target.world, target.act, target.mode) then
+        local msg = ("Act %d locked on %s %s — clear earlier acts first"):format(
+            target.act, target.mode, target.world)
+        setStatus("Awakening: " .. msg)
+        if af.targetIdx and af.targetCount and af.targetCount > 1 then
+            af.targetIdx = (af.targetIdx % af.targetCount) + 1
+            saveSession()
+        else
+            notify("Awakening", msg, "error")
+        end
+        task.wait(3)
+        return
+    end
+
     local prevSolo = CONFIG.soloOnly
     if target.solo then CONFIG.soloOnly = true end
     local ok, err = startMap(target.world, target.act, target.mode, target.difficulty or CONFIG.awakeningDifficulty)
     if target.solo then CONFIG.soloOnly = prevSolo end
 
     if not ok then
+        if stageLaunchLooksSuccessful() then
+            setStatus(("Awakening: launch in progress for %s Act %d..."):format(target.world, target.act))
+            waitForAwakeningRun(target)
+            return
+        end
         setStatus("Awakening launch failed: " .. tostring(err))
         if af.targetIdx and af.targetCount and af.targetCount > 1 then
             af.targetIdx = (af.targetIdx % af.targetCount) + 1
